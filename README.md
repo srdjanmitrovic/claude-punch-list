@@ -16,6 +16,20 @@ all of it.
 <img src="https://img.shields.io/badge/build_step-none-1a1a1f" alt="No build step">
 <img src="https://img.shields.io/badge/license-MIT-1a1a1f" alt="MIT license">
 
+<p>
+<a href="#install"><b>Install</b></a>
+&nbsp;·&nbsp;
+<a href="#how-it-works">How it works</a>
+&nbsp;·&nbsp;
+<a href="#example-one-bug-start-to-finish">Example</a>
+&nbsp;·&nbsp;
+<a href="#what-gets-attached">What it collects</a>
+&nbsp;·&nbsp;
+<a href="#privacy">Privacy</a>
+&nbsp;·&nbsp;
+<a href="#make-it-yours">Make it yours</a>
+</p>
+
 </div>
 
 <br>
