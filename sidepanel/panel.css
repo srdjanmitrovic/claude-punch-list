@@ -1,0 +1,658 @@
+/*
+ * Claude Debug Reporter — "proof sheet"
+ *
+ * The panel is a proofing instrument: you mark a defect on a page and send it
+ * for correction. Two ideas carry the design.
+ *
+ * 1. Two voices. Monospace is the PRIMARY voice, because everything the panel
+ *    says is an instrument reading. A humanist face appears in exactly two
+ *    places, and both are where the human speaks: the invitation to act, and
+ *    the annotation field. Nowhere else.
+ *
+ * 2. One signal colour. Registration magenta means "marked for correction" and
+ *    nothing else: an armed capture mode, a non-zero count, the marquee. Hard
+ *    errors invert to a solid ink block rather than introducing a second hue,
+ *    which keeps the whole panel to two colours plus neutrals.
+ */
+
+:root {
+  /* Tells Chrome to render form controls, scrollbars and caret in the matching
+     scheme. Without it the textarea scrollbar and checkbox stay light-mode. */
+  color-scheme: light dark;
+
+  --bg: #faf9f7;
+  --bg-sunken: #f1efea;
+  --surface: #ffffff;
+  --fg: #15151a;
+  --fg-dim: #6e6e78;
+  --rule: #dfddd7;
+  --rule-strong: #c7c4bb;
+  --proof: #b4126a;
+  --proof-soft: rgba(180, 18, 106, 0.09);
+  --marks: #9a9488;
+
+  --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  /* The human voice. Optima's calligraphic stems read as a corrector's hand;
+     Avenir Next is the fallback where it is unavailable. */
+  --human: "Optima", "Avenir Next", "Segoe UI", system-ui, sans-serif;
+
+  --gap: 18px;
+  --pad: 16px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #131317;
+    --bg-sunken: #0e0e11;
+    --surface: #1b1b21;
+    --fg: #edece8;
+    --fg-dim: #8b8b96;
+    --rule: #2c2c34;
+    --rule-strong: #3d3d47;
+    --proof: #ff4d9d;
+    --proof-soft: rgba(255, 77, 157, 0.13);
+    --marks: #63636f;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/* The UA rule for [hidden] loses to ANY author display declaration, and several
+   rules below set display on elements that toggle hidden. This restores it. */
+[hidden] {
+  display: none !important;
+}
+
+.sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 12px/1.5 var(--mono);
+  -webkit-font-smoothing: antialiased;
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+
+/* ---------------------------------------------------------------- masthead */
+
+.masthead {
+  padding: 11px var(--pad);
+  border-bottom: 1px solid var(--rule);
+  background: var(--bg-sunken);
+}
+
+.masthead-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.dot {
+  width: 6px;
+  height: 6px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--rule-strong);
+}
+
+.dot.ready {
+  background: var(--proof);
+}
+
+.dot.blocked {
+  background: transparent;
+  box-shadow: inset 0 0 0 1px var(--fg-dim);
+}
+
+.target {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  font-size: 10.5px;
+  letter-spacing: -0.01em;
+  color: var(--fg-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ghost {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: none;
+  border-radius: 3px;
+  background: none;
+  color: var(--fg-dim);
+  cursor: pointer;
+}
+
+.ghost:hover {
+  color: var(--proof);
+  background: var(--proof-soft);
+}
+
+.ghost svg {
+  width: 13px;
+  height: 13px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.4;
+  stroke-linecap: round;
+}
+
+/* ------------------------------------------------------------------ notice */
+
+/* Errors invert to a solid block instead of adopting a warning hue. It is the
+   loudest thing the panel can do with no extra colour. */
+.notice {
+  margin: 0;
+  padding: 10px var(--pad);
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--fg-dim);
+  border-bottom: 1px solid var(--rule);
+  background: var(--bg-sunken);
+}
+
+.notice.error {
+  color: var(--bg);
+  background: var(--fg);
+  border-bottom-color: var(--fg);
+}
+
+/* -------------------------------------------------------------------- main */
+
+main {
+  flex: 1;
+  padding: var(--gap) var(--pad) 6px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap);
+}
+
+.key {
+  display: block;
+  margin: 0 0 7px;
+  font-size: 9.5px;
+  font-weight: 500;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--fg-dim);
+}
+
+/* ------------------------------------------------------- the proof frame -- */
+
+/* The stage takes the leftover height so the frame, not a void above the
+   footer, absorbs it. Capped, because a frame taller than this stops reading as
+   a viewfinder and starts reading as an empty page. */
+.stage {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  max-height: 340px;
+}
+
+/* Once filled, the stage stops claiming leftover height too. Without this the
+   frame hugs its image but the stage keeps growing, opening a gap between the
+   mode buttons and the next section. */
+.stage:has(.frame.filled) {
+  flex: 0 0 auto;
+  max-height: none;
+}
+
+.frame {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 128px;
+  display: grid;
+  place-items: center;
+  padding: 14px;
+  background: var(--bg-sunken);
+  overflow: hidden;
+}
+
+/* Crop marks. Eight hairlines, one per corner arm, drawn as an overlay so they
+   sit ON the captured image the way registration marks sit on a proof. The same
+   bracket shape is the extension's toolbar icon. */
+.frame::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  pointer-events: none;
+  background-image: linear-gradient(var(--marks), var(--marks)),
+    linear-gradient(var(--marks), var(--marks)), linear-gradient(var(--marks), var(--marks)),
+    linear-gradient(var(--marks), var(--marks)), linear-gradient(var(--marks), var(--marks)),
+    linear-gradient(var(--marks), var(--marks)), linear-gradient(var(--marks), var(--marks)),
+    linear-gradient(var(--marks), var(--marks));
+  background-size: 13px 1px, 1px 13px, 13px 1px, 1px 13px, 13px 1px, 1px 13px, 13px 1px, 1px 13px;
+  background-position: 0 0, 0 0, 100% 0, 100% 0, 0 100%, 0 100%, 100% 100%, 100% 100%;
+  background-repeat: no-repeat;
+}
+
+.frame-empty {
+  text-align: center;
+  max-width: 30ch;
+}
+
+/* The human voice, first of two appearances. */
+.invite {
+  margin: 0 0 6px;
+  font-family: var(--human);
+  font-size: 16px;
+  letter-spacing: 0.01em;
+  color: var(--fg);
+}
+
+.invite-sub {
+  margin: 0;
+  font-size: 10.5px;
+  line-height: 1.65;
+  color: var(--fg-dim);
+  text-wrap: balance;
+}
+
+/* The shortcut sits on its own line: inline kbd caps inside a sentence break
+   across lines in a 320px panel and shred the phrase. */
+.invite-keys {
+  margin: 11px 0 0;
+  display: flex;
+  justify-content: center;
+  gap: 3px;
+}
+
+.frame img {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-height: 260px;
+  object-fit: contain;
+}
+
+/* Once there is an image, the frame stops stretching and hugs it. Left to grow,
+   it would leave a dead band under the screenshot with the readout floating in
+   it, and the crop marks would frame empty space instead of the capture. */
+.frame.filled {
+  padding: 0;
+  display: block;
+  flex: 0 0 auto;
+  min-height: 0;
+  background: var(--surface);
+}
+
+/* Over a screenshot, a fixed grey would vanish against light captures and glare
+   against dark ones. Difference blending inverts whatever is underneath, so the
+   marks stay legible on any capture, which is exactly how registration marks
+   behave when they print over artwork. */
+.frame.filled::before {
+  --marks: #ffffff;
+  mix-blend-mode: difference;
+}
+
+.discard {
+  position: absolute;
+  z-index: 3;
+  top: 7px;
+  right: 7px;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  border-radius: 2px;
+  background: var(--fg);
+  color: var(--bg);
+  font: 400 14px/1 var(--mono);
+  cursor: pointer;
+}
+
+/* Dimension readout, bottom-right, like a viewfinder. */
+.gauge {
+  position: absolute;
+  z-index: 3;
+  right: 0;
+  bottom: 0;
+  margin: 0;
+  padding: 4px 7px;
+  font-size: 9.5px;
+  letter-spacing: 0.08em;
+  color: var(--bg);
+  background: var(--fg);
+}
+
+/* Marching ants: the universal "select something" idiom, and the panel's one
+   moment of motion. Driven by :has() off the armed mode button, so no extra
+   class plumbing is needed in panel.js. */
+.stage:has(.mode.armed) .frame::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  pointer-events: none;
+  background-image: repeating-linear-gradient(90deg, var(--proof) 0 5px, transparent 5px 10px),
+    repeating-linear-gradient(90deg, var(--proof) 0 5px, transparent 5px 10px),
+    repeating-linear-gradient(0deg, var(--proof) 0 5px, transparent 5px 10px),
+    repeating-linear-gradient(0deg, var(--proof) 0 5px, transparent 5px 10px);
+  background-size: 100% 1px, 100% 1px, 1px 100%, 1px 100%;
+  background-position: 0 0, 0 100%, 0 0, 100% 0;
+  background-repeat: no-repeat;
+  animation: ants 520ms linear infinite;
+}
+
+@keyframes ants {
+  to {
+    background-position: 10px 0, -10px 100%, 0 -10px, 100% 10px;
+  }
+}
+
+/* ------------------------------------------------------------------ modes -- */
+
+.modes {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  margin-top: 10px;
+  border: 1px solid var(--rule);
+  background: var(--rule);
+  gap: 1px; /* the gap IS the hairline: background shows through */
+}
+
+.mode {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 5px;
+  padding: 9px 4px 8px;
+  border: none;
+  background: var(--bg);
+  color: var(--fg);
+  font: 500 9.5px/1 var(--mono);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: color 120ms, background 120ms;
+}
+
+.mode:hover:not(:disabled) {
+  color: var(--proof);
+}
+
+.mode:disabled {
+  color: var(--fg-dim);
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.mode.armed {
+  color: var(--bg);
+  background: var(--proof);
+}
+
+.mode svg {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.mode svg.fill {
+  fill: currentColor;
+  stroke-width: 0.9;
+}
+
+/* ------------------------------------------------------------- annotation -- */
+
+textarea {
+  display: block;
+  width: 100%;
+  padding: 11px 12px;
+  border: 1px solid var(--rule);
+  background: var(--surface);
+  color: var(--fg);
+  /* The human voice, second and last appearance. */
+  font: 13.5px/1.55 var(--human);
+  resize: vertical;
+  min-height: 74px;
+}
+
+textarea::placeholder {
+  color: var(--fg-dim);
+  opacity: 0.8;
+}
+
+/* ------------------------------------------------------------------ chips -- */
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px;
+  border: 1px solid var(--rule);
+  color: var(--fg-dim);
+  font-size: 10.5px;
+  cursor: pointer;
+  user-select: none;
+  transition: border-color 120ms, color 120ms;
+}
+
+/* The native box is kept for keyboard and screen readers, and hidden visually:
+   the chip itself is the affordance. */
+.chip input {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.chip:has(input:checked) {
+  border-color: var(--rule-strong);
+  color: var(--fg);
+}
+
+.chip:has(input:focus-visible) {
+  outline: 2px solid var(--proof);
+  outline-offset: 1px;
+}
+
+.chip-name::before {
+  content: "+ ";
+  color: var(--fg-dim);
+}
+
+/* The tick is deliberately NOT magenta. Four ticks would be the loudest thing
+   on screen, on the least important control, and the signal colour is reserved
+   for what actually needs attention: a non-zero count, an armed mode, the
+   marquee. */
+.chip:has(input:checked) .chip-name::before {
+  content: "✓ ";
+  color: var(--fg);
+}
+
+.count {
+  font-style: normal;
+  font-size: 9.5px;
+  color: var(--fg-dim);
+}
+
+/* Magenta means marked for correction, here too: a count only earns the signal
+   colour when there is actually something to report. */
+.count.has {
+  color: var(--proof);
+  font-weight: 600;
+}
+
+.footnote {
+  margin: 8px 0 0;
+  font-size: 10.5px;
+  line-height: 1.5;
+  color: var(--fg-dim);
+}
+
+/* ------------------------------------------------------------------- send -- */
+
+.send {
+  display: block;
+  width: 100%;
+  padding: 13px;
+  border: none;
+  background: var(--fg);
+  color: var(--bg);
+  font: 500 10.5px/1 var(--mono);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: opacity 120ms;
+}
+
+.send:hover:not(:disabled) {
+  opacity: 0.88;
+}
+
+.send:disabled {
+  background: none;
+  color: var(--fg-dim);
+  box-shadow: inset 0 0 0 1px var(--rule);
+  cursor: not-allowed;
+}
+
+.send.busy {
+  cursor: progress;
+}
+
+/* ---------------------------------------------------------------- receipt -- */
+
+.receipt {
+  margin-top: 12px;
+  padding: 11px 12px;
+  border-left: 2px solid var(--proof);
+  background: var(--bg-sunken);
+}
+
+.receipt-head {
+  margin: 0 0 6px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--fg);
+}
+
+.receipt-path {
+  display: block;
+  font-family: var(--mono);
+  font-size: 9.5px;
+  line-height: 1.55;
+  color: var(--fg-dim);
+  word-break: break-all;
+}
+
+.receipt-acts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 9px;
+}
+
+.ghost-link {
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--proof);
+  font: 10.5px var(--mono);
+  cursor: pointer;
+  text-decoration: none;
+  border-bottom: 1px solid currentColor;
+}
+
+.ghost-link:hover {
+  color: var(--fg);
+}
+
+.proof {
+  margin: 10px 0 0;
+  padding: 11px 12px;
+  max-height: 230px;
+  overflow: auto;
+  border: 1px solid var(--rule);
+  background: var(--surface);
+  font: 9.5px/1.6 var(--mono);
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--fg-dim);
+}
+
+/* --------------------------------------------------------------- colophon -- */
+
+.colophon {
+  margin-top: var(--gap);
+  padding: 10px var(--pad);
+  border-top: 1px solid var(--rule);
+  background: var(--bg-sunken);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.stamp {
+  font-size: 9.5px;
+  letter-spacing: 0.08em;
+  color: var(--fg-dim);
+}
+
+kbd {
+  display: inline-block;
+  padding: 1px 4px;
+  border: 1px solid var(--rule-strong);
+  font: 9.5px var(--mono);
+  color: var(--fg-dim);
+}
+
+/* ------------------------------------------------------------------ focus -- */
+
+:focus-visible {
+  outline: 2px solid var(--proof);
+  outline-offset: 1px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+
+  /* The marquee is the armed state's only indicator, so it must stay legible
+     when the motion is removed. */
+  .stage:has(.mode.armed) .frame::after {
+    background-image: linear-gradient(var(--proof), var(--proof)),
+      linear-gradient(var(--proof), var(--proof)), linear-gradient(var(--proof), var(--proof)),
+      linear-gradient(var(--proof), var(--proof));
+  }
+}

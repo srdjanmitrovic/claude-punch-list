@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Claude Debug Reporter</title>
+    <link rel="stylesheet" href="panel.css" />
+  </head>
+  <body>
+    <header class="masthead">
+      <div class="masthead-row">
+        <span class="dot" id="status-dot" aria-hidden="true"></span>
+        <p class="target" id="target-url" title="">Resolving tab</p>
+        <button class="ghost" id="refresh-context" type="button" title="Re-read the page log">
+          <svg viewBox="0 0 16 16" aria-hidden="true">
+            <path d="M13.5 8a5.5 5.5 0 1 1-1.7-4M13 1.5V5H9.5" />
+          </svg>
+          <span class="sr">Re-read the page log</span>
+        </button>
+      </div>
+    </header>
+
+    <div class="notice" id="banner" hidden></div>
+
+    <main>
+      <!-- Signature element: the proof frame. Crop marks at the corners, a
+           marching-ants marquee while a capture mode is armed. -->
+      <section class="stage">
+        <div class="frame" id="preview">
+          <div class="frame-empty" id="preview-empty">
+            <p class="invite">Frame the defect.</p>
+            <p class="invite-sub">Drag a region, pick an element, or grab the screen.</p>
+            <p class="invite-keys">
+              <kbd>Alt</kbd><kbd>Shift</kbd><kbd>C</kbd>
+            </p>
+          </div>
+          <img id="preview-img" alt="Captured screenshot" hidden />
+          <button class="discard" id="preview-clear" type="button" title="Discard capture" hidden>
+            <span aria-hidden="true">×</span><span class="sr">Discard capture</span>
+          </button>
+          <p class="gauge" id="preview-meta" hidden></p>
+        </div>
+
+        <div class="modes" role="group" aria-label="Capture mode">
+          <button class="mode" id="mode-region" type="button">
+            <svg viewBox="0 0 20 20" aria-hidden="true">
+              <path d="M2.5 6.5v-4h4M13.5 2.5h4v4M17.5 13.5v4h-4M6.5 17.5h-4v-4" />
+            </svg>
+            <span>Region</span>
+          </button>
+          <button class="mode" id="mode-element" type="button">
+            <svg viewBox="0 0 20 20" aria-hidden="true" class="fill">
+              <path d="M4.5 3v11.4l3-2.9 2 4.7 2.2-1-2-4.6h4.2z" />
+            </svg>
+            <span>Element</span>
+          </button>
+          <button class="mode" id="mode-visible" type="button">
+            <svg viewBox="0 0 20 20" aria-hidden="true">
+              <rect x="2.5" y="4.5" width="15" height="11" rx="1" />
+              <path d="M2.5 8h15" />
+            </svg>
+            <span>Screen</span>
+          </button>
+        </div>
+      </section>
+
+      <section>
+        <label class="key" for="description">What's wrong</label>
+        <textarea
+          id="description"
+          rows="3"
+          placeholder="The total shows NaN once a coupon is applied. It should show the discounted price."
+        ></textarea>
+      </section>
+
+      <section>
+        <p class="key">Attach</p>
+        <ul class="chips" id="toggles">
+          <li>
+            <label class="chip">
+              <input type="checkbox" id="inc-console" checked />
+              <span class="chip-name">console</span>
+              <em class="count" id="count-console">0</em>
+            </label>
+          </li>
+          <li>
+            <label class="chip">
+              <input type="checkbox" id="inc-network" checked />
+              <span class="chip-name">network</span>
+              <em class="count" id="count-network">0</em>
+            </label>
+          </li>
+          <li>
+            <label class="chip">
+              <input type="checkbox" id="inc-element" checked />
+              <span class="chip-name">element</span>
+              <em class="count" id="count-element">0</em>
+            </label>
+          </li>
+          <li>
+            <label class="chip">
+              <input type="checkbox" id="inc-page" checked />
+              <span class="chip-name">page</span>
+              <em class="count"></em>
+            </label>
+          </li>
+        </ul>
+        <p class="footnote" id="collector-warning" hidden>
+          No log on this tab. Reload the page to start collecting.
+        </p>
+      </section>
+
+      <section>
+        <button class="send" id="submit" type="button" disabled>
+          <span id="submit-label">Copy for Claude Code</span>
+        </button>
+
+        <div class="receipt" id="result" hidden>
+          <p class="receipt-head" id="result-text">Copied</p>
+          <code class="receipt-path" id="result-path"></code>
+          <div class="receipt-acts">
+            <button class="ghost-link" id="copy-again" type="button">Copy again</button>
+            <button class="ghost-link" id="reveal" type="button">Show file</button>
+            <button class="ghost-link" id="preview-prompt" type="button">Read prompt</button>
+          </div>
+        </div>
+        <pre class="proof" id="prompt-preview" hidden></pre>
+      </section>
+    </main>
+
+    <footer class="colophon">
+      <button class="ghost-link" id="clear-buffers" type="button">Clear collected log</button>
+      <span class="stamp" id="version"></span>
+    </footer>
+
+    <script type="module" src="panel.js"></script>
+  </body>
+</html>

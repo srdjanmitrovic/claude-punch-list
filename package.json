@@ -1,0 +1,23 @@
+{
+  "name": "claude-debug-reporter",
+  "version": "0.1.0",
+  "description": "Chrome extension that turns a browser bug into a paste-ready prompt for Claude Code.",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "node tools/build.mjs",
+    "prompt": "node tools/preview-prompt.mjs",
+    "icons": "python3 tools/make-icons.py"
+  },
+  "keywords": [
+    "chrome-extension",
+    "claude-code",
+    "debugging",
+    "screenshot",
+    "developer-tools"
+  ]
+}

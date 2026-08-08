@@ -1,0 +1,17 @@
+# Release archives, produced by `npm run build`
+dist/
+
+# macOS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# Nothing here needs npm, but keep these out anyway
+node_modules/
+package-lock.json
+
+# Playwright output, if you script screenshots
+.playwright-mcp/

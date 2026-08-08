@@ -1,0 +1,60 @@
+# Build the extension zip and attach it to a GitHub release.
+#
+# Triggered by pushing a version tag:
+#
+#     git tag v0.1.0 && git push origin v0.1.0
+#
+# The build has no dependencies, so there is no install step and no lockfile.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Check the tag matches the manifest version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          MANIFEST=$(node -p "require('./manifest.json').version")
+          if [ "$TAG" != "$MANIFEST" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match manifest version $MANIFEST." >&2
+            echo "Bump manifest.json and package.json, then retag." >&2
+            exit 1
+          fi
+          echo "version=$MANIFEST" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: node tools/build.mjs
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.zip
+            dist/*.sha256
+          generate_release_notes: true
+          body: |
+            ## Install
+
+            1. Download `claude-debug-reporter-v${{ env.version }}.zip` below and unzip it.
+            2. Open `chrome://extensions` and turn on **Developer mode**.
+            3. Click **Load unpacked** and select the unzipped folder.
+            4. Reload any tab you want to debug, so the collector can arm on it.
+
+            Requires Chrome 116 or newer. The `.sha256` file contains the archive checksum;
+            builds are reproducible, so building the same tag locally gives the same hash.
