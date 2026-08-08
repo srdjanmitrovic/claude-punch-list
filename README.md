@@ -158,43 +158,77 @@ The prompt wording lives in one file and is likewise meant to be edited. See
 
 ## Install
 
-### From a release
+There are two ways in, both under a minute. Neither goes through the Chrome Web Store, so both
+use Developer mode.
 
-1. Download `claude-debug-reporter-vX.Y.Z.zip` from the [releases page](../../releases).
-2. Unzip it.
-3. Open `chrome://extensions` and turn on **Developer mode**.
-4. Click **Load unpacked** and select the unzipped folder.
-5. Pin the extension, then reload any tab you want to debug.
-
-### From source
+### From source, which is also the fastest
 
 ```bash
 git clone https://github.com/srdjanmitrovic/claude-debug-reporter.git
 cd claude-debug-reporter
 ```
 
-Then follow steps 3 to 5 above, selecting the repository folder itself. There is nothing to
-install and nothing to compile.
+1. Open `chrome://extensions`
+2. Turn on **Developer mode** (toggle, top right)
+3. Click **Load unpacked** and select the `claude-debug-reporter` folder you just cloned
+4. Pin the extension from the puzzle piece menu, so its icon sits in the toolbar
+5. Reload any tab you want to debug
+
+Nothing to install and nothing to compile. Loading the folder rather than a zip has a second
+benefit: your edits go live. Change a file, press reload on the extension card, and it applies.
+
+### From a release zip
+
+1. Download `claude-debug-reporter-vX.Y.Z.zip` from the [releases page](../../releases)
+2. Unzip it
+3. Follow steps 1 to 5 above, picking the unzipped folder at step 3
 
 Requires Chrome 116 or newer.
 
-> **That last step matters.** Console and network capture works by wrapping `console.error`,
+> **Step 5 is not optional.** Console and network capture works by wrapping `console.error`,
 > `fetch` and `XMLHttpRequest` before the page's own scripts run, which can only happen on a
 > page load that occurs after the extension is enabled. On a tab opened earlier, screenshots
 > still work, but the context counts show a dash and the panel tells you to reload.
 
-## Try it in one minute
+### First run
 
-The repository ships a demo page that breaks on purpose.
+The repository ships a demo page that breaks on purpose, so you can confirm everything works
+without hunting for a real bug.
 
 ```bash
 python3 -m http.server 8000
 ```
 
-Open `http://localhost:8000/tools/demo-page.html`, press <kbd>Alt</kbd><kbd>Shift</kbd><kbd>C</kbd>,
-and drag a box over the total. Now click **Apply** on the page: it fires a failing request, a
-console warning, and an uncaught `TypeError` that leaves `NaN` in the total. Capture again and
-watch the counts fill in.
+Open `http://localhost:8000/tools/demo-page.html` in a **new** tab, then:
+
+1. Click **Apply** on the coupon field. The total turns into `$NaN`, and behind it the page
+   fires a failing request, a console warning, and an uncaught `TypeError`.
+2. Press <kbd>Alt</kbd><kbd>Shift</kbd><kbd>C</kbd>, or click the toolbar icon and choose
+   **Region**.
+3. Drag a box over the order summary.
+4. Check that the **console** and **network** chips now show counts in magenta. That is the
+   collector confirming it caught the error.
+5. Type a sentence and click **Copy for Claude Code**, then paste into a Claude Code session.
+
+You should get a markdown prompt carrying the absolute path to a PNG in
+`~/Downloads/claude-debug/`, the `TypeError` with its stack frames, and the failed request.
+
+### If something does not work
+
+**The counts show a dash.** The tab was open before the extension was enabled. Reload it.
+
+**Every capture opens a "Save as" dialog.** Chrome's "Ask where to save each file before
+downloading" setting is on. Turn it off in `chrome://settings/downloads` and saving becomes
+instant. The extension cannot override that setting, so it waits and tells you instead.
+
+**Nothing happens at all.** The service worker has its own console, separate from the page's.
+On the extension's card in `chrome://extensions`, click **service worker** to open it. Errors
+from `background.js` land there. For the panel itself, right click inside it and choose
+**Inspect**.
+
+**The panel says Chrome blocks this page.** That is accurate and unavoidable on `chrome://`
+pages, the Web Store, other extensions' pages, and `view-source:`. Open a normal http or https
+page. For local files, turn on "Allow access to file URLs" on the extension's card.
 
 ## What gets attached
 
