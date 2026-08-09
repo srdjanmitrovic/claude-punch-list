@@ -13,6 +13,7 @@ import { buildPrompt } from '../shared/prompt-template.js';
 const SAVE_FOLDER = 'claude-debug';
 const SLOW_DOWNLOAD_HINT_MS = 2500;
 const ARM_TIMEOUT_MS = 3000; // cap on waiting for an in-flight arm to settle
+const DRAFT_TTL_MS = 24 * 60 * 60 * 1000; // how long an uncopied description survives
 
 const el = {
   statusDot: document.getElementById('status-dot'),
@@ -642,6 +643,9 @@ function updateSubmitState() {
 function persist() {
   chrome.storage.local.set({
     cdrDraft: el.description.value,
+    // Rewritten on every keystroke, so age is measured from the last edit
+    // rather than from whenever the description was started.
+    cdrDraftAt: Date.now(),
     cdrInclude: {
       console: el.incConsole.checked,
       network: el.incNetwork.checked,
@@ -651,9 +655,30 @@ function persist() {
   });
 }
 
+/**
+ * Restore the panel, dropping a description that has gone stale.
+ *
+ * resetAfterCopy retires the draft that was used. This covers the one that was
+ * not: text typed against a bug, never copied, still in the textarea against an
+ * unrelated page later. Past a day that is far more likely to be forgotten
+ * debris than work in progress.
+ *
+ * Only ever applied here, at startup. A panel left open for a week keeps its
+ * text, because pulling a description out from under someone looking at it
+ * would be worse than the staleness this is meant to fix.
+ */
 async function restore() {
-  const stored = await chrome.storage.local.get(['cdrDraft', 'cdrInclude']);
-  if (typeof stored.cdrDraft === 'string') el.description.value = stored.cdrDraft;
+  const stored = await chrome.storage.local.get(['cdrDraft', 'cdrDraftAt', 'cdrInclude']);
+
+  const draft = typeof stored.cdrDraft === 'string' ? stored.cdrDraft : '';
+  const savedAt = stored.cdrDraftAt;
+  const expired = typeof savedAt === 'number' && Date.now() - savedAt > DRAFT_TTL_MS;
+
+  // Drop it from storage rather than merely declining to show it, so a stale
+  // draft cannot outlive the check that rejected it.
+  if (expired) chrome.storage.local.remove(['cdrDraft', 'cdrDraftAt']);
+  else el.description.value = draft;
+
   const include = stored.cdrInclude;
   if (include) {
     el.incConsole.checked = include.console !== false;
@@ -661,6 +686,12 @@ async function restore() {
     el.incElement.checked = include.element !== false;
     el.incPage.checked = include.page !== false;
   }
+
+  // A draft written before this build carries no stamp, so its real age is
+  // unknown. Stamping it now starts the clock instead of discarding text that
+  // may have been typed minutes before the extension updated. Runs after the
+  // toggles are restored, since persist writes those too.
+  if (el.description.value && savedAt === undefined) persist();
 }
 
 // ---------------------------------------------------------------- wiring --
