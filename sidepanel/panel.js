@@ -313,19 +313,52 @@ function setCapture(capture) {
   refreshContext();
 }
 
+/**
+ * Empty the frame, leaving the receipt alone.
+ *
+ * Split out because the two callers disagree about the receipt. The × on the
+ * frame means "start over", so it takes the receipt down with it; the reset
+ * after a copy must not, since the saved path and Copy again are the only
+ * handles left on the report that just went out.
+ */
 function clearCapture() {
   state.capture = null;
   state.element = null;
+  state.captureUrl = '';
+  state.captureTabId = null;
   el.previewImg.hidden = true;
   el.previewImg.removeAttribute('src');
   el.previewEmpty.hidden = false;
   el.previewClear.hidden = true;
   el.previewMeta.hidden = true;
   el.preview.classList.remove('filled');
-  el.result.hidden = true;
-  el.promptPreview.hidden = true;
   setCount(el.countElement, null);
   updateSubmitState();
+}
+
+function discardCapture() {
+  clearCapture();
+  el.result.hidden = true;
+  el.promptPreview.hidden = true;
+}
+
+/**
+ * Retire the inputs once a report has actually reached the clipboard.
+ *
+ * The draft is written to storage on every keystroke so that closing the panel
+ * cannot lose it, and a side panel is closed constantly. The cost of that
+ * durability is that a description outlives the report it was written for and
+ * comes back, stale, against an unrelated screenshot days later. A successful
+ * copy is the moment it has served its purpose, so that is where it is dropped.
+ *
+ * Deliberately not called when the clipboard was blocked, nor when the save
+ * failed: in both cases the user is still mid-report and may need to retry, and
+ * clearing the inputs out from under them would destroy the work.
+ */
+function resetAfterCopy() {
+  el.description.value = '';
+  clearCapture();
+  persist();
 }
 
 async function arm(mode) {
@@ -568,7 +601,11 @@ async function saveAndCopy() {
     el.promptPreview.textContent = prompt;
     el.promptPreview.hidden = Boolean(method);
     showBanner(null);
-    persist();
+
+    // The prompt is already captured in state.lastPrompt and in the hidden
+    // proof block, so Copy again and Read prompt keep working against an
+    // emptied panel.
+    if (method) resetAfterCopy();
   } catch (error) {
     // Saving the image failed, but the assembled text is still worth having,
     // so fall back to a prompt with no screenshot path rather than nothing.
@@ -686,7 +723,7 @@ chrome.runtime.onMessage.addListener((message, sender) => {
 el.modeRegion.addEventListener('click', () => arm('region'));
 el.modeElement.addEventListener('click', () => arm('element'));
 el.modeVisible.addEventListener('click', captureVisible);
-el.previewClear.addEventListener('click', clearCapture);
+el.previewClear.addEventListener('click', discardCapture);
 el.submit.addEventListener('click', saveAndCopy);
 el.refreshContext.addEventListener('click', refreshContext);
 el.description.addEventListener('input', persist);
