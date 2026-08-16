@@ -1,6 +1,6 @@
 {
   "name": "claude-debug-reporter",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Chrome extension that turns a browser bug into a paste-ready prompt for Claude Code.",
   "license": "MIT",
   "private": true,
