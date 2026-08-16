@@ -15,6 +15,30 @@ const SLOW_DOWNLOAD_HINT_MS = 2500;
 const ARM_TIMEOUT_MS = 3000; // cap on waiting for an in-flight arm to settle
 const DRAFT_TTL_MS = 24 * 60 * 60 * 1000; // how long an uncopied description survives
 
+/**
+ * How the annotation field presents itself per intent.
+ *
+ * The prompt wording lives in shared/prompt-template.js; this is only the panel
+ * asking the right question. Leaving it out would let someone answer "What's
+ * wrong" while the prompt underneath says "What should change".
+ *
+ * The bug entry must match the markup in panel.html, which carries it as the
+ * pre-restore default so the field is never briefly unlabelled.
+ */
+const INTENT_UI = {
+  bug: {
+    label: "What's wrong",
+    placeholder:
+      'The total shows NaN once a coupon is applied. It should show the discounted price.',
+  },
+  change: {
+    label: 'What should change',
+    placeholder:
+      'The coupon field should validate as you type instead of only on submit, so the ' +
+      'discounted total updates inline.',
+  },
+};
+
 const el = {
   statusDot: document.getElementById('status-dot'),
   targetUrl: document.getElementById('target-url'),
@@ -30,6 +54,9 @@ const el = {
   previewClear: document.getElementById('preview-clear'),
   previewMeta: document.getElementById('preview-meta'),
 
+  intentBug: document.getElementById('intent-bug'),
+  intentChange: document.getElementById('intent-change'),
+  descriptionLabel: document.getElementById('description-label'),
   description: document.getElementById('description'),
 
   incConsole: document.getElementById('inc-console'),
@@ -59,6 +86,7 @@ const el = {
 const state = {
   tab: null,
   restriction: null,
+  intent: 'bug', // 'bug' | 'change'; matches the pressed segment in panel.html
   armedMode: null, // 'region' | 'element' | null
   armedTabId: null, // which tab that arm was issued against
   armPending: null, // in-flight cdr:arm, so a fast cancel cannot overtake it
@@ -104,6 +132,38 @@ function setArmed(mode, tabId = null) {
   ]) {
     node.classList.toggle('armed', name === mode);
   }
+}
+
+/**
+ * Choose which report this is, and re-ask the question to match.
+ *
+ * The capture flow underneath is identical: same screenshot, same buffers, same
+ * file on disk. Only the prompt's framing and the wording of this one field
+ * change, which is why nothing here touches the attach toggles. Silently
+ * unchecking console on a suggestion would drop evidence the user chose to
+ * include, and a suggestion often comes from noticing something in that log.
+ */
+function setIntent(intent) {
+  // Named rather than looked up, so a stored value that happens to name an
+  // Object.prototype member cannot pass the check and then read as undefined.
+  // Anything unrecognised, including the absent key on a pre-upgrade install,
+  // falls back to the mode this extension started life as.
+  const chosen = intent === 'change' ? 'change' : 'bug';
+  state.intent = chosen;
+
+  for (const [name, node] of [
+    ['bug', el.intentBug],
+    ['change', el.intentChange],
+  ]) {
+    const on = name === chosen;
+    node.classList.toggle('on', on);
+    node.setAttribute('aria-pressed', String(on));
+  }
+
+  el.descriptionLabel.textContent = INTENT_UI[chosen].label;
+  // Only ever visible against an empty field, so swapping it cannot disturb
+  // anything already typed.
+  el.description.placeholder = INTENT_UI[chosen].placeholder;
 }
 
 function timestamp(date = new Date()) {
@@ -563,6 +623,7 @@ function staleCaptureUrl() {
 function assembleReport(screenshotPath) {
   const collected = state.context?.collected || {};
   return {
+    intent: state.intent,
     description: el.description.value,
     screenshotPath,
     pageChangedFrom: staleCaptureUrl(),
@@ -646,6 +707,9 @@ function persist() {
     // Rewritten on every keystroke, so age is measured from the last edit
     // rather than from whenever the description was started.
     cdrDraftAt: Date.now(),
+    // Sticky like the toggles rather than cleared with the draft: someone who
+    // files suggestions is usually about to file another one.
+    cdrIntent: state.intent,
     cdrInclude: {
       console: el.incConsole.checked,
       network: el.incNetwork.checked,
@@ -668,7 +732,17 @@ function persist() {
  * would be worse than the staleness this is meant to fix.
  */
 async function restore() {
-  const stored = await chrome.storage.local.get(['cdrDraft', 'cdrDraftAt', 'cdrInclude']);
+  const stored = await chrome.storage.local.get([
+    'cdrDraft',
+    'cdrDraftAt',
+    'cdrIntent',
+    'cdrInclude',
+  ]);
+
+  // Must precede the persist() at the end of this function, which writes
+  // state.intent back out. Restoring the intent afterwards would let that call
+  // overwrite a stored 'change' with the 'bug' default still sitting in state.
+  setIntent(stored.cdrIntent);
 
   const draft = typeof stored.cdrDraft === 'string' ? stored.cdrDraft : '';
   const savedAt = stored.cdrDraftAt;
@@ -755,6 +829,18 @@ el.modeRegion.addEventListener('click', () => arm('region'));
 el.modeElement.addEventListener('click', () => arm('element'));
 el.modeVisible.addEventListener('click', captureVisible);
 el.previewClear.addEventListener('click', discardCapture);
+
+for (const [intent, node] of [
+  ['bug', el.intentBug],
+  ['change', el.intentChange],
+]) {
+  node.addEventListener('click', () => {
+    if (state.intent === intent) return;
+    setIntent(intent);
+    persist();
+  });
+}
+
 el.submit.addEventListener('click', saveAndCopy);
 el.refreshContext.addEventListener('click', refreshContext);
 el.description.addEventListener('input', persist);

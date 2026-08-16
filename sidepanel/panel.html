@@ -65,7 +65,16 @@
       </section>
 
       <section>
-        <label class="key" for="description">What's wrong</label>
+        <!-- Sits above the field because it rewrites the field's own label and
+             placeholder. The choice belongs next to what it changes. -->
+        <div class="intents" role="group" aria-label="Report intent">
+          <button class="intent on" id="intent-bug" type="button" aria-pressed="true">Bug</button>
+          <button class="intent" id="intent-change" type="button" aria-pressed="false">
+            Suggestion
+          </button>
+        </div>
+
+        <label class="key" for="description" id="description-label">What's wrong</label>
         <textarea
           id="description"
           rows="3"

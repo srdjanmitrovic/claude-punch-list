@@ -1,7 +1,8 @@
 /**
  * Render the prompt template against sample data.
  *
- *     node tools/preview-prompt.mjs
+ *     node tools/preview-prompt.mjs           # bug report
+ *     node tools/preview-prompt.mjs change    # suggested change
  *
  * Editing shared/prompt-template.js normally means reloading the extension and
  * capturing something to see the result. This skips all of that: it imports the
@@ -14,8 +15,21 @@
 
 import { buildPrompt } from '../shared/prompt-template.js';
 
+// Same page, same evidence, two reasons for reporting it. Reading the pair back
+// to back is the point: everything between the first line and the last should
+// be byte for byte identical.
+const DESCRIPTIONS = {
+  bug: 'The order total shows NaN after applying a coupon. Expected the discounted price.',
+  change:
+    'The coupon field should validate as you type instead of only on submit, so the discounted ' +
+    'total updates inline.',
+};
+
+const intent = process.argv[2] === 'change' ? 'change' : 'bug';
+
 const sample = {
-  description: 'The order total shows NaN after applying a coupon. Expected the discounted price.',
+  intent,
+  description: DESCRIPTIONS[intent],
   screenshotPath: '/Users/you/Downloads/claude-debug/2026-08-07_20-51-33_localhost-checkout.png',
   capturedAt: new Date('2026-08-07T20:51:33').toLocaleString(),
   page: {
@@ -68,6 +82,6 @@ const prompt = buildPrompt(sample);
 console.log(prompt);
 console.log('\n' + '-'.repeat(60));
 console.log(
-  `${prompt.length} characters, roughly ${Math.ceil(prompt.length / 4)} tokens, ` +
-    `${prompt.split('\n').length} lines`
+  `intent: ${intent} — ${prompt.length} characters, roughly ` +
+    `${Math.ceil(prompt.length / 4)} tokens, ${prompt.split('\n').length} lines`
 );

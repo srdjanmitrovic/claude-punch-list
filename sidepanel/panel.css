@@ -419,6 +419,50 @@ main {
 
 /* ------------------------------------------------------------- annotation -- */
 
+/*
+ * The same hairline-grid construction as .modes, two up: the 1px gap over a
+ * --rule background IS the divider.
+ *
+ * Deliberately NOT magenta when selected. --proof means "marked for
+ * correction" and every other use of it is transient (an armed mode, a count
+ * that just went non-zero). One of these two segments is lit permanently, so
+ * painting it magenta would turn a signal into furniture.
+ *
+ * Nor a full ink inversion, for the same reason at a different volume: --fg is
+ * near-white here, and a permanently filled half-width bar of it outshines both
+ * the frame and the send button. --rule-strong keeps the filled-cell idiom that
+ * .mode.armed establishes, quiet enough to stay a setting rather than a signal.
+ */
+.intents {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  margin: 0 0 11px;
+  border: 1px solid var(--rule);
+  background: var(--rule);
+  gap: 1px;
+}
+
+.intent {
+  padding: 8px 4px;
+  border: none;
+  background: var(--bg);
+  color: var(--fg-dim);
+  font: 500 9.5px/1 var(--mono);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: color 120ms, background 120ms;
+}
+
+.intent:hover:not(.on) {
+  color: var(--fg);
+}
+
+.intent.on {
+  background: var(--rule-strong);
+  color: var(--fg);
+}
+
 textarea {
   display: block;
   width: 100%;

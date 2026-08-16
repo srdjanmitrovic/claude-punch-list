@@ -17,11 +17,14 @@
  *     shallower answers; that is sometimes what you want.
  *   - Whether to tell it to read the screenshot. Claude Code will not open the
  *     image unless something points at it, hence the explicit line.
+ *   - The wording of each intent in INTENTS below. Those eight strings are the
+ *     entire difference between reporting a bug and proposing a change.
  *
  * Edit freely and reload the extension. No other file needs to change.
  * ─────────────────────────────────────────────────────────────────────────────
  *
  * @typedef {Object} Report
+ * @property {'bug'|'change'=} intent Which voice to speak in. See INTENTS below.
  * @property {string}  description   What the user typed.
  * @property {string=} screenshotPath Absolute path to the saved PNG.
  * @property {Object=} page          { url, title, viewport:{width,height,dpr} }
@@ -34,6 +37,48 @@
  *                                   when the page navigated before saving, so
  *                                   the image and the console output disagree.
  */
+
+/**
+ * The two voices this template speaks in.
+ *
+ * The evidence is identical either way. A screenshot, a console buffer and a DOM
+ * node describe the page the same regardless of why it is being reported, so
+ * only the framing around that evidence changes: the opening directive, the
+ * heading over the user's own words, the reason to open the image, and the
+ * closing instruction. Keeping those four strings here rather than forking
+ * buildPrompt is what stops the two prompts drifting apart in the parts that
+ * were never supposed to differ.
+ *
+ * The closing lines are where the two really diverge, and they are worth
+ * reading as a pair. A bug has a root cause and asking for it first is what
+ * stops Claude Code patching the symptom. A change has no root cause; the
+ * corresponding risk is that it quietly grows, so that line asks for the
+ * smallest version instead.
+ *
+ * 'bug' is the fallback for any report with no intent, which covers drafts made
+ * before this existed and the sample in tools/preview-prompt.mjs.
+ */
+const INTENTS = {
+  bug: {
+    lead: (url) => (url ? `Fix this issue on ${url}` : 'Fix this issue on the captured page'),
+    heading: "What's wrong",
+    screenshot: 'Read that image before anything else. It shows the problem as rendered.',
+    closing:
+      'Find the root cause in this codebase before changing anything. ' +
+      'If the screenshot and the console point at different things, say so rather than guessing.',
+  },
+  change: {
+    lead: (url) => (url ? `Make this change on ${url}` : 'Make this change on the captured page'),
+    heading: 'What should change',
+    screenshot:
+      'Read that image before anything else. It shows the current behaviour, which is what ' +
+      'this change is measured against.',
+    closing:
+      'Find where this is implemented before writing anything, and follow the patterns already ' +
+      'in this codebase rather than introducing new ones. If the change is larger than it looks, ' +
+      'say so and propose the smallest version that delivers it.',
+  },
+};
 
 /** Fence a block of text, avoiding accidental fence collisions. */
 function fence(body, language = '') {
@@ -93,17 +138,16 @@ function formatStyles(styles = {}) {
 export function buildPrompt(report) {
   const sections = [];
   const url = report.page?.url || '';
+  const voice = INTENTS[report.intent] || INTENTS.bug;
 
-  sections.push(url ? `Fix this issue on ${url}` : 'Fix this issue on the captured page');
+  sections.push(voice.lead(url));
 
   sections.push(
-    `## What's wrong\n${report.description?.trim() || '(no description given)'}`
+    `## ${voice.heading}\n${report.description?.trim() || '(no description given)'}`
   );
 
   if (report.screenshotPath) {
-    sections.push(
-      `## Screenshot\n${report.screenshotPath}\n\nRead that image before anything else. It shows the problem as rendered.`
-    );
+    sections.push(`## Screenshot\n${report.screenshotPath}\n\n${voice.screenshot}`);
   }
 
   if (report.page) {
@@ -148,10 +192,7 @@ export function buildPrompt(report) {
     sections.push(`## Selected element\n${parts.join('\n')}`);
   }
 
-  sections.push(
-    '---\nFind the root cause in this codebase before changing anything. ' +
-      'If the screenshot and the console point at different things, say so rather than guessing.'
-  );
+  sections.push(`---\n${voice.closing}`);
 
   return sections.join('\n\n');
 }

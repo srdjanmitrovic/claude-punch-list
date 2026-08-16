@@ -68,9 +68,16 @@ back out.
 The element picker also reads that node's markup and its computed styles, so layout bugs
 arrive with the CSS already attached.
 
-### 2. Say what is wrong
+### 2. Say what is wrong, or what should change
 
 One sentence is usually enough, because the console output travels with it.
+
+Two segments above the field decide which report this is. **Bug** asks Claude Code to find
+the root cause before touching anything. **Suggestion** asks it to find where the behaviour
+lives and follow the patterns already there, and to propose the smallest version first if the
+change turns out to be bigger than it looks. Everything else is the same either way: the same
+capture, the same screenshot on disk, the same console and network evidence attached. Only the
+framing around that evidence changes.
 
 <table>
 <tr>
@@ -304,10 +311,13 @@ Chrome withholds the URL and the panel reports the page as unreadable.
 
 **The prompt.** [`shared/prompt-template.js`](shared/prompt-template.js) is the whole contract
 with Claude Code, and it is the most useful file to edit. Ordering, tone, and how firmly it
-instructs are all yours to set. To see your changes without reloading anything:
+instructs are all yours to set. The `INTENTS` table near the top holds the eight strings that
+separate a bug report from a suggestion, and nothing else differs between them. To see your
+changes without reloading anything:
 
 ```bash
-npm run prompt
+npm run prompt          # bug report
+npm run prompt change   # suggested change
 ```
 
 That renders the real template against a representative report and prints exactly what would
