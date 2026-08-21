@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Panel stage</title>
+    <link rel="icon" href="../icons/icon32.png" />
+    <!--
+      The side panel, running as a web page, beside the demo page it reports on.
+
+          python3 -m http.server 8000
+          open http://localhost:8000/tools/panel-stage.html
+
+      Nothing is loaded as an extension. The panel gets a stand-in chrome.*
+      from chrome-shim.js; the demo tab gets one just big enough to carry the
+      real collector, bridge, overlay and picker. Everything visible is the real
+      code, which is what makes this useful for working on the panel's design
+      without reloading an extension, and for producing the README's images.
+
+      Without a screenshot provider, captures are a grey placeholder. A driver
+      such as Playwright can supply one by exposing window.__pwCapture on this
+      page, returning a PNG data URL of the #demo frame. The panel follows the
+      system colour scheme, as it does in Chrome; a driver can emulate either.
+
+      ?save=2500 makes every save take that many milliseconds, which is how to
+      see the SAVING state and the slow download banner.
+    -->
+    <style>
+      :root {
+        color-scheme: light;
+        --chrome: #dee1e6;
+        --chrome-ink: #3c4043;
+        --tab: #ffffff;
+      }
+      * { box-sizing: border-box; }
+      html, body {
+        margin: 0;
+        height: 100%;
+        background: #f0f0f2;
+        font: 12px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+        color: var(--chrome-ink);
+      }
+      /* Fills whatever window it is given, so a driver sets the size through
+         the viewport. The demo page wants about a thousand pixels beside the
+         panel before its layout folds. */
+      .window {
+        width: 100%;
+        min-width: 1000px;
+        height: 100vh;
+        display: flex;
+        flex-direction: column;
+        background: var(--chrome);
+        overflow: hidden;
+      }
+      .bar {
+        flex: none;
+        height: 40px;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 0 12px;
+      }
+      .lights { display: flex; gap: 7px; }
+      .lights i {
+        width: 11px; height: 11px; border-radius: 50%; display: block;
+        background: #ccc;
+      }
+      .lights i:nth-child(1) { background: #ff5f57; }
+      .lights i:nth-child(2) { background: #febc2e; }
+      .lights i:nth-child(3) { background: #28c840; }
+      .omnibox {
+        flex: 1;
+        height: 26px;
+        display: flex;
+        align-items: center;
+        padding: 0 12px;
+        border-radius: 13px;
+        background: #f1f3f4;
+        color: #5f6368;
+        font-size: 12px;
+        letter-spacing: 0.01em;
+      }
+      .ext {
+        width: 22px; height: 22px; border-radius: 5px;
+        background: url(../icons/icon32.png) center / 16px no-repeat;
+      }
+      .ext.on { background-color: #fff; box-shadow: inset 0 0 0 1px #c6c9ce; }
+      .content {
+        flex: 1;
+        display: flex;
+        min-height: 0;
+        background: var(--tab);
+      }
+      iframe { border: 0; display: block; }
+      #demo { flex: 1; height: 100%; }
+      #panel {
+        flex: none;
+        width: 380px;
+        height: 100%;
+        border-left: 1px solid #c6c9ce;
+      }
+      .cursor {
+        position: fixed;
+        left: 0; top: 0;
+        width: 18px; height: 24px;
+        pointer-events: none;
+        z-index: 10;
+        display: none;
+        filter: drop-shadow(0 1px 1.5px rgba(0,0,0,0.45));
+      }
+    </style>
+  </head>
+  <body>
+    <div class="window" id="window">
+      <div class="bar">
+        <div class="lights"><i></i><i></i><i></i></div>
+        <div class="omnibox" id="omnibox">localhost:8000/tools/demo-page.html</div>
+        <div class="ext on" title="Extension"></div>
+      </div>
+      <div class="content">
+        <iframe id="demo" src="demo-page.html" title="Demo tab"></iframe>
+        <iframe id="panel" title="Side panel"></iframe>
+      </div>
+    </div>
+
+    <!-- A drawn pointer, so a driver that moves the mouse can show where it is.
+         Real pointers never appear in screenshots. -->
+    <svg class="cursor" id="cursor" viewBox="0 0 18 24" aria-hidden="true">
+      <path d="M1.5 1.5v18.2l4.6-4.1 3 6.9 3.3-1.4-3-6.8h6.4z" fill="#fff" stroke="#000" stroke-width="1.2" stroke-linejoin="round"/>
+    </svg>
+
+    <script>
+      (() => {
+        'use strict';
+
+        const params = new URLSearchParams(location.search);
+        const demo = document.getElementById('demo');
+        const panel = document.getElementById('panel');
+        const omnibox = document.getElementById('omnibox');
+        const cursor = document.getElementById('cursor');
+
+        const storage = {};
+        let demoListeners = [];
+
+        const CONTENT = new URL('../content/', location.href);
+        const SIDEPANEL = new URL('../sidepanel/', location.href);
+
+        function demoWindow() {
+          return demo.contentWindow;
+        }
+
+        function inject(file) {
+          const doc = demoWindow().document;
+          return new Promise((resolve, reject) => {
+            const script = doc.createElement('script');
+            script.src = new URL(file, CONTENT).href;
+            script.onload = () => {
+              script.remove();
+              resolve();
+            };
+            script.onerror = () => reject(new Error(`could not load ${file}`));
+            (doc.head || doc.documentElement).appendChild(script);
+          });
+        }
+
+        // The demo tab's own chrome.*: just enough for the bridge to register a
+        // listener and for the overlay and picker to broadcast to the panel.
+        function installDemoShim() {
+          const win = demoWindow();
+          demoListeners = [];
+          win.chrome = {
+            runtime: {
+              onMessage: {
+                addListener(fn) {
+                  demoListeners.push(fn);
+                },
+              },
+              sendMessage(message) {
+                panel.contentWindow.__shim?.broadcast(message, { tab: { id: 1 } });
+                return Promise.resolve();
+              },
+            },
+          };
+        }
+
+        demo.addEventListener('load', async () => {
+          installDemoShim();
+          // The real extension injects these at document_start. Here they land
+          // after the page's own script has run, which is fine for the demo
+          // page: its bug fires on a click, long after either moment.
+          await inject('collector-main.js');
+          await inject('collector-bridge.js');
+          omnibox.textContent = demoWindow().location.href.replace(/^https?:\/\//, '');
+        });
+
+        window.__stage = {
+          storage,
+          tabUrl: () => demoWindow().location.href,
+          tabTitle: () => demoWindow().document.title,
+          downloadsDir: () => '/Users/you/Downloads/',
+          saveDelay: () => Number(params.get('save')) || 0,
+
+          arm(mode) {
+            return inject(mode === 'element' ? 'picker.js' : 'overlay.js');
+          },
+          disarm() {
+            const win = demoWindow();
+            win.__cdrRegionOverlay?.stop();
+            win.__cdrElementPicker?.stop();
+          },
+
+          // chrome.tabs.sendMessage, delivered to whatever the bridge registered.
+          sendToTab(message) {
+            return new Promise((resolve, reject) => {
+              let handled = false;
+              for (const fn of demoListeners) {
+                const keepOpen = fn(message, { tab: { id: 1 } }, (response) => {
+                  handled = true;
+                  resolve(response);
+                });
+                if (keepOpen === true) handled = true;
+              }
+              if (!handled) {
+                reject(new Error('Could not establish connection. Receiving end does not exist.'));
+              }
+            });
+          },
+
+          async capture() {
+            if (typeof window.__pwCapture === 'function') return window.__pwCapture();
+            const canvas = document.createElement('canvas');
+            canvas.width = demo.clientWidth;
+            canvas.height = demo.clientHeight;
+            const context = canvas.getContext('2d');
+            context.fillStyle = '#e8e8ec';
+            context.fillRect(0, 0, canvas.width, canvas.height);
+            context.fillStyle = '#6e6e78';
+            context.font = '24px ui-monospace, Menlo, monospace';
+            context.fillText('no screenshot provider on this stage', 40, 80);
+            return canvas.toDataURL('image/png');
+          },
+
+          // For a driver: place the drawn pointer, in stage coordinates.
+          pointer(x, y) {
+            if (x == null) {
+              cursor.style.display = 'none';
+              return;
+            }
+            cursor.style.display = 'block';
+            cursor.style.transform = `translate(${x}px, ${y}px)`;
+          },
+
+          // "Close and reopen the side panel."
+          reloadPanel: loadPanel,
+        };
+
+        async function loadPanel() {
+          const response = await fetch(new URL('panel.html', SIDEPANEL));
+          let html = await response.text();
+          // Resolve the panel's relative URLs against its real directory, and
+          // get the shim in ahead of panel.js.
+          html = html.replace(
+            '<head>',
+            `<head><base href="${SIDEPANEL.href}">` +
+              `<script src="${new URL('chrome-shim.js', location.href).href}"><\/script>`
+          );
+          panel.srcdoc = html;
+        }
+
+        loadPanel();
+      })();
+    </script>
+  </body>
+</html>

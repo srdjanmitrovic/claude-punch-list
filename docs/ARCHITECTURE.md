@@ -10,8 +10,9 @@ Toolbar icon or Alt+Shift+C
    |
    v
 sidepanel/panel.js ......... orchestrates everything. Captures the tab, crops
-   |                         with a canvas, saves via chrome.downloads, builds
-   |                         and copies the prompt.
+   |                         with a canvas, saves each capture via
+   |                         chrome.downloads as it happens, keeps the list of
+   |                         items, builds and copies the prompt.
    |
    +-- background.js ....... service worker. Side panel behaviour, the keyboard
    |                         command, injecting the capture scripts, and a map
@@ -28,7 +29,7 @@ sidepanel/panel.js ......... orchestrates everything. Captures the tab, crops
                                       fetch and XHR from document_start.
 ```
 
-## Two decisions worth understanding
+## Three decisions worth understanding
 
 ### The collector is split in two
 
@@ -61,6 +62,44 @@ One trap worth knowing. `activeTab` is **not** reliably granted to side panel co
 is why `host_permissions: <all_urls>` is required rather than optional. Without it,
 `captureVisibleTab` and `scripting.executeScript` called from the panel fail even though
 `activeTab` is declared.
+
+### Screenshots are saved when they are taken, not when the report is copied
+
+A report is a list of items, and each item is one capture with its own description, intent,
+page URL and, for the element picker, the node's payload. The moment a capture lands, the
+panel writes its PNG to disk and waits for the absolute path before it considers the item
+complete. Copying then only has to assemble text, which is why it is instant and why it can
+be repeated.
+
+The alternative, saving everything at copy time, was how the single capture version worked,
+and it stops scaling the moment there is more than one file: a partial failure halfway
+through a batch leaves a report that names some paths and not others, and every "Save as"
+dialog stacks up at the end instead of appearing next to the capture that caused it.
+
+Saving early has a consequence the code has to honour in two places. An item discarded
+before it was copied never appears in any prompt, so its file is deleted again with
+`downloads.removeFile` and its history entry with `downloads.erase`. The reset after a
+successful copy must do the opposite and leave every file alone, because the prompt on the
+clipboard names each one by path and Claude Code is about to open them.
+
+It also means the panel never has to keep a full image. Each item holds a WebP thumbnail no
+wider than the frame can display, and the original data URL is released once the download
+has started. That is what makes the report safe to persist: `cdrReport` in
+`chrome.storage.local` holds every item minus its pixels and is rewritten on every keystroke,
+and `cdrThumbs` holds the thumbnails and is rewritten only when an item is added or removed.
+An item is only written once it has a path, so a panel closed mid-save cannot come back
+showing a description of a file that does not exist. A report untouched for a week is dropped
+at startup; the files stay. Files can also go missing within that week, because Downloads
+folders get emptied, so at startup the panel asks `chrome.downloads` whether each one still
+exists and refuses to copy until a missing item is discarded.
+
+Side panels are per window, and every one of them reads and writes the same keys. Rather
+than let the last writer win, each write is stamped with the writing panel's id and every
+panel listens to `chrome.storage.onChanged`: a change carrying another panel's id is adopted
+into the local sheet, keeping only what the local panel alone knows (an item still being
+saved, the sentence being typed). Two windows therefore show one report. The toggle settings
+are written separately from the report, so a panel that never captured anything cannot
+overwrite a report by unticking a box.
 
 ## Message protocol
 
@@ -127,6 +166,11 @@ file before downloading" enabled, the dialog can sit open for minutes, and givin
 throw away a path that is still coming. The loop ends on `complete` or `interrupted`, and
 cancelling the dialog produces the latter with `USER_CANCELED`.
 
+While the poll runs the item is already in the frame, marked SAVING, and the copy button
+stays disabled until no item is in that state. If the save fails the item is removed again
+rather than kept without a path: nothing reached the disk, and an item with no screenshot
+would be a sentence about nothing. The banner says to capture it again.
+
 ## Clipboard
 
 The only precondition Chromium enforces for a sanitized clipboard write from an extension page
@@ -141,8 +185,8 @@ manual copy.
 | :--- | :--- |
 | `host_permissions: <all_urls>` | Screenshot the tab, inject the overlay and picker, and read `tab.url`. Chrome withholds the URL entirely for any origin this does not cover. |
 | `scripting` | Inject the region overlay and element picker on demand |
-| `downloads` | Save the PNG and read back its absolute path |
-| `storage` | Remember the draft text and toggle settings |
+| `downloads` | Save each PNG as it is captured, read back its absolute path, delete it again if the item is discarded, and learn if it has since gone missing |
+| `storage` | Keep the report (items, descriptions, thumbnails) between panel sessions, plus the toggle settings |
 | `sidePanel` | The panel itself |
 
 Note what is **not** in that table. The collector arms via the two `content_scripts` entries
@@ -169,6 +213,22 @@ Note that Chrome withholds `tab.url` entirely for any page the extension has no 
 permission for, so an absent URL is itself the signal that a page is off limits. That is also
 the only observable signal for a blocked `file://` tab, which is why the "enable Allow access
 to file URLs" hint lives in the missing URL branch rather than in a `file://` branch.
+
+## Running the panel outside Chrome
+
+`tools/panel-stage.html` loads the panel as an ordinary web page next to the demo page, with
+`tools/chrome-shim.js` standing in for `chrome.*`. The shim answers the real message protocol
+the way the worker and content scripts would: `cdr:arm` injects the real overlay or picker
+into the demo frame, `cdr:get-context` reaches the real collector through the real bridge,
+and `captureVisibleTab` asks the stage for a screenshot of the demo frame. Everything on
+screen is the actual code; only the platform is faked. Two things it does not reproduce:
+downloads complete instantly unless `?save=<ms>` slows them, and there is only ever one
+panel, so the cross window adoption above cannot be exercised there.
+
+It exists for two reasons. Working on the panel's design no longer means reloading an
+extension for every change, and the README's screenshots and GIF are produced from it by
+`tools/make-media.mjs`, so they can be regenerated rather than redrawn. Nothing under
+`tools/` is included in the release zip.
 
 ## Conventions in the code
 

@@ -24,22 +24,27 @@
 
     <main>
       <!-- Signature element: the proof frame. Crop marks at the corners, a
-           marching-ants marquee while a capture mode is armed. -->
+           marching-ants marquee while a capture mode is armed. It shows the
+           selected item; the strip beneath it holds the rest of the sheet. -->
       <section class="stage">
         <div class="frame" id="preview">
           <div class="frame-empty" id="preview-empty">
-            <p class="invite">Frame the defect.</p>
-            <p class="invite-sub">Drag a region, pick an element, or grab the screen.</p>
+            <p class="invite">Frame what you noticed.</p>
+            <p class="invite-sub">Drag a region, pick an element, or grab the screen. Keep going for as many as you like.</p>
             <p class="invite-keys">
               <kbd>Alt</kbd><kbd>Shift</kbd><kbd>C</kbd>
             </p>
           </div>
           <img id="preview-img" alt="Captured screenshot" hidden />
-          <button class="discard" id="preview-clear" type="button" title="Discard capture" hidden>
-            <span aria-hidden="true">×</span><span class="sr">Discard capture</span>
+          <button class="discard" id="preview-clear" type="button" title="Discard this item" hidden>
+            <span aria-hidden="true">×</span><span class="sr">Discard this item</span>
           </button>
           <p class="gauge" id="preview-meta" hidden></p>
         </div>
+
+        <!-- One thumbnail per item, in capture order. Clicking one brings it
+             into the frame and its description into the field below. -->
+        <div class="strip" id="strip" role="group" aria-label="Captured items" hidden></div>
 
         <div class="modes" role="group" aria-label="Capture mode">
           <button class="mode" id="mode-region" type="button">
@@ -64,7 +69,9 @@
         </div>
       </section>
 
-      <section>
+      <!-- Everything here belongs to the item in the frame. Hidden until there
+           is one, because a description with nothing to attach to has no home. -->
+      <section id="item" hidden>
         <!-- Sits above the field because it rewrites the field's own label and
              placeholder. The choice belongs next to what it changes. -->
         <div class="intents" role="group" aria-label="Report intent">
@@ -122,6 +129,7 @@
       <section>
         <button class="send" id="submit" type="button" disabled>
           <span id="submit-label">Copy for Claude Code</span>
+          <em class="send-count" id="submit-count" hidden></em>
         </button>
 
         <div class="receipt" id="result" hidden>
@@ -129,7 +137,7 @@
           <code class="receipt-path" id="result-path"></code>
           <div class="receipt-acts">
             <button class="ghost-link" id="copy-again" type="button">Copy again</button>
-            <button class="ghost-link" id="reveal" type="button">Show file</button>
+            <button class="ghost-link" id="reveal" type="button">Show files</button>
             <button class="ghost-link" id="preview-prompt" type="button">Read prompt</button>
           </div>
         </div>
@@ -138,7 +146,10 @@
     </main>
 
     <footer class="colophon">
-      <button class="ghost-link" id="clear-buffers" type="button">Clear collected log</button>
+      <div class="colophon-acts">
+        <button class="ghost-link" id="clear-buffers" type="button">Clear collected log</button>
+        <button class="ghost-link" id="discard-all" type="button" hidden>Discard all</button>
+      </div>
       <span class="stamp" id="version"></span>
     </footer>
 

@@ -287,12 +287,18 @@ main {
 
 /* Once there is an image, the frame stops stretching and hugs it. Left to grow,
    it would leave a dead band under the screenshot with the readout floating in
-   it, and the crop marks would frame empty space instead of the capture. */
+   it, and the crop marks would frame empty space instead of the capture.
+
+   The one exception is a short capture. A single table row comes out forty
+   pixels tall, and the discard button and the readout together cover most of
+   it. The floor here is the height at which both controls clear the image, so
+   a short capture sits centred between them on the frame's own surface. */
 .frame.filled {
   padding: 0;
-  display: block;
+  display: grid;
+  place-items: center;
   flex: 0 0 auto;
-  min-height: 0;
+  min-height: 104px;
   background: var(--surface);
 }
 
@@ -358,6 +364,90 @@ main {
   to {
     background-position: 10px 0, -10px 100%, 0 -10px, 100% 10px;
   }
+}
+
+/* ------------------------------------------------------------------ strip -- */
+
+/* The contact sheet. One frame per item, in capture order, scrolling sideways
+   rather than wrapping so the stage keeps a fixed height however long the
+   report gets. Thumbnails keep their own aspect ratio: a tall element crop and
+   a wide region should look as different here as they are. */
+.strip {
+  display: flex;
+  gap: 4px;
+  margin-top: 6px;
+  padding-bottom: 3px;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+.thumb {
+  position: relative;
+  flex: none;
+  height: 44px;
+  padding: 0;
+  border: 1px solid var(--rule);
+  background: var(--surface);
+  cursor: pointer;
+  overflow: hidden;
+}
+
+.thumb:hover {
+  border-color: var(--rule-strong);
+}
+
+/* Selection is ink, not magenta. Which frame is in the viewer is a persistent
+   state, and the signal colour is reserved for transient ones. */
+.thumb.on {
+  border-color: var(--fg);
+  box-shadow: inset 0 0 0 1px var(--fg);
+}
+
+/* The strip clips its overflow to scroll, which would take the top and left
+   edges of the usual outside ring with it. Drawn inside instead. */
+.thumb:focus-visible {
+  outline-offset: -3px;
+}
+
+/* Its file has gone from the disk since it was captured. */
+.thumb.missing img {
+  opacity: 0.35;
+}
+
+.thumb.missing {
+  border-style: dashed;
+}
+
+/* Anchored top left rather than centred: a wide crop of a table row is
+   recognisable by its label at the left edge, not by the blank run in the
+   middle, and a tall one by whatever heads it. */
+.thumb img {
+  display: block;
+  height: 100%;
+  width: auto;
+  min-width: 28px;
+  max-width: 96px;
+  object-fit: cover;
+  object-position: 0 0;
+}
+
+/* The item number, bottom left, same construction as the gauge. Dimmed until
+   the item has a description, so a glance at the strip shows what still needs
+   a sentence. */
+.thumb-n {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  padding: 1px 4px;
+  font: 500 9px/1.3 var(--mono);
+  letter-spacing: 0.06em;
+  color: var(--bg);
+  background: var(--fg-dim);
+  pointer-events: none;
+}
+
+.thumb.noted .thumb-n {
+  background: var(--fg);
 }
 
 /* ------------------------------------------------------------------ modes -- */
@@ -589,6 +679,13 @@ textarea::placeholder {
   cursor: progress;
 }
 
+/* How many items ride along. Only shown past one, when the number is news. */
+.send-count {
+  margin-left: 6px;
+  font-style: normal;
+  opacity: 0.7;
+}
+
 /* ---------------------------------------------------------------- receipt -- */
 
 .receipt {
@@ -660,6 +757,12 @@ textarea::placeholder {
   align-items: center;
   justify-content: space-between;
   gap: 10px;
+}
+
+.colophon-acts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
 }
 
 .stamp {

@@ -35,11 +35,20 @@ Clicking **Apply** on that page fires a failing request, a console warning, and 
 `TypeError`. That gives the collector real data to pick up, so you can verify a change end to
 end rather than against an empty buffer.
 
+For work on the panel itself there is a faster loop. With the same server running, open
+`http://localhost:8000/tools/panel-stage.html`. That is the panel as an ordinary web page
+beside the demo page, with `chrome.*` stood in for by `tools/chrome-shim.js`. Capture modes,
+the collector, the prompt and persistence all work; reload the page to see a change, and
+reload just the panel frame (`__stage.reloadPanel()` in the console) to simulate closing and
+reopening the side panel. Captures are a grey placeholder unless a driver supplies
+screenshots, which is what `tools/make-media.mjs` does to produce the README's images.
+
 Before opening a pull request:
 
 ```bash
-npm run build    # validates the manifest and every path it references
-npm run prompt   # renders the prompt template, in case you touched it
+npm run build          # validates the manifest and every path it references
+npm run prompt         # renders the prompt template, in case you touched it
+npm run prompt mixed   # the same, for a report with several items
 ```
 
 There is no test suite yet. If you add one, please keep it dependency free or make the
@@ -61,6 +70,11 @@ reading a single file, and breaking them tends to fail silently rather than loud
   Filter on `sender.tab.id`.
 * Anything that runs before an `await` in the service worker still holds the user gesture.
   Anything after it does not. `chrome.sidePanel.open()` cares about this.
+* Screenshots go to disk at capture time, and an item is only persisted once it has a path.
+  Discarding an uncopied item deletes its file; the reset after a copy must not, because the
+  prompt on the clipboard names every file.
+* `shared/prompt-template.js` must render a one item report byte for byte as it did before
+  the list existed. `npm run prompt` and `npm run prompt change` are the check.
 
 ## Style
 
