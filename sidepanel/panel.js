@@ -88,7 +88,10 @@ const el = {
   previewClear: document.getElementById('preview-clear'),
   previewMeta: document.getElementById('preview-meta'),
   sheet: document.getElementById('sheet'),
-  strip: document.getElementById('strip'),
+  list: document.getElementById('list'),
+  newItem: document.getElementById('new-item'),
+  selectAll: document.getElementById('select-all'),
+  clearSelection: document.getElementById('clear-selection'),
   tip: document.getElementById('thumb-tip'),
   tipHead: document.getElementById('thumb-tip-head'),
   tipBody: document.getElementById('thumb-tip-body'),
@@ -136,6 +139,7 @@ const el = {
  * @property {number|null} tabId
  * @property {'bug'|'change'} intent
  * @property {string}  description
+ * @property {boolean} included     Ticked: goes into the next prompt.
  * @property {Object|null} element  Payload from picker.js, element mode only.
  * @property {number}  capturedAt   Epoch ms.
  * @property {string|null} thumb    Downscaled image for the frame and the strip.
@@ -156,7 +160,9 @@ const state = {
   armPending: null, // in-flight cdr:arm, so a fast cancel cannot overtake it
   /** @type {Item[]} */
   items: [],
-  selectedId: null, // the item in the frame, whose description the field edits
+  // The item in the frame, whose description the field edits. Distinct from
+  // the ticks: any number of items can be ticked, one at most is in the frame.
+  selectedId: null,
   context: null, // { page, collected }
   lastDownloadId: null,
   lastPrompt: '',
@@ -477,11 +483,10 @@ function renderFrame() {
 }
 
 /**
- * What a screen reader gets for a thumbnail; the number alone says nothing.
- * The sentence itself rides along, cut short, since the tooltip that shows it
- * to a sighted user is not announced.
+ * What a screen reader gets for a row's pick button; the number alone says
+ * nothing. The sentence itself rides along, cut short.
  */
-function describeThumb(item, index) {
+function describeRow(item, index) {
   const head = `Item ${index + 1}, ${MODE_LABEL[item.mode].toLowerCase()}`;
   if (item.missing) return `${head}, file missing`;
   const words = item.description.trim();
@@ -489,13 +494,19 @@ function describeThumb(item, index) {
   return `${head}: ${words.length > 90 ? `${words.slice(0, 90)}…` : words}`;
 }
 
+/** The small readout above a row's sentence. */
+function rowHead(item, index) {
+  const status = item.missing ? ' · FILE MISSING' : item.path ? '' : ' · SAVING';
+  return `${index + 1} · ${MODE_LABEL[item.mode]}${status}`;
+}
+
 /**
- * Read an item's sentence back over its thumbnail.
+ * Read an item's whole sentence back over its row, when the row cut it short.
  *
- * One element, positioned with fixed coordinates, because the strip scrolls
- * and a scroll container clips anything positioned inside it. Above the
- * thumbnail when there is room, which there always is now that the strip sits
- * near the bottom of the panel; below it otherwise.
+ * One element, positioned with fixed coordinates, because the list scrolls
+ * and a scroll container clips anything positioned inside it. Above the row
+ * when there is room, which there usually is now that the sheet sits near the
+ * bottom of the panel; below it otherwise.
  */
 function showTip(button, item, index) {
   const words = item.description.trim();
@@ -526,7 +537,7 @@ function hideTip() {
 /**
  * How focus last arrived: from a key or from a pointer.
  *
- * A click focuses a thumbnail as surely as Tab does, and renderStrip puts
+ * A click focuses a row's button as surely as Tab does, and renderSheet puts
  * focus back on the rebuilt button afterwards. Browsers' own :focus-visible
  * heuristic treats that scripted focus inconsistently, so the panel keeps its
  * own answer: the tooltip opens on focus only when the last thing the user
@@ -536,52 +547,105 @@ let lastInput = 'keyboard';
 document.addEventListener('pointerdown', () => (lastInput = 'pointer'), true);
 document.addEventListener('keydown', () => (lastInput = 'keyboard'), true);
 
-function renderStrip() {
+/** Fill a row's text from its item, on build and on every keystroke. */
+function fillRowText(row, item, index) {
+  const words = item.description.trim();
+  row.querySelector('.row-head').textContent = rowHead(item, index);
+  const body = row.querySelector('.row-body');
+  body.textContent = words || 'No description yet.';
+  body.classList.toggle('quiet', !words);
+  row.querySelector('.row-pick').setAttribute('aria-label', describeRow(item, index));
+}
+
+function renderSheet() {
   // The rebuild destroys the button that has focus. Putting focus back on the
-  // selected thumbnail keeps a keyboard user where they were.
-  const hadFocus = el.strip.contains(document.activeElement);
+  // row in the frame keeps a keyboard user where they were.
+  const hadFocus = el.list.contains(document.activeElement);
   hideTip();
 
   el.sheet.hidden = state.items.length === 0;
-  el.strip.replaceChildren(
+  el.list.replaceChildren(
     ...state.items.map((item, index) => {
-      const button = document.createElement('button');
-      button.type = 'button';
-      button.className = 'thumb';
-      button.classList.toggle('on', item.id === state.selectedId);
-      button.classList.toggle('noted', Boolean(item.description.trim()));
-      button.classList.toggle('missing', Boolean(item.missing));
-      button.setAttribute('aria-pressed', String(item.id === state.selectedId));
-      button.setAttribute('aria-label', describeThumb(item, index));
+      const row = document.createElement('li');
+      row.className = 'row';
+      row.classList.toggle('on', item.id === state.selectedId);
+      row.classList.toggle('included', item.included);
+      row.classList.toggle('missing', Boolean(item.missing));
 
+      const tick = document.createElement('label');
+      tick.className = 'row-tick';
+      const box = document.createElement('input');
+      box.type = 'checkbox';
+      box.checked = item.included;
+      box.setAttribute('aria-label', `Include item ${index + 1} in the prompt`);
+      box.addEventListener('change', () => {
+        item.included = box.checked;
+        row.classList.toggle('included', item.included);
+        persist();
+        updateSubmitState();
+      });
+      tick.append(box);
+
+      const pick = document.createElement('button');
+      pick.type = 'button';
+      pick.className = 'row-pick';
+      pick.setAttribute('aria-pressed', String(item.id === state.selectedId));
+
+      const thumb = document.createElement('span');
+      thumb.className = 'row-thumb';
       const img = document.createElement('img');
       img.alt = '';
       if (item.thumb) img.src = item.thumb;
+      thumb.append(img);
 
-      const number = document.createElement('span');
-      number.className = 'thumb-n';
-      number.textContent = String(index + 1);
+      const text = document.createElement('span');
+      text.className = 'row-text';
+      const head = document.createElement('span');
+      head.className = 'row-head';
+      const body = document.createElement('span');
+      body.className = 'row-body';
+      text.append(head, body);
 
-      button.append(img, number);
-      button.addEventListener('click', () => selectItem(item.id));
-      // Read live from the item, so a sentence typed after the strip was
-      // built shows up without a rebuild.
-      const show = () => showTip(button, item, state.items.indexOf(item));
-      button.addEventListener('mouseenter', show);
-      button.addEventListener('mouseleave', hideTip);
+      pick.append(thumb, text);
+      pick.addEventListener('click', () => selectItem(item.id));
+
+      // Only a row that cut its sentence short has anything to add on hover;
+      // the tooltip reads live from the item, so a sentence typed after the
+      // row was built is what shows.
+      const show = () => {
+        if (body.scrollHeight > body.clientHeight + 1) {
+          showTip(pick, item, state.items.indexOf(item));
+        }
+      };
+      pick.addEventListener('mouseenter', show);
+      pick.addEventListener('mouseleave', hideTip);
       // A click focuses a button too, and would otherwise pin the tooltip
       // open until focus moved on. Only keyboard focus earns it.
-      button.addEventListener('focus', () => {
+      pick.addEventListener('focus', () => {
         if (lastInput === 'keyboard') show();
       });
-      button.addEventListener('blur', hideTip);
-      return button;
+      pick.addEventListener('blur', hideTip);
+
+      row.append(tick, pick);
+      fillRowText(row, item, index);
+      return row;
     })
   );
 
-  const on = el.strip.querySelector('.thumb.on');
-  on?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
-  if (hadFocus) on?.focus({ preventScroll: true });
+  const on = el.list.querySelector('.row.on');
+  on?.scrollIntoView({ block: 'nearest' });
+  if (hadFocus) on?.querySelector('.row-pick').focus({ preventScroll: true });
+}
+
+/**
+ * Tick or untick every row. The ticks decide what the next prompt carries;
+ * unticked items stay on the sheet for a later one.
+ */
+function setAllIncluded(included) {
+  for (const item of state.items) item.included = included;
+  renderSheet();
+  persist();
+  updateSubmitState();
 }
 
 /**
@@ -597,7 +661,7 @@ function selectItem(id) {
   const item = selectedItem();
 
   renderFrame();
-  renderStrip();
+  renderSheet();
 
   if (item) {
     showIntent(item.intent, { example: state.items.indexOf(item) === 0 });
@@ -610,6 +674,20 @@ function selectItem(id) {
     el.description.value = '';
   }
   el.item.hidden = !item;
+  updateSubmitState();
+}
+
+/**
+ * Take the frame back to empty without touching the sheet.
+ *
+ * Every capture already starts a new item, so this changes nothing about what
+ * the next capture does. What it changes is what the panel shows while the
+ * user lines that capture up: an empty frame and no sentence, rather than the
+ * previous item looking like the one about to be replaced.
+ */
+function startNewItem() {
+  selectItem(null);
+  el.modeRegion.focus({ preventScroll: true });
 }
 
 /**
@@ -633,6 +711,7 @@ async function addItem(capture) {
     tabId: state.tab?.id ?? null,
     intent: state.intent,
     description: '',
+    included: true,
     // An element payload only belongs to the capture it was picked with.
     element: capture.mode === 'element' ? capture.element || null : null,
     capturedAt: Date.now(),
@@ -656,7 +735,7 @@ async function addItem(capture) {
     // Not selectItem: that resets the field's value and would throw the caret
     // to the end of whatever has been typed in the meantime.
     renderFrame();
-    renderStrip();
+    renderSheet();
 
     const saved = await saveScreenshot(capture.dataUrl, item.url);
 
@@ -672,6 +751,8 @@ async function addItem(capture) {
     persist();
     persistThumbs();
     renderFrame();
+    const row = el.list.children[state.items.indexOf(item)];
+    if (row) fillRowText(row, item, state.items.indexOf(item));
     showBanner(null);
   } catch (error) {
     // Nothing reached the disk, so there is nothing to keep: the description
@@ -1008,15 +1089,21 @@ function assembleReport(items) {
   };
 }
 
-function blocked() {
-  return state.items.some((item) => !item.path || item.missing);
+/** The items the next prompt carries: the ticked ones. */
+function includedItems() {
+  return state.items.filter((item) => item.included);
+}
+
+function blocked(items) {
+  return items.some((item) => !item.path || item.missing);
 }
 
 async function copyReport() {
-  if (state.busy || !state.items.length || blocked()) return;
-  // The report being copied. Anything that lands after this line is the
-  // start of the next one.
-  const items = state.items.slice();
+  // The report being copied: the ticked items, as they stand at this moment.
+  // Anything that lands or is ticked after this line is the start of the
+  // next one.
+  const items = includedItems();
+  if (state.busy || !items.length || blocked(items)) return;
 
   state.busy = true;
   el.submit.classList.add('busy');
@@ -1061,11 +1148,20 @@ async function copyReport() {
 }
 
 function updateSubmitState() {
-  const count = state.items.length;
-  el.submit.disabled = state.busy || count === 0 || blocked();
-  el.submitCount.hidden = count < 2;
-  el.submitCount.textContent = count < 2 ? '' : `(${count})`;
-  el.discardAll.hidden = count < 2;
+  const all = state.items.length;
+  const picked = includedItems();
+  el.submit.disabled = state.busy || picked.length === 0 || blocked(picked);
+
+  // The count is news once there is more than one item, or once the ticks
+  // have made the prompt smaller than the sheet.
+  const partial = picked.length !== all;
+  el.submitCount.hidden = all < 2 && !partial;
+  el.submitCount.textContent = partial ? `(${picked.length} of ${all})` : `(${all})`;
+
+  el.discardAll.hidden = all < 2;
+  el.newItem.hidden = state.selectedId == null;
+  el.selectAll.hidden = !partial;
+  el.clearSelection.hidden = picked.length === 0;
 }
 
 /**
@@ -1080,7 +1176,7 @@ function markMissing(item) {
   if (item.missing) return;
   item.missing = true;
   renderFrame();
-  renderStrip();
+  renderSheet();
   updateSubmitState();
   const number = state.items.indexOf(item) + 1;
   showBanner(
@@ -1171,6 +1267,7 @@ function adoptStored(report, thumbs) {
       ...item,
       intent: normalizeIntent(item.intent),
       description: typeof item.description === 'string' ? item.description : '',
+      included: item.included !== false,
       thumb:
         typeof thumbs?.items?.[item.id] === 'string'
           ? thumbs.items[item.id]
@@ -1349,21 +1446,24 @@ el.description.addEventListener('input', () => {
   const item = selectedItem();
   if (!item) return;
   item.description = el.description.value;
-  // Cheaper than rebuilding the strip on every keystroke, and the only things
-  // about it that a description changes.
+  // Cheaper than rebuilding the sheet on every keystroke, and the only thing
+  // about a row that a description changes.
   const index = state.items.indexOf(item);
-  const thumb = el.strip.children[index];
-  thumb?.classList.toggle('noted', Boolean(item.description.trim()));
-  thumb?.setAttribute('aria-label', describeThumb(item, index));
+  const row = el.list.children[index];
+  if (row) fillRowText(row, item, index);
   persist();
 });
+
+el.newItem.addEventListener('click', startNewItem);
+el.selectAll.addEventListener('click', () => setAllIncluded(true));
+el.clearSelection.addEventListener('click', () => setAllIncluded(false));
 
 el.submit.addEventListener('click', copyReport);
 el.refreshContext.addEventListener('click', refreshContext);
 
-// A tooltip pinned to a thumbnail that has scrolled away would float over
-// nothing; the strip and the panel both scroll under a hovering pointer.
-el.strip.addEventListener('scroll', hideTip, { passive: true });
+// A tooltip pinned to a row that has scrolled away would float over nothing;
+// the list and the panel both scroll under a hovering pointer.
+el.list.addEventListener('scroll', hideTip, { passive: true });
 document.addEventListener('scroll', hideTip, { passive: true, capture: true });
 
 for (const toggle of [el.incConsole, el.incNetwork, el.incElement, el.incPage]) {

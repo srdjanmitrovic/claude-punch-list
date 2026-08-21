@@ -6,9 +6,9 @@
  * design.
  *
  * 1. Two voices. Monospace is the PRIMARY voice, because everything the panel
- *    says is an instrument reading. A humanist face appears in exactly three
- *    places, and all are where the human speaks: the invitation to act, the
- *    annotation field, and the tooltip that reads a sentence back. Nowhere
+ *    says is an instrument reading. A humanist face appears only where the
+ *    human speaks: the invitation to act, the annotation field, and the
+ *    sentence read back in each row of the sheet and in its tooltip. Nowhere
  *    else.
  *
  * 2. One signal colour. Registration magenta means "marked for correction" and
@@ -368,96 +368,164 @@ main {
   }
 }
 
-/* ------------------------------------------------------------------ strip -- */
+/* ------------------------------------------------------------------ sheet -- */
 
-/* The contact sheet, laid out right above the button that sends it. One frame
-   per item, in capture order, scrolling sideways rather than wrapping so the
-   row keeps a fixed height however long the report gets. Thumbnails keep their
-   own aspect ratio: a tall element crop and a wide region should look as
-   different here as they are. */
+/* The punch list itself, laid out right above the button that sends it. One
+   row per item, in capture order: a tick for whether it goes into the next
+   prompt, a thumbnail, and the sentence. Past a handful of rows the list
+   scrolls rather than pushing the button out of reach. */
 .sheet {
   margin-bottom: 12px;
 }
 
-.strip {
+.sheet-acts {
   display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 9px;
+}
+
+.list {
+  display: flex;
+  flex-direction: column;
   gap: 4px;
-  padding-bottom: 3px;
-  overflow-x: auto;
+  margin: 0;
+  padding: 0;
+  max-height: 268px;
+  overflow-y: auto;
+  list-style: none;
   scrollbar-width: thin;
 }
 
-.thumb {
-  position: relative;
-  flex: none;
-  height: 44px;
-  padding: 0;
+.row {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 6px;
+  align-items: center;
+  padding: 4px 6px 4px 5px;
   border: 1px solid var(--rule);
   background: var(--surface);
-  cursor: pointer;
-  overflow: hidden;
 }
 
-.thumb:hover {
+.row:hover {
   border-color: var(--rule-strong);
 }
 
-/* Selection is ink, not magenta. Which frame is in the viewer is a persistent
-   state, and the signal colour is reserved for transient ones. */
-.thumb.on {
+/* The row in the frame is ink, not magenta. Which item is being edited is a
+   persistent state, and the signal colour is reserved for transient ones. */
+.row.on {
   border-color: var(--fg);
   box-shadow: inset 0 0 0 1px var(--fg);
 }
 
-/* The strip clips its overflow to scroll, which would take the top and left
-   edges of the usual outside ring with it. Drawn inside instead. */
-.thumb:focus-visible {
-  outline-offset: -3px;
+/* Its file has gone from the disk since it was captured. */
+.row.missing {
+  border-style: dashed;
 }
 
-/* Its file has gone from the disk since it was captured. */
-.thumb.missing img {
+.row.missing img {
   opacity: 0.35;
 }
 
-.thumb.missing {
-  border-style: dashed;
+/* Unticked: still on the sheet, not in the next prompt. */
+.row:not(.included) .row-pick {
+  opacity: 0.45;
+}
+
+.row-tick {
+  display: grid;
+  place-items: center;
+  padding: 4px;
+  cursor: pointer;
+}
+
+/* The native box stays visible here, unlike the chips: it is the control, and
+   there is nothing else in the row to carry the state. Ink, not magenta. */
+.row-tick input {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: var(--fg);
+  cursor: pointer;
+}
+
+.row-pick {
+  display: grid;
+  grid-template-columns: 64px 1fr;
+  gap: 8px;
+  align-items: center;
+  width: 100%;
+  min-width: 0;
+  padding: 0;
+  border: none;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: opacity 120ms;
+}
+
+/* The list clips its overflow to scroll, which would take the edges of the
+   usual outside ring with it. Drawn inside instead. */
+.row-pick:focus-visible {
+  outline-offset: -2px;
+}
+
+.row-thumb {
+  display: block;
+  width: 64px;
+  height: 44px;
+  overflow: hidden;
+  border: 1px solid var(--rule);
+  background: var(--bg-sunken);
 }
 
 /* Anchored top left rather than centred: a wide crop of a table row is
    recognisable by its label at the left edge, not by the blank run in the
    middle, and a tall one by whatever heads it. */
-.thumb img {
+.row-thumb img {
   display: block;
+  width: 100%;
   height: 100%;
-  width: auto;
-  min-width: 28px;
-  max-width: 96px;
   object-fit: cover;
   object-position: 0 0;
 }
 
-/* The item number, bottom left, same construction as the gauge. Dimmed until
-   the item has a description, so a glance at the strip shows what still needs
-   a sentence. */
-.thumb-n {
-  position: absolute;
-  left: 0;
-  bottom: 0;
-  padding: 1px 4px;
-  font: 500 9px/1.3 var(--mono);
-  letter-spacing: 0.06em;
-  color: var(--bg);
-  background: var(--fg-dim);
-  pointer-events: none;
+.row-text {
+  display: block;
+  min-width: 0;
 }
 
-.thumb.noted .thumb-n {
-  background: var(--fg);
+.row-head {
+  display: block;
+  margin-bottom: 2px;
+  font-size: 9.5px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--fg-dim);
 }
 
-/* What a thumbnail says when hovered: an ink block like the gauge, carrying
-   the item's own sentence in the human voice. Positioned by panel.js. */
+/* The human voice, reading the sentence back. Two lines, then the tooltip
+   carries the rest. */
+.row-body {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  font: 12px/1.4 var(--human);
+  color: var(--fg);
+  overflow-wrap: anywhere;
+}
+
+.row-body.quiet {
+  font: 10.5px/1.45 var(--mono);
+  color: var(--fg-dim);
+}
+
+/* What a row says when hovered and its sentence did not fit: an ink block like
+   the gauge, carrying the whole sentence in the human voice. Positioned by
+   panel.js. */
 .tip {
   position: fixed;
   z-index: 6;

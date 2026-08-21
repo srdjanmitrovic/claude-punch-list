@@ -69,7 +69,8 @@ was collected while you walked. Claude Code opens the images itself.
   unhandled rejections, failed resource loads, and requests that came back 4xx, 5xx or not at
   all, collected from page load without being asked.
 * **One prompt, pasted once.** The screenshots are already on disk with absolute paths.
-  Copy is instant and can be repeated.
+  Copy is instant and can be repeated. Tick the items that go this time; the rest wait on
+  the sheet for the next prompt.
 * **Survives the panel closing.** A half-built sheet comes back when the side panel reopens,
   in this window or another, and is dropped after a week untouched.
 * **Nothing leaves your machine.** No network code, no accounts, no telemetry. Files go to
@@ -90,9 +91,11 @@ tool in one go.
 </tr>
 </table>
 
-Each capture lands in the frame and joins the sheet, a strip of thumbnails just above the
-copy button. The screenshot is written to `~/Downloads/claude-punch-list/` at that moment, so
-the item has a real path from the start and there is nothing left to save later.
+Each capture lands in the frame and joins the sheet, the list just above the copy button,
+with a tick already in its box. The screenshot is written to `~/Downloads/claude-punch-list/`
+at that moment, so the item has a real path from the start and there is nothing left to save
+later. **New item** empties the frame without touching the sheet, for when you would rather
+line up the next capture against a blank frame than against the last one.
 
 ### 2. Say what is wrong, or what should change
 
@@ -111,19 +114,25 @@ One sentence per item is usually enough, because the console output travels with
 </tr>
 </table>
 
-Hover a thumbnail to read its sentence where it is; click it to bring that item back into the
-frame and its sentence back into the field. The number on a thumbnail stays dim until the
-item has a sentence, so a glance shows what still needs one. The × on the frame discards the
-item in it, and its file with it.
+Each row on the sheet shows its sentence, or says that it has none yet, so a glance shows
+what still needs one; hover a row that cut its sentence short to read the whole thing. Click
+a row to bring that item back into the frame and its sentence back into the field. The × on
+the frame discards the item in it, and its file with it.
 
 Under the field, the **console** and **network** chips count what the page has produced so
 far, so a glance tells you whether it has thrown anything yet.
 
 ### 3. Copy for Claude Code
 
-One prompt containing every item lands on your clipboard. You paste once. Claude Code reads
-each screenshot from its path, works through the items, and says which item each change
+One prompt containing every ticked item lands on your clipboard. You paste once. Claude Code
+reads each screenshot from its path, works through the items, and says which item each change
 belongs to.
+
+The ticks decide what goes. Everything is ticked as it is captured, so the usual walkthrough
+is capture, capture, capture, copy. Untick what should wait, or **Clear selection** and tick
+just one, and the button says how many are going. A single ticked item is sent as a single
+report rather than a list of one. The items that were sent leave the sheet; the rest stay for
+the next prompt.
 
 ## Example: three items, one prompt
 
@@ -207,10 +216,10 @@ side, because neither alone is right for the other. The console section sits onc
 bottom, next to the items it explains: the file and line that threw, the request that failed
 first, and the warning naming the missing coupon. Nobody has to open DevTools.
 
-**A sheet with one item** reads as a single report rather than a list, in the same shape this
+**A single ticked item** reads as a single report rather than a list, in the same shape this
 extension has produced since its first version: a heading, a screenshot section with its own
 instruction, the page, the evidence, and the closing that fits the intent. The list layout
-only appears once there is a list.
+only appears once more than one item is going.
 
 **Items from different pages** are handled too. Capture on the cart, click through to the
 checkout, capture again: the opening line says "across 2 pages", each item names its own

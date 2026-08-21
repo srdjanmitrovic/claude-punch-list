@@ -79,13 +79,13 @@ async function openStage(
 
 /** The pictures the README embeds directly. */
 async function stills(browser, outDir) {
-  // Tall enough that a three item sheet fits without scrolling, as it does in
-  // a side panel on a laptop screen, and wide enough that the screen capture
-  // stays landscape.
+  // Tall enough that a three item sheet and the copy button fit without
+  // scrolling, as they do in a side panel on a laptop screen, and wide enough
+  // that the screen capture stays landscape.
   const { context, page, panel, demo, spots, demoClip } = await openStage(browser, {
     deviceScaleFactor: 2,
-    width: 1480,
-    height: 900,
+    width: 1600,
+    height: 1040,
   });
   const clipDemo = { clip: demoClip };
   const at = await spots();
@@ -125,7 +125,7 @@ async function stills(browser, outDir) {
   // The sheet with three items, in both schemes.
   await page.locator('#panel').screenshot({ path: join(outDir, 'panel-light.png') });
   await page.emulateMedia({ colorScheme: 'dark' });
-  await panel().locator('.thumb').nth(0).click();
+  await panel().locator('.row-pick').nth(0).click();
   // The click leaves the pointer over the thumbnail, and a hovered thumbnail
   // shows its tooltip. Park the pointer on the demo page first.
   await page.mouse.move(at.shipping[0], at.shipping[1] + 200);
@@ -225,14 +225,14 @@ async function frames(browser, framesDir) {
   // One prompt for all of it. The sheet is taller than the window by now, so
   // the panel scrolls until the button sits at the bottom edge, with the sheet
   // just above it, the way a hand on the wheel would. On the way, a pause over
-  // the first thumbnail reads its sentence back.
+  // the first row.
   await panel().evaluate(() => {
     document.getElementById('submit').scrollIntoView({ block: 'end', behavior: 'instant' });
   });
   await page.waitForTimeout(150);
   await shot(400);
-  await glide(...(await centre('.thumb:first-child')), 6);
-  await shot(1300);
+  await glide(...(await centre('.row:first-child .row-pick')), 6);
+  await shot(700);
   await glide(...(await centre('#submit')), 6);
   await click();
   await page.waitForTimeout(500);

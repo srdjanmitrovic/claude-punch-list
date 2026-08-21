@@ -124,13 +124,20 @@
       </section>
 
       <section>
-        <!-- The sheet, right above the button that sends it: one thumbnail per
-             item, in capture order. Clicking one brings it into the frame and
-             its description into the field; hovering one shows the
-             description where it is. -->
+        <!-- The sheet, right above the button that sends it: one row per item,
+             in capture order, each with a tick for whether it goes into the
+             next prompt. Clicking a row brings it into the frame and its
+             description into the field. -->
         <div class="sheet" id="sheet" hidden>
+          <div class="sheet-acts">
+            <button class="ghost-link" id="new-item" type="button" hidden>+ New item</button>
+            <button class="ghost-link" id="select-all" type="button" hidden>Select all</button>
+            <button class="ghost-link" id="clear-selection" type="button" hidden>
+              Clear selection
+            </button>
+          </div>
           <p class="key">On the sheet</p>
-          <div class="strip" id="strip" role="group" aria-label="Captured items"></div>
+          <ul class="list" id="list" aria-label="Captured items"></ul>
         </div>
 
         <button class="send" id="submit" type="button" disabled>
@@ -151,8 +158,9 @@
       </section>
     </main>
 
-    <!-- The one tooltip. Lives outside the strip because the strip scrolls,
-         and a scroll container clips anything positioned inside it. -->
+    <!-- The one tooltip, for a row that has cut its sentence short. Lives
+         outside the list because the list scrolls, and a scroll container
+         clips anything positioned inside it. -->
     <div class="tip" id="thumb-tip" role="tooltip" hidden>
       <p class="tip-head" id="thumb-tip-head"></p>
       <p class="tip-body" id="thumb-tip-body"></p>
