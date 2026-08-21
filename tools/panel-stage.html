@@ -226,7 +226,18 @@
           },
 
           async capture() {
-            if (typeof window.__pwCapture === 'function') return window.__pwCapture();
+            if (typeof window.__pwCapture === 'function') {
+              // The drawn pointer sits over the demo tab and an element
+              // screenshot would bake it into the capture, which Chrome's own
+              // captureVisibleTab never does. Hide it for the shot.
+              const shown = cursor.style.display;
+              cursor.style.display = 'none';
+              try {
+                return await window.__pwCapture();
+              } finally {
+                cursor.style.display = shown;
+              }
+            }
             const canvas = document.createElement('canvas');
             canvas.width = demo.clientWidth;
             canvas.height = demo.clientHeight;

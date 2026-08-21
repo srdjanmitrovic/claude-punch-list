@@ -90,9 +90,9 @@ tool in one go.
 </tr>
 </table>
 
-Each capture lands in the frame and joins the strip of thumbnails under it. The screenshot is
-written to `~/Downloads/claude-punch-list/` at that moment, so the item has a real path from
-the start and there is nothing left to save later.
+Each capture lands in the frame and joins the sheet, a strip of thumbnails just above the
+copy button. The screenshot is written to `~/Downloads/claude-punch-list/` at that moment, so
+the item has a real path from the start and there is nothing left to save later.
 
 ### 2. Say what is wrong, or what should change
 
@@ -111,9 +111,10 @@ One sentence per item is usually enough, because the console output travels with
 </tr>
 </table>
 
-Click a thumbnail to bring that item back into the frame and its sentence back into the
-field. The number on a thumbnail stays dim until the item has a sentence, so a glance shows
-what still needs one. The × on the frame discards the item in it, and its file with it.
+Hover a thumbnail to read its sentence where it is; click it to bring that item back into the
+frame and its sentence back into the field. The number on a thumbnail stays dim until the
+item has a sentence, so a glance shows what still needs one. The × on the frame discards the
+item in it, and its file with it.
 
 Under the field, the **console** and **network** chips count what the page has produced so
 far, so a glance tells you whether it has thrown anything yet.

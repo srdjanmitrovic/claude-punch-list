@@ -87,7 +87,11 @@ const el = {
   previewImg: document.getElementById('preview-img'),
   previewClear: document.getElementById('preview-clear'),
   previewMeta: document.getElementById('preview-meta'),
+  sheet: document.getElementById('sheet'),
   strip: document.getElementById('strip'),
+  tip: document.getElementById('thumb-tip'),
+  tipHead: document.getElementById('thumb-tip-head'),
+  tipBody: document.getElementById('thumb-tip-body'),
 
   item: document.getElementById('item'),
   intentBug: document.getElementById('intent-bug'),
@@ -472,22 +476,73 @@ function renderFrame() {
   el.previewMeta.hidden = false;
 }
 
-/** What a screen reader gets for a thumbnail; the number alone says nothing. */
+/**
+ * What a screen reader gets for a thumbnail; the number alone says nothing.
+ * The sentence itself rides along, cut short, since the tooltip that shows it
+ * to a sighted user is not announced.
+ */
 function describeThumb(item, index) {
-  const status = item.missing
-    ? 'file missing'
-    : item.description.trim()
-      ? 'described'
-      : 'no description yet';
-  return `Item ${index + 1}, ${MODE_LABEL[item.mode].toLowerCase()}, ${status}`;
+  const head = `Item ${index + 1}, ${MODE_LABEL[item.mode].toLowerCase()}`;
+  if (item.missing) return `${head}, file missing`;
+  const words = item.description.trim();
+  if (!words) return `${head}, no description yet`;
+  return `${head}: ${words.length > 90 ? `${words.slice(0, 90)}…` : words}`;
 }
+
+/**
+ * Read an item's sentence back over its thumbnail.
+ *
+ * One element, positioned with fixed coordinates, because the strip scrolls
+ * and a scroll container clips anything positioned inside it. Above the
+ * thumbnail when there is room, which there always is now that the strip sits
+ * near the bottom of the panel; below it otherwise.
+ */
+function showTip(button, item, index) {
+  const words = item.description.trim();
+  el.tipHead.textContent = `${index + 1} · ${MODE_LABEL[item.mode]}${item.missing ? ' · FILE MISSING' : ''}`;
+  el.tipBody.textContent = words || 'No description yet.';
+  el.tipBody.classList.toggle('quiet', !words);
+
+  // Measure before placing: the text decides the size.
+  el.tip.style.visibility = 'hidden';
+  el.tip.hidden = false;
+  const size = el.tip.getBoundingClientRect();
+  const anchor = button.getBoundingClientRect();
+  const margin = 8;
+
+  const left = Math.max(margin, Math.min(anchor.left, window.innerWidth - size.width - margin));
+  const above = anchor.top - size.height - 6;
+  const top = above >= margin ? above : anchor.bottom + 6;
+
+  el.tip.style.left = `${Math.round(left)}px`;
+  el.tip.style.top = `${Math.round(top)}px`;
+  el.tip.style.visibility = '';
+}
+
+function hideTip() {
+  el.tip.hidden = true;
+}
+
+/**
+ * How focus last arrived: from a key or from a pointer.
+ *
+ * A click focuses a thumbnail as surely as Tab does, and renderStrip puts
+ * focus back on the rebuilt button afterwards. Browsers' own :focus-visible
+ * heuristic treats that scripted focus inconsistently, so the panel keeps its
+ * own answer: the tooltip opens on focus only when the last thing the user
+ * touched was the keyboard. Pointer users already have hover.
+ */
+let lastInput = 'keyboard';
+document.addEventListener('pointerdown', () => (lastInput = 'pointer'), true);
+document.addEventListener('keydown', () => (lastInput = 'keyboard'), true);
 
 function renderStrip() {
   // The rebuild destroys the button that has focus. Putting focus back on the
   // selected thumbnail keeps a keyboard user where they were.
   const hadFocus = el.strip.contains(document.activeElement);
+  hideTip();
 
-  el.strip.hidden = state.items.length === 0;
+  el.sheet.hidden = state.items.length === 0;
   el.strip.replaceChildren(
     ...state.items.map((item, index) => {
       const button = document.createElement('button');
@@ -498,7 +553,6 @@ function renderStrip() {
       button.classList.toggle('missing', Boolean(item.missing));
       button.setAttribute('aria-pressed', String(item.id === state.selectedId));
       button.setAttribute('aria-label', describeThumb(item, index));
-      button.title = `Item ${index + 1}`;
 
       const img = document.createElement('img');
       img.alt = '';
@@ -510,6 +564,17 @@ function renderStrip() {
 
       button.append(img, number);
       button.addEventListener('click', () => selectItem(item.id));
+      // Read live from the item, so a sentence typed after the strip was
+      // built shows up without a rebuild.
+      const show = () => showTip(button, item, state.items.indexOf(item));
+      button.addEventListener('mouseenter', show);
+      button.addEventListener('mouseleave', hideTip);
+      // A click focuses a button too, and would otherwise pin the tooltip
+      // open until focus moved on. Only keyboard focus earns it.
+      button.addEventListener('focus', () => {
+        if (lastInput === 'keyboard') show();
+      });
+      button.addEventListener('blur', hideTip);
       return button;
     })
   );
@@ -1295,6 +1360,11 @@ el.description.addEventListener('input', () => {
 
 el.submit.addEventListener('click', copyReport);
 el.refreshContext.addEventListener('click', refreshContext);
+
+// A tooltip pinned to a thumbnail that has scrolled away would float over
+// nothing; the strip and the panel both scroll under a hovering pointer.
+el.strip.addEventListener('scroll', hideTip, { passive: true });
+document.addEventListener('scroll', hideTip, { passive: true, capture: true });
 
 for (const toggle of [el.incConsole, el.incNetwork, el.incElement, el.incPage]) {
   toggle.addEventListener('change', persistSettings);

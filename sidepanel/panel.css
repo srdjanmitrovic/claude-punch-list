@@ -6,9 +6,10 @@
  * design.
  *
  * 1. Two voices. Monospace is the PRIMARY voice, because everything the panel
- *    says is an instrument reading. A humanist face appears in exactly two
- *    places, and both are where the human speaks: the invitation to act, and
- *    the annotation field. Nowhere else.
+ *    says is an instrument reading. A humanist face appears in exactly three
+ *    places, and all are where the human speaks: the invitation to act, the
+ *    annotation field, and the tooltip that reads a sentence back. Nowhere
+ *    else.
  *
  * 2. One signal colour. Registration magenta means "marked for correction" and
  *    nothing else: an armed capture mode, a non-zero count, the marquee. Hard
@@ -369,14 +370,18 @@ main {
 
 /* ------------------------------------------------------------------ strip -- */
 
-/* The contact sheet. One frame per item, in capture order, scrolling sideways
-   rather than wrapping so the stage keeps a fixed height however long the
-   report gets. Thumbnails keep their own aspect ratio: a tall element crop and
-   a wide region should look as different here as they are. */
+/* The contact sheet, laid out right above the button that sends it. One frame
+   per item, in capture order, scrolling sideways rather than wrapping so the
+   row keeps a fixed height however long the report gets. Thumbnails keep their
+   own aspect ratio: a tall element crop and a wide region should look as
+   different here as they are. */
+.sheet {
+  margin-bottom: 12px;
+}
+
 .strip {
   display: flex;
   gap: 4px;
-  margin-top: 6px;
   padding-bottom: 3px;
   overflow-x: auto;
   scrollbar-width: thin;
@@ -449,6 +454,37 @@ main {
 
 .thumb.noted .thumb-n {
   background: var(--fg);
+}
+
+/* What a thumbnail says when hovered: an ink block like the gauge, carrying
+   the item's own sentence in the human voice. Positioned by panel.js. */
+.tip {
+  position: fixed;
+  z-index: 6;
+  max-width: 260px;
+  padding: 7px 9px 8px;
+  background: var(--fg);
+  color: var(--bg);
+  pointer-events: none;
+}
+
+.tip-head {
+  margin: 0 0 3px;
+  font: 500 9px/1.3 var(--mono);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  opacity: 0.7;
+}
+
+.tip-body {
+  margin: 0;
+  font: 12.5px/1.45 var(--human);
+  overflow-wrap: anywhere;
+}
+
+.tip-body.quiet {
+  font: 10.5px/1.45 var(--mono);
+  opacity: 0.7;
 }
 
 /* ------------------------------------------------------------------ modes -- */

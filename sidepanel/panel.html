@@ -25,7 +25,8 @@
     <main>
       <!-- Signature element: the proof frame. Crop marks at the corners, a
            marching-ants marquee while a capture mode is armed. It shows the
-           selected item; the strip beneath it holds the rest of the sheet. -->
+           selected item; the strip above the copy button holds the rest of
+           the sheet. -->
       <section class="stage">
         <div class="frame" id="preview">
           <div class="frame-empty" id="preview-empty">
@@ -41,10 +42,6 @@
           </button>
           <p class="gauge" id="preview-meta" hidden></p>
         </div>
-
-        <!-- One thumbnail per item, in capture order. Clicking one brings it
-             into the frame and its description into the field below. -->
-        <div class="strip" id="strip" role="group" aria-label="Captured items" hidden></div>
 
         <div class="modes" role="group" aria-label="Capture mode">
           <button class="mode" id="mode-region" type="button">
@@ -127,6 +124,15 @@
       </section>
 
       <section>
+        <!-- The sheet, right above the button that sends it: one thumbnail per
+             item, in capture order. Clicking one brings it into the frame and
+             its description into the field; hovering one shows the
+             description where it is. -->
+        <div class="sheet" id="sheet" hidden>
+          <p class="key">On the sheet</p>
+          <div class="strip" id="strip" role="group" aria-label="Captured items"></div>
+        </div>
+
         <button class="send" id="submit" type="button" disabled>
           <span id="submit-label">Copy for Claude Code</span>
           <em class="send-count" id="submit-count" hidden></em>
@@ -144,6 +150,13 @@
         <pre class="proof" id="prompt-preview" hidden></pre>
       </section>
     </main>
+
+    <!-- The one tooltip. Lives outside the strip because the strip scrolls,
+         and a scroll container clips anything positioned inside it. -->
+    <div class="tip" id="thumb-tip" role="tooltip" hidden>
+      <p class="tip-head" id="thumb-tip-head"></p>
+      <p class="tip-body" id="thumb-tip-body"></p>
+    </div>
 
     <footer class="colophon">
       <div class="colophon-acts">

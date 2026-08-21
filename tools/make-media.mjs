@@ -126,6 +126,9 @@ async function stills(browser, outDir) {
   await page.locator('#panel').screenshot({ path: join(outDir, 'panel-light.png') });
   await page.emulateMedia({ colorScheme: 'dark' });
   await panel().locator('.thumb').nth(0).click();
+  // The click leaves the pointer over the thumbnail, and a hovered thumbnail
+  // shows its tooltip. Park the pointer on the demo page first.
+  await page.mouse.move(at.shipping[0], at.shipping[1] + 200);
   await page.waitForTimeout(200);
   await page.locator('#panel').screenshot({ path: join(outDir, 'panel-dark.png') });
 
@@ -220,9 +223,16 @@ async function frames(browser, framesDir) {
   await shot(900);
 
   // One prompt for all of it. The sheet is taller than the window by now, so
-  // the panel scrolls to the button first, the way a hand on the wheel would.
-  await panel().locator('#submit').scrollIntoViewIfNeeded();
+  // the panel scrolls until the button sits at the bottom edge, with the sheet
+  // just above it, the way a hand on the wheel would. On the way, a pause over
+  // the first thumbnail reads its sentence back.
+  await panel().evaluate(() => {
+    document.getElementById('submit').scrollIntoView({ block: 'end', behavior: 'instant' });
+  });
+  await page.waitForTimeout(150);
   await shot(400);
+  await glide(...(await centre('.thumb:first-child')), 6);
+  await shot(1300);
   await glide(...(await centre('#submit')), 6);
   await click();
   await page.waitForTimeout(500);
