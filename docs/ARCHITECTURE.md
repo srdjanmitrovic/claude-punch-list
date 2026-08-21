@@ -103,7 +103,11 @@ overwrite a report by unticking a box.
 
 ## Message protocol
 
-Every message is a plain object with a `type` field prefixed `cdr:`.
+Every message is a plain object with a `type` field prefixed `cdr:`. The prefix, like the
+`cdr*` storage keys and the `__cdr*` globals the content scripts cache on `window`, is the
+initialism of the project's original name, Claude Debug Reporter. It stayed through the
+rename because it is internal, and changing it would touch every file for nothing a user
+could see.
 
 | Message | From | To | Purpose |
 | :--- | :--- | :--- | :--- |

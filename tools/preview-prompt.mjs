@@ -22,7 +22,7 @@ const PAGE = {
   viewport: { width: 1280, height: 720, dpr: 2 },
 };
 
-const FOLDER = '/Users/you/Downloads/claude-debug';
+const FOLDER = '/Users/you/Downloads/claude-punch-list';
 
 const at = (time) => Date.parse(`2026-08-07T${time}`);
 

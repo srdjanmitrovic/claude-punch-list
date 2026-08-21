@@ -6,8 +6,8 @@ set up takes about a minute.
 ## Getting started
 
 ```bash
-git clone https://github.com/srdjanmitrovic/claude-debug-reporter.git
-cd claude-debug-reporter
+git clone https://github.com/srdjanmitrovic/claude-punch-list.git
+cd claude-punch-list
 ```
 
 Open `chrome://extensions`, turn on Developer mode, click **Load unpacked**, and select the

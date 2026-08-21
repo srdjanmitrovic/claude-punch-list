@@ -1,8 +1,9 @@
 /*
- * Claude Debug Reporter — "proof sheet"
+ * Punch List for Claude Code: the proof sheet
  *
- * The panel is a proofing instrument: you mark a defect on a page and send it
- * for correction. Two ideas carry the design.
+ * The panel is a proofing instrument: you mark what is wrong on a page, and
+ * what should change, and send the sheet for correction. Two ideas carry the
+ * design.
  *
  * 1. Two voices. Monospace is the PRIMARY voice, because everything the panel
  *    says is an instrument reading. A humanist face appears in exactly two

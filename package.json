@@ -1,7 +1,7 @@
 {
-  "name": "claude-debug-reporter",
-  "version": "0.2.0",
-  "description": "Chrome extension that turns a browser bug into a paste-ready prompt for Claude Code.",
+  "name": "claude-punch-list",
+  "version": "0.3.0",
+  "description": "Chrome extension that turns a walkthrough of your app into one paste-ready prompt for Claude Code: every screenshot, every note, and the console behind them.",
   "license": "MIT",
   "private": true,
   "type": "module",
@@ -16,7 +16,9 @@
   "keywords": [
     "chrome-extension",
     "claude-code",
+    "punch-list",
     "debugging",
+    "feedback",
     "screenshot",
     "developer-tools"
   ]

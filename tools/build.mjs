@@ -211,7 +211,7 @@ if (problems.length) {
   process.exit(1);
 }
 
-const name = `claude-debug-reporter-v${manifest.version}.zip`;
+const name = `claude-punch-list-v${manifest.version}.zip`;
 const zip = makeZip(entries);
 
 rmSync(OUT_DIR, { recursive: true, force: true });

@@ -16,7 +16,7 @@
 
 import { buildPrompt } from '../shared/prompt-template.js';
 
-const SAVE_FOLDER = 'claude-debug';
+const SAVE_FOLDER = 'claude-punch-list';
 const SLOW_DOWNLOAD_HINT_MS = 2500;
 const ARM_TIMEOUT_MS = 3000; // cap on waiting for an in-flight arm to settle
 const REPORT_TTL_MS = 7 * 24 * 60 * 60 * 1000; // how long an uncopied report survives
