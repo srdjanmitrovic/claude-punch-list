@@ -177,9 +177,10 @@ Validate the coupon as you type instead of only on Apply.
 
 Screenshot: /Users/you/Downloads/claude-punch-list/2026-08-21_18-54-57_localhost-demo-page.png
 
+Search for: `coupon`, "Coupon code"
 Selected element: `#coupon`
 ```html
-<input id="coupon" placeholder="Coupon code" value="SUMMER25" style="">
+<input id="coupon" placeholder="Coupon code" value="SUMMER25">
 ```
 Computed styles: display: block; width: 242.188px; height: 40.9219px; padding: 9px 11px; box-sizing: border-box; overflow: clip; color: rgb(0, 0, 0); background-color: rgb(255, 255, 255); font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; font-size: 13.5px; line-height: 20.925px; border: 1px solid rgb(229, 231, 235); border-radius: 7px
 
@@ -204,14 +205,16 @@ Screenshot: /Users/you/Downloads/claude-punch-list/2026-08-21_18-54-58_localhost
 ## Failed network requests
 ```
 POST /api/coupons/validate -> 501 Unsupported method ('POST') (24ms)
+    called from applyCoupon (/tools/demo-page.html:171:32)
+                HTMLButtonElement.<anonymous> (/tools/demo-page.html:195:9)
 ```
 
 ---
 For each bug, find the root cause in this codebase before changing anything, and if the screenshot and the console point at different things, say so rather than guessing. For each change, find where it is implemented before writing anything and follow the patterns already in this codebase rather than introducing new ones; if it is larger than it looks, say so and propose the smallest version that delivers it. Cover every item, and say which item each change belongs to. If several items turn out to share a cause or a fix, say so rather than treating them separately.
 ````
 
-Just under 2,500 characters, roughly 600 tokens, for three screenshots, a DOM node and a
-stack trace.
+About 2,559 characters, roughly 650 tokens, for three screenshots, a DOM node, a stack trace and
+the function that sent the failed request.
 
 **Why that beats three messages.** Each item is numbered, so Claude Code can account for all
 of them and you can check that it did. The opening line says how much of each kind of work
@@ -236,21 +239,26 @@ here is `opacity: 1` filler. If `font-family` and a fractional `height` are not 
 the list is one array to edit.
 
 **On a React or Vue page the element section says more.** The demo page above uses neither, so
-its sample stops at the selector. Pick an element in a React application and the same section
+its sample has no component to name. Pick an element in a React application and the same section
 reads:
 
 ```markdown
-Selector: `div.cart-summary > span.total`
 Component: `Total` (React, development build)
-Rendered from /src/components/cart/CartSummary.tsx:42:9, where CartSummary writes this JSX rather than where Total is defined
+Call site: /src/components/cart/CartSummary.tsx:42:9 (where CartSummary writes this JSX; Total is defined elsewhere)
 Inside CartSummary > CheckoutPage
+Search for: `cart-total`, "Order total", `handleApply`, `handleSave`, `Total`
+Handlers on `form.coupon`, 2 elements up the DOM, not on the picked element: onSubmit=ƒ handleApply, onChange
+`onSubmit` body starts: setPending(true); applyCoupon(inputRef.current ? ...
 Props of `Total`: amount=NaN, currency="EUR", onRetry=ƒ handleSave
+Classes: _total_1f3k9_12 is a CSS Module: .total in CartSummary.module.css
+Selector: `form.coupon > div.cart-summary > span.total`
 ```
 
-That distinction in the middle line is the one worth knowing. React records where an element's
-JSX is *written*, which is the file of whoever rendered it. The component's own definition is
-usually one file away, and a line that implied otherwise would send Claude Code to the wrong
-place.
+Two lines there are worth knowing about. The call site is where the element's JSX is *written*,
+which is the file of whoever rendered it; the component's own definition is usually one file
+away, and a line that implied otherwise would send Claude Code to the wrong place. And the
+handlers belong to an ancestor here, not to the element that was picked, so the line says which
+element and how far up.
 
 **On a production build there is no real name to show**, and no tool can show one: the bundler
 replaced it with `A` before the page ever loaded, which is why React DevTools shows `A` too.
@@ -261,14 +269,19 @@ that outright rather than hedging, and points at what minification does leave al
 Component: `A` (React, production build). The bundler chose that name, so it does not appear in the source and searching for it will find nothing. React DevTools shows the same name.
 Find it by the prop names below, which minification leaves alone, and by the markup and any test ids. The ancestors on the next line are real names, so those can be searched for.
 Inside TooltipProvider > App, plus 3 the bundler renamed
+Search for: `tooltip-label`, "Save", `noop`
+Handlers: onClick, onMouseEnter
 Props of `A`: label="Save", open=true, onOpenChange=ƒ noop, delayDuration=700
+Classes: Tooltip_label__8kq2p is a CSS Module: .label in Tooltip.module.css
+Selector: `div.tooltip > span.Tooltip_label__8kq2p`
 ```
 
-Prop names survive because mangling them would break every component boundary, so `open`,
-`onOpenChange` and `delayDuration` are a precise thing to search for. Names a bundler invented
-are dropped from the ancestor chain rather than printed, which both stops them being grepped
-for and frees the five name slots for ancestors a library named itself. That is how
-`TooltipProvider` and `App` appear above where three one-letter names used to.
+Prop names survive because mangling them would break every component boundary, so `open` and
+`delayDuration` are a precise thing to search for, and handler names that the bundler replaced
+are dropped rather than offered. Names a bundler invented are dropped from the ancestor chain
+too, which both stops them being grepped for and frees the five name slots for ancestors a
+library named itself. That is how `TooltipProvider` and `App` appear above where three
+one-letter names used to.
 
 If the build is yours, keep the function names and the real ones come through with no change
 to the extension. That is `keepNames: true` for esbuild, which Vite 7 exposes as
@@ -546,9 +559,10 @@ Honest about what is not built yet.
 * **Full page screenshots** that scroll and stitch. Sticky headers repeat, lazily loaded
   content shifts under you, and the capture rate limit forces roughly half a second per
   viewport. Region capture covers most real cases.
-* **More frameworks.** React and Vue 3 are read today. Vue 2 hangs its instance off a
-  different property, and Svelte and Angular expose nothing comparable without their own
-  devtools hooks.
+* **More frameworks.** React and Vue 3 are read today. A Svelte development build attaches
+  `__svelte_meta` to each element with the file and line it came from, which is the closest
+  thing to a free win left. Vue 2 hangs its instance off a different property, and Angular
+  exposes a component only through its own development mode globals.
 * **The component name while hovering.** The picker's tag shows the tag name and size. Showing
   the component would mean a round trip to the page's own JavaScript world on every mouse move,
   which is why it waits for the click instead.
