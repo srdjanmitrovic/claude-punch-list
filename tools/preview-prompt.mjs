@@ -4,6 +4,8 @@
  *     node tools/preview-prompt.mjs           # one bug
  *     node tools/preview-prompt.mjs change    # one suggested change
  *     node tools/preview-prompt.mjs mixed     # a list: two changes and a bug, across two pages
+ *     node tools/preview-prompt.mjs minified  # one bug on a production build, where the
+ *                                             # component name is the bundler's
  *
  * Editing shared/prompt-template.js normally means reloading the extension and
  * capturing something to see the result. This skips all of that: it imports the
@@ -43,6 +45,10 @@ const SINGLE = {
   },
 };
 
+// The owner deliberately differs from names[0]: CartSummary writes this span
+// and passes it down, so the source path is CartSummary's file and not the file
+// Total is defined in. That is the case the wording has to get right, and it is
+// the one a sample that always agreed with itself would never show.
 const ELEMENT = {
   selector: 'div.cart-summary > span.total',
   html: '<span class="total price price--emphasis">NaN</span>',
@@ -53,6 +59,40 @@ const ELEMENT = {
     color: 'rgb(220, 38, 38)',
     'font-size': '18px',
     'font-weight': '700',
+  },
+  component: {
+    framework: 'react',
+    build: 'development',
+    names: ['Total', 'CartSummary', 'CheckoutPage'],
+    owner: 'CartSummary',
+    // What Vite serves: the module url's pathname, with the ?t= cache buster
+    // already stripped by the collector.
+    source: '/src/components/cart/CartSummary.tsx:42:9',
+    props: ['amount=NaN', 'currency="EUR"', 'onRetry=ƒ handleSave'],
+    hops: 0,
+  },
+};
+
+// The same element on a production build, and the case the component wording
+// has to work hardest for. Every field here came off a real minified bundle:
+// the name is terser's, three ancestors were dropped for the same reason, and
+// TooltipProviderProvider collapsed into the TooltipProvider that rendered it.
+// Nothing in `names` can be grepped except the ancestors, so the prompt has to
+// point at the props instead, which minification leaves alone.
+const MINIFIED_ELEMENT = {
+  selector: 'div.tooltip > span.tt',
+  html: '<span class="tt" data-testid="tooltip-label">Save</span>',
+  text: 'Save',
+  truncated: false,
+  styles: { display: 'inline', 'font-size': '13px' },
+  component: {
+    framework: 'react',
+    build: 'production',
+    names: ['A', 'TooltipProvider', 'App'],
+    minified: 3,
+    renamed: true,
+    hops: 0,
+    props: ['label="Save"', 'open=true', 'onOpenChange=ƒ noop', 'delayDuration=700'],
   },
 };
 
@@ -92,18 +132,18 @@ const LIST = [
   },
 ];
 
-const mode = ['change', 'mixed'].includes(process.argv[2]) ? process.argv[2] : 'bug';
+const mode = ['change', 'mixed', 'minified'].includes(process.argv[2]) ? process.argv[2] : 'bug';
 
 const items =
   mode === 'mixed'
     ? LIST
     : [
         {
-          ...SINGLE[mode],
+          ...SINGLE[mode === 'minified' ? 'bug' : mode],
           screenshotPath: `${FOLDER}/2026-08-07_20-51-33_localhost-checkout.png`,
           url: PAGE.url,
           capturedAt: at('20:51:33'),
-          element: ELEMENT,
+          element: mode === 'minified' ? MINIFIED_ELEMENT : ELEMENT,
         },
       ];
 

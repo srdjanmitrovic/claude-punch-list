@@ -1,0 +1,395 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Checkout | Northbeam Supply (React)</title>
+    <!--
+      A React build of the demo page, so the component lookup has a real fiber
+      tree to read. The layout and the bug are the plain demo page's.
+
+          python3 -m http.server 8000
+          open http://localhost:8000/tools/panel-stage.html?demo=demo-react.html
+
+      What this fixture proves. Picking an element here reaches a genuine React
+      fiber, so the whole lookup can be exercised: finding the __reactFiber$
+      expando, walking up to the owning components, naming them, reading the
+      props on a leaf, seeing the development flag, and reading a source
+      location off fiber._debugSource. Both React.memo fiber shapes are here,
+      and a React.forwardRef, because those are the classifications a lookup
+      most often gets wrong.
+
+      The source locations are written by hand. React's createElement lifts a
+      __source key out of a development config onto element._source, and the
+      reconciler copies that onto fiber._debugSource, which is precisely what
+      Babel's JSX transform produces for a React 16 to 18 app. So the
+      _debugSource path is covered here with no build step. Some elements
+      deliberately have no __source, because a Babel free app has none anywhere
+      and the lookup has to cope with that.
+
+      What it does not prove. React 19 dropped _debugSource in favour of a
+      captured _debugStack, and nothing here produces one. Verifying that
+      parsing needs a real React 19 application.
+
+      Nothing under tools/ ships (see INCLUDE in tools/build.mjs), which is why
+      loading React from a CDN is acceptable here and would not be acceptable
+      anywhere in the extension.
+    -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.development.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.development.js"></script>
+    <style>
+      :root {
+        --ink: #16171b;
+        --dim: #6b7280;
+        --line: #e5e7eb;
+        --brand: #2f6f4e;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        background: #f4f5f7;
+        color: var(--ink);
+        font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+      }
+      header {
+        background: #fff;
+        border-bottom: 1px solid var(--line);
+        padding: 16px 32px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+      }
+      .logo { font-weight: 700; letter-spacing: -0.02em; font-size: 17px; }
+      .logo span { color: var(--brand); }
+      nav { color: var(--dim); font-size: 13px; display: flex; gap: 22px; }
+      main {
+        max-width: 940px;
+        margin: 32px auto;
+        padding: 0 24px;
+        display: grid;
+        grid-template-columns: 1.4fr 1fr;
+        gap: 28px;
+        align-items: start;
+      }
+      h1 { font-size: 22px; margin: 0 0 18px; letter-spacing: -0.02em; }
+      .card {
+        background: #fff;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 20px;
+      }
+      .line-item {
+        display: flex;
+        gap: 14px;
+        padding: 14px 0;
+        border-bottom: 1px solid var(--line);
+      }
+      .line-item:last-child { border-bottom: 0; }
+      .thumb {
+        width: 56px; height: 56px; border-radius: 7px; flex: none;
+        background: linear-gradient(135deg, #dfe4ea, #c7ced8);
+      }
+      .item-name { font-weight: 600; font-size: 14px; }
+      .item-meta { color: var(--dim); font-size: 12.5px; }
+      .item-price { margin-left: auto; font-variant-numeric: tabular-nums; font-size: 14px; }
+
+      .summary-row {
+        display: flex;
+        justify-content: space-between;
+        padding: 7px 0;
+        font-size: 14px;
+        color: var(--dim);
+      }
+      .summary-row.total {
+        border-top: 1px solid var(--line);
+        margin-top: 10px;
+        padding-top: 13px;
+        color: var(--ink);
+        font-weight: 700;
+        font-size: 17px;
+      }
+      .total .amount { font-variant-numeric: tabular-nums; }
+
+      .coupon { display: flex; gap: 8px; margin: 16px 0 4px; }
+      .coupon input {
+        flex: 1; min-width: 0; padding: 9px 11px; font: inherit; font-size: 13.5px;
+        border: 1px solid var(--line); border-radius: 7px;
+      }
+      button {
+        font: inherit; font-size: 13.5px; font-weight: 600; cursor: pointer;
+        border: 0; border-radius: 7px; padding: 9px 15px;
+        background: var(--brand); color: #fff;
+      }
+      button.secondary { background: #eef0f3; color: var(--ink); }
+      .pay { width: 100%; margin-top: 16px; padding: 13px; font-size: 15px; }
+      .hint {
+        margin: 22px auto 40px; max-width: 940px; padding: 0 24px;
+        font-size: 13px; color: var(--dim);
+      }
+      .hint code {
+        background: #e9ebef; padding: 1px 5px; border-radius: 4px;
+        font: 12px ui-monospace, Menlo, monospace;
+      }
+      @media (max-width: 760px) { main { grid-template-columns: 1fr; } }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+
+    <script>
+      (() => {
+        'use strict';
+
+        const h = React.createElement;
+
+        // Babel's JSX transform puts one of these in every element's config in
+        // development, naming the file the JSX itself was written in (not the
+        // file the component is declared in). Written out by hand here, at the
+        // call sites that should carry a location and nowhere else.
+        const at = (fileName, lineNumber, columnNumber) => ({
+          fileName,
+          lineNumber,
+          columnNumber,
+        });
+
+        const CATALOG = { WINTER10: { rate: 0.1 } };
+
+        const ITEMS = [
+          { id: 'jacket', name: 'Trail Shell Jacket', meta: 'Slate, size M', price: 189, inStock: true, tags: ['outerwear', 'waterproof'] },
+          { id: 'base', name: 'Merino Base Layer', meta: 'Charcoal, size M', price: 74, inStock: true, tags: ['wool'] },
+          { id: 'drybag', name: 'Dry Bag, 12L', meta: 'Yellow', price: 32, inStock: false, tags: ['packing', 'clearance'] },
+        ];
+
+        const money = (amount) => `$${amount.toFixed(2)}`;
+
+        // React.memo has two fiber shapes and a lookup that handles one tends
+        // to miss the other. With no comparator React collapses it to a
+        // SimpleMemoComponent whose fiber.type is the inner function, so the
+        // wrapper only survives on fiber.elementType; with a comparator it
+        // stays a MemoComponent whose fiber.type is the memo object itself and
+        // has no .name at all. SummaryRow below is the first shape, this is the
+        // second, so both are on the page.
+        const ItemPrice = React.memo(
+          function ItemPrice({ amount }) {
+            return h('div', { className: 'item-price' }, money(amount));
+          },
+          (previous, next) => previous.amount === next.amount
+        );
+
+        function LineItem({ name, meta, price, inStock, tags, onRemove }) {
+          return h(
+            'div',
+            {
+              className: 'line-item',
+              title: tags.join(', '),
+              onDoubleClick: onRemove,
+              __source: at('src/components/cart/LineItem.jsx', 11, 5),
+            },
+            h('div', { className: 'thumb' }),
+            h(
+              'div',
+              null,
+              h('div', { className: 'item-name' }, name),
+              h('div', { className: 'item-meta' }, inStock ? meta : `${meta}, backordered`)
+            ),
+            h(ItemPrice, { amount: price })
+          );
+        }
+
+        function OrderList({ items }) {
+          return h(
+            'section',
+            null,
+            h('h1', null, 'Your order'),
+            h(
+              'div',
+              { className: 'card' },
+              items.map((item) =>
+                h(LineItem, {
+                  key: item.id,
+                  __source: at('src/components/OrderList.jsx', 16, 11),
+                  name: item.name,
+                  meta: item.meta,
+                  price: item.price,
+                  inStock: item.inStock,
+                  tags: item.tags,
+                  onRemove: () => console.warn(`Removing ${item.id} from the cart is not wired up yet`),
+                })
+              )
+            )
+          );
+        }
+
+        // No comparator, so this is the SimpleMemoComponent shape described
+        // above ItemPrice: fiber.type is the function and fiber.elementType is
+        // the memo object.
+        const SummaryRow = React.memo(function SummaryRow({ label, value }) {
+          return h(
+            'div',
+            { className: 'summary-row' },
+            h('span', null, label),
+            h('span', null, value)
+          );
+        });
+
+        // forwardRef leaves an object with a $$typeof tag on fiber.type, with
+        // the function on .render, so a lookup reading fiber.type.name gets
+        // nothing here. The ref is real: CartSummary reads the input off it.
+        const CouponField = React.forwardRef(function CouponField(
+          { code, disabled, onChange, onApply },
+          ref
+        ) {
+          return h(
+            'div',
+            { className: 'coupon' },
+            h('input', {
+              ref,
+              id: 'coupon',
+              placeholder: 'Coupon code',
+              value: code,
+              onChange: (event) => onChange(event.target.value),
+            }),
+            h('button', { className: 'secondary', id: 'apply', disabled, onClick: onApply }, 'Apply')
+          );
+        });
+
+        function Total({ label, amount, pending, breakdown, onRecalculate }) {
+          return h(
+            'div',
+            {
+              className: 'summary-row total',
+              'data-total': '',
+              title: breakdown.join(' + '),
+              onDoubleClick: onRecalculate,
+              __source: at('src/components/cart/Total.jsx', 42, 7),
+            },
+            h('span', null, label),
+            h(
+              'span',
+              {
+                className: 'amount total-amount',
+                id: 'total',
+                style: pending ? { opacity: 0.55 } : null,
+              },
+              money(amount)
+            )
+          );
+        }
+
+        function CartSummary({ subtotal, shipping }) {
+          const [code, setCode] = React.useState('SUMMER25');
+          const [discount, setDiscount] = React.useState(null);
+          const [total, setTotal] = React.useState(subtotal + shipping);
+          const [pending, setPending] = React.useState(false);
+          const inputRef = React.useRef(null);
+
+          async function applyCoupon(entered) {
+            const response = await fetch('/api/coupons/validate', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ code: entered }),
+            });
+
+            if (!response.ok) {
+              console.warn(`Coupon ${entered} not found in catalog, falling back to local lookup`);
+            }
+
+            const entry = CATALOG[entered];
+            // The same bug the plain demo page has: `entry` is undefined for
+            // any code outside CATALOG, so reading .rate throws and the total
+            // is left holding NaN.
+            const amount = subtotal * entry.rate;
+
+            setDiscount(amount);
+            setTotal(subtotal + shipping - amount);
+            setPending(false);
+          }
+
+          function handleApply() {
+            setPending(true);
+            setTotal(NaN);
+            // Not awaited and not caught, deliberately. A throw during render
+            // or inside an effect unwinds to the nearest boundary and unmounts
+            // the tree, which would leave the picker nothing to pick; React
+            // never sees a rejection from an event handler, so the components
+            // survive and the page still produces a real uncaught error.
+            applyCoupon(inputRef.current ? inputRef.current.value.trim() : code);
+          }
+
+          return h(
+            'aside',
+            { className: 'card cart-summary' },
+            h(SummaryRow, { label: 'Subtotal', value: money(subtotal) }),
+            h(SummaryRow, { label: 'Shipping', value: money(shipping) }),
+            discount === null
+              ? null
+              : h(SummaryRow, { label: 'Discount', value: `−${money(discount)}` }),
+            h(Total, {
+              __source: at('src/components/cart/CartSummary.jsx', 58, 9),
+              label: 'Total',
+              amount: total,
+              pending,
+              breakdown: ['subtotal', 'shipping', 'discount'],
+              onRecalculate: () => setTotal(subtotal + shipping),
+            }),
+            h(CouponField, {
+              ref: inputRef,
+              code,
+              disabled: pending,
+              onChange: setCode,
+              onApply: handleApply,
+            }),
+            h('button', { className: 'pay' }, `Pay ${money(total)}`)
+          );
+        }
+
+        function CheckoutPage({ items }) {
+          return h(
+            'main',
+            null,
+            h(OrderList, { __source: at('src/pages/CheckoutPage.jsx', 14, 7), items }),
+            h(CartSummary, {
+              __source: at('src/pages/CheckoutPage.jsx', 15, 7),
+              subtotal: 295,
+              shipping: 9,
+            })
+          );
+        }
+
+        function App() {
+          return h(
+            React.Fragment,
+            null,
+            h(
+              'header',
+              null,
+              h('div', { className: 'logo' }, 'Northbeam', h('span', null, '.')),
+              h(
+                'nav',
+                null,
+                h('span', null, 'Shop'),
+                h('span', null, 'Orders'),
+                h('span', null, 'Account')
+              )
+            ),
+            h(CheckoutPage, { items: ITEMS }),
+            h(
+              'p',
+              { className: 'hint' },
+              'React fixture for Punch List. Click ',
+              h('code', null, 'Apply'),
+              ' for the same bug the plain demo page has: a failing request, a console warning, and an uncaught TypeError that leaves ',
+              h('code', null, 'NaN'),
+              ' in the total. Pick the total, the coupon field or a line item to exercise the component lookup.'
+            )
+          );
+        }
+
+        // No StrictMode on purpose. It invokes every render twice in
+        // development, which would double the console lines the collector
+        // buffers and make the report read as if the page logged twice.
+        ReactDOM.createRoot(document.getElementById('root')).render(h(App));
+      })();
+    </script>
+  </body>
+</html>

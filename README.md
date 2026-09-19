@@ -61,7 +61,8 @@ was collected while you walked. Claude Code opens the images itself.
 * **A sheet, not a shot.** Every capture becomes a numbered item with its own screenshot,
   its own sentence and its own intent. Add as many as the walkthrough needs.
 * **Three ways to frame.** Drag a region, click an element, or grab the whole viewport.
-  Element captures also bring the node's markup and computed styles.
+  Element captures also bring the node's markup, its computed styles, and the React or Vue
+  component that rendered it, so Claude Code opens a file instead of grepping class names.
 * **Bugs and suggestions on the same sheet.** Each item is either. The prompt opens with
   "Fix 1 issue and make 2 changes", gives each item the heading that fits it, and closes
   with the instruction that fits each kind.
@@ -159,7 +160,7 @@ Code**. Twenty seconds, most of it typing.
 page, not written by hand:
 
 ````markdown
-Fix 1 issue and make 2 changes on http://localhost:8000/tools/demo-page.html
+Fix 1 issue and make 2 changes on /tools/demo-page.html
 
 Each item has a screenshot on disk. Read that image before working on the item. For a bug it shows the problem as rendered; for a change it shows the current behaviour, which is what the change is measured against.
 
@@ -185,7 +186,7 @@ Move the Pay button above the coupon field. Most people never use a coupon.
 Screenshot: /Users/you/Downloads/claude-punch-list/2026-08-21_18-54-58_localhost-demo-page.png
 
 ## Page
-- URL: http://localhost:8000/tools/demo-page.html
+- URL: /tools/demo-page.html
 - Title: Checkout | Northbeam Supply
 - Viewport: 1100 x 860 @2x
 - Captured: 8/21/2026, 6:54:56 PM
@@ -230,6 +231,47 @@ That computed styles line is thirteen properties out of the roughly 340 `getComp
 returns. Properties still sitting at their initial value are dropped automatically, so nothing
 here is `opacity: 1` filler. If `font-family` and a fractional `height` are not what you debug,
 the list is one array to edit.
+
+**On a React or Vue page the element section says more.** The demo page above uses neither, so
+its sample stops at the selector. Pick an element in a React application and the same section
+reads:
+
+```markdown
+Selector: `div.cart-summary > span.total`
+Component: `Total` (React, development build)
+Rendered from /src/components/cart/CartSummary.tsx:42:9, where CartSummary writes this JSX rather than where Total is defined
+Inside CartSummary > CheckoutPage
+Props of `Total`: amount=NaN, currency="EUR", onRetry=ƒ handleSave
+```
+
+That distinction in the middle line is the one worth knowing. React records where an element's
+JSX is *written*, which is the file of whoever rendered it. The component's own definition is
+usually one file away, and a line that implied otherwise would send Claude Code to the wrong
+place.
+
+**On a production build there is no real name to show**, and no tool can show one: the bundler
+replaced it with `A` before the page ever loaded, which is why React DevTools shows `A` too.
+Source maps could recover it, but production sites almost never serve them. So the prompt says
+that outright rather than hedging, and points at what minification does leave alone:
+
+```markdown
+Component: `A` (React, production build). The bundler chose that name, so it does not appear in the source and searching for it will find nothing. React DevTools shows the same name.
+Find it by the prop names below, which minification leaves alone, and by the markup and any test ids. The ancestors on the next line are real names, so those can be searched for.
+Inside TooltipProvider > App, plus 3 the bundler renamed
+Props of `A`: label="Save", open=true, onOpenChange=ƒ noop, delayDuration=700
+```
+
+Prop names survive because mangling them would break every component boundary, so `open`,
+`onOpenChange` and `delayDuration` are a precise thing to search for. Names a bundler invented
+are dropped from the ancestor chain rather than printed, which both stops them being grepped
+for and frees the five name slots for ancestors a library named itself. That is how
+`TooltipProvider` and `App` appear above where three one-letter names used to.
+
+If the build is yours, keep the function names and the real ones come through with no change
+to the extension. That is `keepNames: true` for esbuild, which Vite 7 exposes as
+`esbuild: { keepNames: true }` and Vite 8 as `build.rolldownOptions.output.keepNames`, and
+`keep_fnames: true` for terser. Next.js minifies with SWC and offers no supported way to keep
+them, so capture on `next dev` instead, which also gives the file and line.
 
 The prompt wording lives in one file and is likewise meant to be edited. See
 [Make it yours](#make-it-yours).
@@ -324,8 +366,8 @@ page. For local files, turn on "Allow access to file URLs" on the extension's ca
 | :--- | :--- |
 | **console** | `console.error` and `console.warn` calls, uncaught exceptions with stack frames, unhandled promise rejections, and failed resource loads |
 | **network** | Requests that returned 4xx or 5xx or failed outright, with method, URL, status and timing |
-| **element** | For each item picked with the element tool: the node's markup, a CSS selector that finds it again, and a curated set of computed styles |
-| **page** | URL, title, viewport size and device pixel ratio, plus each item's own URL when the sheet spans more than one page |
+| **element** | For each item picked with the element tool: the node's markup, a CSS selector that finds it again, a curated set of computed styles, and on a React or Vue page the component behind it |
+| **page** | URL, title, viewport size and device pixel ratio, plus each item's own URL when the sheet spans more than one page. URLs print as paths (`/checkout?step=2`) while the sheet stays on one origin, and in full once it spans two |
 
 Console and network are read once, when you copy, from the tab you are looking at. Element
 payloads belong to the item they were picked with and are printed under it. Each toggle is
@@ -336,9 +378,21 @@ files on disk are never touched by that.
 ## Privacy
 
 Nothing leaves your machine. There is no network code in this extension: screenshots go to
-your Downloads folder, the sheet itself (thumbnails, sentences, screenshot paths, page URLs
-and any picked element's markup) goes to the extension's own local storage, and text goes to
-your clipboard.
+your Downloads folder, the sheet itself (thumbnails, sentences, screenshot paths, page URLs,
+and any picked element's markup, component name and prop values) goes to the extension's own
+local storage, and text goes to your clipboard.
+
+Component props are worth one extra paragraph, because they are the one thing here that is read
+out of a running application rather than off the screen. Only the nearest component's props are
+read, `children` is skipped, at most twelve keys are kept, and every string is cut at sixty
+characters.
+
+Any prop whose name suggests a secret (`password`, `token`, `apiKey`, `email`, `cardNumber` and
+a couple of dozen more) has its value replaced with `<redacted>` before it leaves the page. The
+name is still reported, because knowing the prop is there is most of its debugging value and
+the value rarely is. That rule is a name match, not a guarantee: a secret in a prop called
+`data` would still be captured, so untick **element** before capturing on a page where that
+matters.
 
 The one caveat worth stating plainly is that the collector has to run in the page's own
 JavaScript world to wrap the real `console` and `fetch`, and anything in that world is
@@ -425,9 +479,14 @@ modes, the collector, the prompt and persistence all work, and reloading the pag
 cycle. It is also where the images in this README come from, so they can be regenerated rather
 than redrawn:
 
+The stage loads the broken checkout page by default. Add `?demo=demo-react.html` or
+`?demo=demo-vue.html` to load a small React or Vue fixture instead, which is how to see the
+component lines without pointing the extension at a real application.
+
 ```bash
 npm run build     # package dist/claude-punch-list-vX.Y.Z.zip for a release
 npm run prompt    # preview the prompt template with sample data
+npm run prompt minified   # the same, for a production build with no real component name
 npm run icons     # regenerate the PNG icons from tools/make-icons.py
 
 node tools/make-media.mjs    # screenshots and GIF frames; needs Playwright and the server above
@@ -454,9 +513,12 @@ Honest about what is not built yet.
 * **Full page screenshots** that scroll and stitch. Sticky headers repeat, lazily loaded
   content shifts under you, and the capture rate limit forces roughly half a second per
   viewport. Region capture covers most real cases.
-* **Framework component names.** Reading a React fiber or Vue instance off a DOM node needs
-  main world access, which the collector already has. Wiring the picker through it would let
-  the prompt name the component instead of only the selector.
+* **More frameworks.** React and Vue 3 are read today. Vue 2 hangs its instance off a
+  different property, and Svelte and Angular expose nothing comparable without their own
+  devtools hooks.
+* **The component name while hovering.** The picker's tag shows the tag name and size. Showing
+  the component would mean a round trip to the page's own JavaScript world on every mouse move,
+  which is why it waits for the click instead.
 
 ## Contributing
 

@@ -35,6 +35,12 @@ Clicking **Apply** on that page fires a failing request, a console warning, and 
 `TypeError`. That gives the collector real data to pick up, so you can verify a change end to
 end rather than against an empty buffer.
 
+Two more fixtures sit beside it. `tools/demo-react.html` and `tools/demo-vue.html` render a
+small component tree so the element picker's component lookup has something to read; the stage
+loads either with `?demo=demo-react.html` or `?demo=demo-vue.html`. Both pull their framework
+from a CDN, which is fine for a fixture and would not be fine in the extension. Nothing under
+`tools/` is packaged.
+
 For work on the panel itself there is a faster loop. With the same server running, open
 `http://localhost:8000/tools/panel-stage.html`. That is the panel as an ordinary web page
 beside the demo page, with `chrome.*` stood in for by `tools/chrome-shim.js`. Capture modes,
@@ -49,6 +55,7 @@ Before opening a pull request:
 npm run build          # validates the manifest and every path it references
 npm run prompt         # renders the prompt template, in case you touched it
 npm run prompt mixed   # the same, for a report with several items
+npm run prompt minified # the same, for a production build with no real component name
 ```
 
 There is no test suite yet. If you add one, please keep it dependency free or make the
@@ -66,6 +73,10 @@ reading a single file, and breaking them tends to fail silently rather than loud
   rejections, and swallow its own errors.
 * `content/overlay.js` and `content/picker.js` are re-injected in full on every use. They must
   not declare anything at the top level with `const`, `let` or `class`.
+* The picker reads a React fiber or a Vue instance by asking `content/collector-main.js`, because
+  those live on the node as properties only the page's own JavaScript world can see. The node
+  crosses the boundary as a temporary `data-cdr-pick` attribute, since the DOM is shared and the
+  property is not. Both sides remove that attribute, including on the timeout path.
 * Content script broadcasts reach every open side panel, not just the one in the same window.
   Filter on `sender.tab.id`.
 * Anything that runs before an `await` in the service worker still holds the user gesture.
@@ -97,5 +108,6 @@ test of the tool, and the output is exactly the context a maintainer wants.
 
 Some things are intentionally out of scope for now: a full page scroll and stitch capture, any
 server component, and telemetry of any kind. Nothing in this extension should ever make a
-network request. If you have an idea that needs one, open an issue first so we can talk about
+network request. The React and Vue fixtures under `tools/` load a framework from a CDN, which is
+the one exception and only because they are test pages that never ship. If you have an idea that needs one, open an issue first so we can talk about
 it before you spend time on it.

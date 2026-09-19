@@ -23,6 +23,14 @@
 
       ?save=2500 makes every save take that many milliseconds, which is how to
       see the SAVING state and the slow download banner.
+
+      ?demo=demo-react.html loads a different page in the tab frame, from the
+      short list in DEMOS below. The React and Vue fixtures are there for the
+      component lookup, which the plain demo page cannot exercise. Only a bare
+      filename from that list is accepted: the stage injects the extension's
+      real content scripts into whatever the frame holds, and a stage that
+      accepted any url would hand that code, and same origin reach into the
+      panel, to a page it did not write.
     -->
     <style>
       :root {
@@ -117,7 +125,8 @@
         <div class="ext on" title="Extension"></div>
       </div>
       <div class="content">
-        <iframe id="demo" src="demo-page.html" title="Demo tab"></iframe>
+        <!-- src is set from the script, once ?demo= has been resolved. -->
+        <iframe id="demo" title="Demo tab"></iframe>
         <iframe id="panel" title="Side panel"></iframe>
       </div>
     </div>
@@ -143,6 +152,10 @@
 
         const CONTENT = new URL('../content/', location.href);
         const SIDEPANEL = new URL('../sidepanel/', location.href);
+
+        // Everything ?demo= is allowed to name, resolved against this
+        // directory. The first entry is the default.
+        const DEMOS = ['demo-page.html', 'demo-react.html', 'demo-vue.html'];
 
         function demoWindow() {
           return demo.contentWindow;
@@ -183,6 +196,12 @@
         }
 
         demo.addEventListener('load', async () => {
+          // An iframe with no src attribute still fires one load for the
+          // about:blank it starts on, before the src set below has anywhere to
+          // go. Shimming and injecting into that document would wrap a console
+          // the demo page never sees.
+          if (demoWindow().location.href === 'about:blank') return;
+
           installDemoShim();
           // The real extension injects these at document_start. Here they land
           // after the page's own script has run, which is fine for the demo
@@ -191,6 +210,9 @@
           await inject('collector-bridge.js');
           omnibox.textContent = demoWindow().location.href.replace(/^https?:\/\//, '');
         });
+
+        const wanted = params.get('demo');
+        demo.src = DEMOS.includes(wanted) ? wanted : DEMOS[0];
 
         window.__stage = {
           storage,

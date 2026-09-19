@@ -19,14 +19,16 @@ sidepanel/panel.js ......... orchestrates everything. Captures the tab, crops
    |                         of which tab is currently armed.
    |
    +-- content/overlay.js .. drag a rectangle (injected on demand)
-   +-- content/picker.js ... hover and click an element (injected on demand)
-   |
+   +-- content/picker.js ... hover and click an element (injected on demand),
+   |                         and asks the main world what rendered it
+   |                              |
    +-- content/collector-bridge.js .. ISOLATED world, always on. Relays.
-        ^
-        | window.postMessage
-        v
+        ^                             |
+        | window.postMessage          | window.postMessage
+        v                             v
        content/collector-main.js .... MAIN world, always on. Wraps console,
-                                      fetch and XHR from document_start.
+                                      fetch and XHR from document_start, and
+                                      reads React and Vue internals on request.
 ```
 
 ## Three decisions worth understanding
@@ -44,9 +46,25 @@ of the extension. The bridge exists purely to carry data across that boundary ov
 
 This split has a subtle consequence that the design depends on. Chrome does not guarantee the
 injection order of the two entries, and `postMessage` has no buffering, so a message sent one
-tick early is lost silently. The protocol here is safe because **the bridge always initiates**:
-the main world script only ever replies to a request. If you ever add a load time push from
-main to isolated, you will need a readiness handshake.
+tick early is lost silently. The protocol here is safe because **the isolated side always
+initiates**, whether that is the bridge asking for the buffers or the picker asking what
+rendered a node: the main world script only ever replies to a request. If you ever add a load
+time push from main to isolated, you will need a readiness handshake.
+
+The same boundary is why the element picker cannot read a React fiber itself. React hangs the
+fiber off the DOM node as a `__reactFiber$<random>` property and Vue hangs
+`__vueParentComponent`, and those properties live on each world's own wrapper of the node, so
+an isolated world script sees a node with none of them. The DOM itself **is** shared, which is
+what the handoff uses: the picker sets a random `data-cdr-pick` attribute on the clicked
+element, asks for it by that value, and the main world finds the node with an ordinary
+`querySelector`. Both sides remove the attribute, because the timeout path is a page where
+nobody over there ever saw it.
+
+Two ordering constraints fall out of that. The attribute goes on **after** the picker has read
+`outerHTML` and the node's attributes, or `data-cdr-pick` appears in the markup printed in the
+user's prompt. And the round trip runs **concurrently** with the two animation frames the
+picker already waits for, so the 300ms timeout costs nothing on a page that answers and does
+not delay the screenshot on a page that does not.
 
 ### The heavy lifting is in the side panel, not the service worker
 
@@ -120,6 +138,24 @@ could see.
 | `cdr:capture-cancelled` | overlay, picker | panel | The user pressed Escape |
 | `cdr:get-context` | panel | bridge | Read the collected buffers plus page info |
 | `cdr:clear-context` | panel | bridge | Empty the buffers |
+
+Inside the page there is a second, smaller protocol, carried on `window.postMessage` rather
+than `chrome.runtime`. Every message is `{ __cdr: 'request' | 'response', id, ... }` and the
+main world answers exactly one action per request.
+
+| Action | From | Purpose |
+| :--- | :--- | :--- |
+| `snapshot` | bridge | Return the console, error and network buffers |
+| `clear` | bridge | Empty them |
+| `inspect` | picker | Return the React or Vue component behind a marked node |
+
+An action this build does not recognise answers `null`, and that is load bearing rather than
+tidiness. Reloading the extension does **not** re-inject the declared content scripts into tabs
+that are already open, so an old main world script keeps running there while a freshly injected
+picker talks to it. Before, anything that was not `clear` returned the snapshot, which would
+have handed the picker a console buffer to present as a component. The two sides also keep
+their ids apart by type, numbers from the bridge and strings from the picker, so each ignores
+the other's replies on a window they both listen to.
 
 Two things about this table are load bearing.
 
