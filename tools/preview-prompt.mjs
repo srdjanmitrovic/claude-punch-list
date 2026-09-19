@@ -50,8 +50,14 @@ const SINGLE = {
 // Total is defined in. That is the case the wording has to get right, and it is
 // the one a sample that always agreed with itself would never show.
 const ELEMENT = {
-  selector: 'div.cart-summary > span.total',
-  html: '<span class="total price price--emphasis">NaN</span>',
+  selector: 'form.coupon > div.cart-summary > span.total',
+  html:
+    '<span class="total price price--emphasis _total_1f3k9_12" data-testid="cart-total" ' +
+    'aria-label="Order total">NaN</span>',
+  // The picker sends these separately from the markup, and the search line is
+  // built out of them rather than out of the HTML. `NaN` is here to be rejected:
+  // it is what the page computed this render, not anything anyone can grep for.
+  attributes: { 'data-testid': 'cart-total', 'aria-label': 'Order total' },
   text: 'NaN',
   truncated: false,
   styles: {
@@ -71,6 +77,21 @@ const ELEMENT = {
     props: ['amount=NaN', 'currency="EUR"', 'onRetry=ƒ handleSave'],
     hops: 0,
   },
+  // Two elements up on purpose. A total has no handlers of its own; the form
+  // around it does, and that is the case the wording has to get right, because
+  // "Handlers: onSubmit=ƒ handleApply" under a span would send a reader looking
+  // for an onSubmit in Total.
+  handlers: {
+    hops: 2,
+    label: 'form.coupon',
+    list: ['onSubmit=ƒ handleApply', 'onChange=ƒ'],
+    starts: 'setPending(true); applyCoupon(inputRef.current ? ...',
+    startsOf: 'onSubmit',
+  },
+  // What Vite's dev server makes of a CSS Module: the hash is per build, so the
+  // class in the DOM is not in the source and the stylesheet is the only part
+  // of this clause worth searching for.
+  classHints: ['_total_1f3k9_12 is a CSS Module: .total in CartSummary.module.css'],
 };
 
 // The same element on a production build, and the case the component wording
@@ -80,10 +101,11 @@ const ELEMENT = {
 // Nothing in `names` can be grepped except the ancestors, so the prompt has to
 // point at the props instead, which minification leaves alone.
 const MINIFIED_ELEMENT = {
-  selector: 'div.tooltip > span.tt',
-  html: '<span class="tt" data-testid="tooltip-label">Save</span>',
+  selector: 'div.tooltip > span.Tooltip_label__8kq2p',
+  html: '<span class="Tooltip_label__8kq2p" data-testid="tooltip-label">Save</span>',
   text: 'Save',
   truncated: false,
+  attributes: { 'data-testid': 'tooltip-label' },
   styles: { display: 'inline', 'font-size': '13px' },
   component: {
     framework: 'react',
@@ -94,6 +116,20 @@ const MINIFIED_ELEMENT = {
     hops: 0,
     props: ['label="Save"', 'open=true', 'onOpenChange=ƒ noop', 'delayDuration=700'],
   },
+  // No `starts` here, which is the production case: the bundle has the handler
+  // body but reading it back would print minified code nobody can act on. The
+  // names go the same way, so the search line has to carry this element on the
+  // test id alone.
+  handlers: {
+    hops: 0,
+    label: '',
+    list: ['onClick=ƒ o', 'onMouseEnter=ƒ (anonymous)'],
+    starts: '',
+    startsOf: '',
+  },
+  // Next.js names a CSS Module class [file]_[local]__[hash], which is the one
+  // production class whose origin can be read straight off the name.
+  classHints: ['Tooltip_label__8kq2p is a CSS Module: .label in Tooltip.module.css'],
 };
 
 // A walkthrough rather than a single moment: three things noticed on the way
@@ -175,6 +211,12 @@ const sample = {
       statusText: 'Internal Server Error',
       ms: 243,
       via: 'fetch',
+      // Nearest frame first, and already resolved through the source map, which
+      // is why these are src paths and not bundle offsets.
+      caller: [
+        'applyCoupon (/src/components/cart/CartSummary.tsx:70:36)',
+        'handleApply (/src/components/cart/CartSummary.tsx:84:13)',
+      ],
     },
   ],
 };

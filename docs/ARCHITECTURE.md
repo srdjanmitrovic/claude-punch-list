@@ -66,6 +66,19 @@ user's prompt. And the round trip runs **concurrently** with the two animation f
 picker already waits for, so the 300ms timeout costs nothing on a page that answers and does
 not delay the screenshot on a page that does not.
 
+The reply carries two things, `component` and `handlers`, either of which may be absent. Handlers
+come from a different property than the component does: React keeps a host element's own props on
+the node as `__reactProps$<random>`, in a production build as well as a development one because
+event dispatch reads them back from there, and Vue keeps the same names on `__vnode.props`.
+Neither is the fiber, so the two lookups climb independently and their hop counts can differ.
+That is why the prompt never presents them as one number.
+
+Whether a handler's body is worth printing is decided by the text itself rather than by the build
+label. Minified code has nothing but one and two character identifiers, so a run of four or more
+letters is the test. Gating on a development build was both too strict, because Vue's development
+bundle sets no flag this code can read, and too loose, because a production build that keeps
+function names still has a minified body behind a real name.
+
 ### The heavy lifting is in the side panel, not the service worker
 
 An MV3 service worker has no DOM, so there is no canvas to crop with, and
@@ -147,7 +160,7 @@ main world answers exactly one action per request.
 | :--- | :--- | :--- |
 | `snapshot` | bridge | Return the console, error and network buffers |
 | `clear` | bridge | Empty them |
-| `inspect` | picker | Return the React or Vue component behind a marked node |
+| `inspect` | picker | Return the React or Vue component behind a marked node, and the handlers bound to it |
 
 An action this build does not recognise answers `null`, and that is load bearing rather than
 tidiness. Reloading the extension does **not** re-inject the declared content scripts into tabs
@@ -170,6 +183,26 @@ worker keeps a map so a panel that opens later can learn about it. The one shot 
 broadcast is not enough by itself, because `Alt+Shift+C` opens the panel and arms the page in
 the same breath: the message can be sent before the panel document exists to hear it. The
 panel picks the state up from the `cdr:check-tab` reply instead.
+
+### A failed request records who sent it
+
+The URL of a request that failed says what broke. The function that sent it says where to look,
+and that is only knowable at the moment of the call, so both wrappers construct an `Error` before
+handing off to the native implementation and keep it until the request settles.
+
+Three things make that affordable. `Error.stackTraceLimit` is lowered around the construction and
+restored afterwards, and only restored to a value that was actually read, because writing
+`undefined` back would stop V8 collecting stacks for the page's own errors. The stack is formatted
+only on failure, so a healthy page pays one allocation per request and nothing else. And the XHR
+wrapper releases its `Error` as soon as the request settles, because an unformatted one holds a
+strong reference to every recorded frame's function and receiver, which a long polling request
+would otherwise pin for its lifetime.
+
+Frames are filtered down to the page's own code. A frame is kept only when its path ends in
+something that looks like a file extension, since a bare document path is a route rather than a
+file and printing one sends the reader hunting for source that never existed. Framework dispatch
+frames are dropped too: only three frames are kept, and on the React fixture the third slot went
+to `react-dom`'s internals while the page's own caller sat just below the cut.
 
 ## Capture and cropping
 

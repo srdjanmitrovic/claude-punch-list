@@ -152,11 +152,40 @@
     function adopt(payload) {
       if (!payload || typeof payload !== 'object') return null;
 
-      const strings = (value, limit) =>
-        (Array.isArray(value) ? value : [])
-          .filter((entry) => typeof entry === 'string')
-          .slice(0, limit)
-          .map((entry) => entry.slice(0, 200));
+      // An older collector answered 'inspect' with the component summary
+      // itself, which is recognisable by framework and names sitting at the top
+      // level where a component field belongs. That pairing is worth a branch,
+      // because a new picker meets an old collector every time the extension is
+      // reloaded with tabs left open: Chrome does not re-inject declared
+      // content scripts into them, so the MAIN world keeps running the previous
+      // build while this file arrives fresh on the next arm. Reading the old
+      // shape lets such a tab degrade to the previous behaviour rather than
+      // lose the component altogether. The opposite pairing needs no handling,
+      // since an old picker is only ever injected by the build it shipped with.
+      const legacy = typeof payload.framework === 'string' && Array.isArray(payload.names);
+
+      return {
+        component: adoptComponent(legacy ? payload : payload.component),
+        handlers: legacy ? null : adoptHandlers(payload.handlers),
+      };
+    }
+
+    // Shared by both rebuilders: an array of short strings and nothing else,
+    // whatever shape actually arrived.
+    function strings(value, limit) {
+      // Sliced before filtering, not after. A hostile reply can carry a million
+      // entries, and filtering first walks every one of them in the content
+      // script before the cap throws them away. The slack multiplier leaves
+      // room for non-string entries to be dropped without losing real ones.
+      return (Array.isArray(value) ? value : [])
+        .slice(0, limit * 4)
+        .filter((entry) => typeof entry === 'string')
+        .slice(0, limit)
+        .map((entry) => entry.slice(0, 200));
+    }
+
+    function adoptComponent(payload) {
+      if (!payload || typeof payload !== 'object') return null;
 
       const names = strings(payload.names, 5);
       if (!names.length) return null;
@@ -187,15 +216,39 @@
       return component;
     }
 
+    function adoptHandlers(payload) {
+      if (!payload || typeof payload !== 'object') return null;
+
+      const list = strings(payload.list, 6);
+      // A handlers block with nothing in its list says nothing, so the object
+      // goes rather than printing an ancestor label above an empty list.
+      if (!list.length) return null;
+
+      const handlers = { list };
+      // Zero is the picked element itself and is meaningful, unlike the
+      // component's hops where zero is the absence of a hop.
+      if (Number.isFinite(payload.hops) && payload.hops >= 0) {
+        handlers.hops = Math.floor(payload.hops);
+      }
+      for (const key of ['label', 'starts', 'startsOf']) {
+        if (typeof payload[key] === 'string' && payload[key]) {
+          handlers[key] = payload[key].slice(0, 200);
+        }
+      }
+      return handlers;
+    }
+
     /**
-     * Ask the MAIN world which React or Vue component rendered this node.
+     * Ask the MAIN world which React or Vue component rendered this node, and
+     * which event handlers it or a near ancestor carries.
      *
      * The picker runs in the ISOLATED world, where React's __reactFiber$ and
      * Vue's __vueParentComponent are invisible: expando properties live on each
      * world's own wrapper of a node. The DOM itself is shared, which is why the
      * node is handed over as an attribute rather than in the message.
      *
-     * Resolves to null on timeout rather than hanging, so a page where the MAIN
+     * Resolves to a rebuilt { component, handlers }, either of which can be
+     * null, or to null on timeout rather than hanging, so a page where the MAIN
      * script never ran still produces a capture.
      */
     function inspect(element) {
@@ -206,14 +259,14 @@
         const marker = 'pick' + Math.random().toString(36).slice(2);
         let settled = false;
 
-        function finish(component) {
+        function finish(reply) {
           if (settled) return;
           settled = true;
           pending.delete(marker);
           // Idempotent: the MAIN world removes it too, and this is what covers
           // the timeout path, where nobody over there ever saw the node.
           element.removeAttribute('data-cdr-pick');
-          resolve(component);
+          resolve(reply);
         }
 
         pending.set(marker, (payload) => finish(adopt(payload)));
@@ -401,6 +454,95 @@
       return out;
     }
 
+    /**
+     * What a generated class name proves about where its CSS lives.
+     *
+     * Pure string matching on names the page already shows us. That is the
+     * whole reason this sits in the ISOLATED world beside the rest of the
+     * payload rather than in the collector: these shapes are stamped in by the
+     * build, so they read the same in a production bundle, where every
+     * framework internal a collector could ask about has been stripped.
+     *
+     * Each clause claims only what its pattern proves. A Vite module class
+     * carries a hash of the file path and not the path, so the file it came
+     * from is genuinely unrecoverable and is left unnamed rather than guessed.
+     */
+    function classHints(element) {
+      const hints = [];
+
+      // Vue's scoped id arrives as an attribute rather than a class, and it is
+      // the one hint here that points inside a component file, so it goes first
+      // and cannot be crowded out by a long class list.
+      for (const attribute of Array.from(element.attributes || [])) {
+        if (hints.length >= 3) break;
+        if (/^data-v-[0-9a-f]{6,10}$/.test(attribute.name)) {
+          hints.push(
+            `${attribute.name} is a Vue scoped style id, so the rule is in that component's <style scoped>`
+          );
+        }
+      }
+
+      // No backticks in these clauses. The template flattens every page
+      // controlled string and turns a backtick into an apostrophe, so one
+      // written here comes out as punctuation rather than as code formatting.
+      for (const name of Array.from(element.classList)) {
+        if (hints.length >= 3) break;
+        // Every shape below is a build artefact and so is short. A longer name
+        // is the page's own, and the clause would be pasted into a prompt.
+        if (!name || name.length > 80) continue;
+
+        // [file]_[local]__[hash], webpack and Next.js. Neither the file nor the
+        // local part may contain an underscore, which is what keeps a BEM class
+        // such as nav__item__active out: its middle part would have to start
+        // with the separator.
+        let match = /^([A-Za-z][A-Za-z0-9$-]*)_([A-Za-z][A-Za-z0-9$-]*)__([A-Za-z0-9]{5,6})$/.exec(name);
+        // The shape alone is not enough. `product_card__header` is an ordinary
+        // hand written class and matches it exactly, and reporting one as a
+        // module names a stylesheet that does not exist, which is the single
+        // worst thing this feature can do. A real hash is base64ish: it carries
+        // a digit, or mixes cases. An all lowercase English word carries
+        // neither, so it is rejected.
+        if (match && !/\d/.test(match[3]) && !(/[a-z]/.test(match[3]) && /[A-Z]/.test(match[3]))) {
+          match = null;
+        }
+        if (match) {
+          hints.push(`${name} is a CSS Module: .${match[2]} in ${match[1]}.module.css`);
+          continue;
+        }
+
+        // _[local]_[hash]_[line], Vite.
+        match = /^_([A-Za-z][A-Za-z0-9$-]*)_([A-Za-z0-9]{5,6})_(\d+)$/.exec(name);
+        if (match) {
+          hints.push(
+            `${name} is a Vite CSS Module: local .${match[1]} declared on line ${match[3]} of its module file, whose name the class does not carry`
+          );
+          continue;
+        }
+
+        // [file]__[name]-sc-[hash], styled-components with the babel plugin. A
+        // bare sc- class is deliberately ignored: it names nothing, and the
+        // shape is loose enough to catch an ordinary hand written class.
+        match = /^([A-Za-z][A-Za-z0-9$]*)__([A-Za-z][A-Za-z0-9$]*)-sc-[A-Za-z0-9]+(?:-\d+)?$/.exec(name);
+        if (match) {
+          hints.push(
+            `${name} is styled-components: the ${match[2]} styled call in ${match[1]}`
+          );
+          continue;
+        }
+
+        // css-[hash]-[label], Emotion with the babel plugin. The hash must
+        // contain a digit, or a plain class like css-module-Wrapper matches.
+        match = /^css-([a-z0-9]{5,})-([A-Za-z][A-Za-z0-9$]*)$/.exec(name);
+        if (match && /\d/.test(match[1])) {
+          hints.push(
+            `${name} is an Emotion class labelled ${match[2]}, so the style is in that component's css or styled call`
+          );
+        }
+      }
+
+      return hints;
+    }
+
     function onMouseMove(event) {
       const element = document.elementFromPoint(event.clientX, event.clientY);
       if (!element || element === current) return;
@@ -430,6 +572,11 @@
         ...markup(element),
         styles: styles(element),
       };
+
+      // Read here with the rest of the payload, while the DOM is still exactly
+      // what the user clicked and before the marker attribute below is set.
+      const hints = classHints(element);
+      if (hints.length) payload.classHints = hints;
 
       // Pad slightly so the element does not sit flush against the crop edge,
       // then clamp every edge before deriving the size. Clamping the origin
@@ -476,9 +623,10 @@
       // cancelled pick would arrive anyway, and the panel would answer it with
       // a screenshot and a file on disk.
       const era = generation;
-      Promise.all([inspected, painted]).then(([component]) => {
+      Promise.all([inspected, painted]).then(([reply]) => {
         if (era !== generation) return;
-        if (component) payload.component = component;
+        if (reply?.component) payload.component = reply.component;
+        if (reply?.handlers) payload.handlers = reply.handlers;
         send({ type: 'cdr:element-picked', rect: captureRect, viewport, element: payload });
       });
     }

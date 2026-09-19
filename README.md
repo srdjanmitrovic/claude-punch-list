@@ -61,8 +61,11 @@ was collected while you walked. Claude Code opens the images itself.
 * **A sheet, not a shot.** Every capture becomes a numbered item with its own screenshot,
   its own sentence and its own intent. Add as many as the walkthrough needs.
 * **Three ways to frame.** Drag a region, click an element, or grab the whole viewport.
-  Element captures also bring the node's markup, its computed styles, and the React or Vue
-  component that rendered it, so Claude Code opens a file instead of grepping class names.
+  Element captures also bring the node's markup, its computed styles, the React or Vue component
+  that rendered it, the handlers bound to it, and a line of search targets, so Claude Code opens
+  a file instead of grepping class names.
+* **Failed requests name their caller.** A 500 in the console tells you what broke. The prompt
+  also tells you which function sent it, and from which file and line.
 * **Bugs and suggestions on the same sheet.** Each item is either. The prompt opens with
   "Fix 1 issue and make 2 changes", gives each item the heading that fits it, and closes
   with the instruction that fits each kind.
@@ -273,6 +276,33 @@ to the extension. That is `keepNames: true` for esbuild, which Vite 7 exposes as
 `keep_fnames: true` for terser. Next.js minifies with SWC and offers no supported way to keep
 them, so capture on `next dev` instead, which also gives the file and line.
 
+**What it hands Claude Code to search for.** Names in a codebase are what a grep can find, and
+mining them out of the markup is work. The prompt does it up front:
+
+```markdown
+Component: `Total` (React, development build)
+Call site: /src/components/cart/CartSummary.tsx:42:9 (where CartSummary writes this JSX; Total is defined elsewhere)
+Inside CartSummary > CheckoutPage
+Search for: `cart-total`, "Order total", `handleApply`, `handleSave`, `Total`
+Handlers on `form.coupon`, 2 elements up the DOM, not on the picked element: onSubmit=ƒ handleApply, onChange
+`onSubmit` body starts: setPending(true); applyCoupon(inputRef.current ? ...
+Classes: _total_1f3k9_12 is a CSS Module: .total in CartSummary.module.css
+```
+
+Handler names and the first statements of a handler's body come off the DOM node itself, so they
+work on a production build as well as a development one. A name a bundler invented is dropped
+rather than offered, and so is a body that turns out to be minified, because a search target that
+matches nothing is worse than none. A body that looks like it holds a credential is dropped whole.
+
+**A failed request names the function that sent it.** The stack is captured where the call is
+made, so the frames are the page's own:
+
+```markdown
+POST http://localhost:3000/api/coupons/validate -> 500 Internal Server Error (243ms)
+    called from applyCoupon (/src/components/cart/CartSummary.tsx:70:36)
+                handleApply (/src/components/cart/CartSummary.tsx:84:13)
+```
+
 The prompt wording lives in one file and is likewise meant to be edited. See
 [Make it yours](#make-it-yours).
 
@@ -365,8 +395,8 @@ page. For local files, turn on "Allow access to file URLs" on the extension's ca
 | Toggle | What it adds |
 | :--- | :--- |
 | **console** | `console.error` and `console.warn` calls, uncaught exceptions with stack frames, unhandled promise rejections, and failed resource loads |
-| **network** | Requests that returned 4xx or 5xx or failed outright, with method, URL, status and timing |
-| **element** | For each item picked with the element tool: the node's markup, a CSS selector that finds it again, a curated set of computed styles, and on a React or Vue page the component behind it |
+| **network** | Requests that returned 4xx or 5xx or failed outright, with method, URL, status, timing, and the function that sent them with its file and line |
+| **element** | For each item picked with the element tool: the component behind it on a React or Vue page, the handlers bound to it and the first line of their source, a line of search targets, any file its class names imply, the node's markup, a CSS selector that finds it again, and a curated set of computed styles |
 | **page** | URL, title, viewport size and device pixel ratio, plus each item's own URL when the sheet spans more than one page. URLs print as paths (`/checkout?step=2`) while the sheet stays on one origin, and in full once it spans two |
 
 Console and network are read once, when you copy, from the tab you are looking at. Element
@@ -388,7 +418,10 @@ read, `children` is skipped, at most twelve keys are kept, and every string is c
 characters.
 
 Any prop whose name suggests a secret (`password`, `token`, `apiKey`, `email`, `cardNumber` and
-a couple of dozen more) has its value replaced with `<redacted>` before it leaves the page. The
+a couple of dozen more) has its value replaced with `<redacted>` before it leaves the page. A
+handler's body is read the same way and dropped entirely, rather than masked in part, if it
+either mentions one of those words or contains a quoted run of twenty or more token characters,
+which is the shape a key or a bearer token has whatever the code around it is called. The
 name is still reported, because knowing the prop is there is most of its debugging value and
 the value rarely is. That rule is a name match, not a guarantee: a secret in a prop called
 `data` would still be captured, so untick **element** before capturing on a page where that

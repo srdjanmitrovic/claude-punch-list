@@ -12,6 +12,11 @@
  *     and the raw context last, on the theory that intent should frame the
  *     evidence. Putting console errors first would bias it toward the stack
  *     trace instead. Both are defensible.
+ *   - What leads the element section. It opens with the component and its call
+ *     site because those name files, and closes with the selector and the
+ *     markup because a render tree path locates nothing in a codebase. Between
+ *     them sits one line of things to grep for. Swapping any of that around is
+ *     a line in formatElement.
  *   - Instruction strength. The closing lines currently ask it to find the root
  *     cause before editing. Softening that to "propose a fix" gets faster,
  *     shallower answers; that is sometimes what you want.
@@ -33,9 +38,14 @@
  *                                    a path while the report stays on one
  *                                    origin, in full once it spans two.
  * @property {number=} capturedAt     When, as epoch milliseconds.
- * @property {Object=} element        { selector, html, styles, text, truncated,
- *                                    component }, where component is the React
- *                                    or Vue node behind the selector.
+ * @property {Object=} element        { selector, attributes, html, styles, text,
+ *                                    truncated, component, handlers,
+ *                                    classHints }, where component is the React
+ *                                    or Vue node behind the selector, handlers
+ *                                    are the event props found on the picked
+ *                                    node or on the nearest ancestor carrying
+ *                                    any, and classHints is one clause per
+ *                                    class whose origin could be decoded.
  *
  * @typedef {Object} Report
  * @property {Item[]}  items         In capture order. Never empty.
@@ -49,7 +59,9 @@
  *                                   anywhere, though pages are still counted.
  * @property {Array=}  consoleLines  [{ level, text, t }]
  * @property {Array=}  errors        [{ kind, text, where, stack, t }]
- * @property {Array=}  network       [{ method, url, status, statusText, ms }]
+ * @property {Array=}  network       [{ method, url, status, statusText, ms,
+ *                                   caller }], where caller is the stack that
+ *                                   sent the request, nearest frame first.
  * @property {number}  builtAt       When the buffers were read and the prompt
  *                                   assembled, as epoch milliseconds.
  */
@@ -213,12 +225,35 @@ function formatConsole(consoleLines = [], errors = []) {
   return lines;
 }
 
+/**
+ * A failed request per line, and under it the code that sent it.
+ *
+ * The frames are the strongest locator in this prompt: a 500 names a route, but
+ * the first frame names the file and the line the call was written on. They are
+ * nearest first, so that first frame is the function that called fetch and the
+ * ones after it are its callers. The continuation lines are indented to sit
+ * under the label rather than the margin, because a bare frame on the left
+ * would read as another request.
+ */
 function formatNetwork(network = []) {
-  return network.map((request) => {
+  const lines = [];
+  for (const request of network) {
     const status = request.status === 0 ? 'FAILED' : request.status;
     const timing = request.ms ? ` (${request.ms}ms)` : '';
-    return `${request.method} ${request.url} -> ${status} ${request.statusText || ''}${timing}`.trim();
-  });
+    lines.push(
+      `${request.method} ${request.url || '(no url)'} -> ${status} ${request.statusText || ''}${timing}`.trim()
+    );
+
+    const frames = (Array.isArray(request.caller) ? request.caller : [])
+      .filter((frame) => typeof frame === 'string')
+      .map(flatten)
+      .filter(Boolean)
+      .slice(0, 3);
+    frames.forEach((frame, index) => {
+      lines.push(index === 0 ? `    called from ${frame}` : `${' '.repeat(16)}${frame}`);
+    });
+  }
+  return lines;
 }
 
 function formatStyles(styles = {}) {
@@ -228,7 +263,8 @@ function formatStyles(styles = {}) {
 }
 
 /**
- * The React or Vue component behind a picked element, as at most three lines.
+ * The React or Vue component behind a picked element, as a few lines plus the
+ * props, which the caller places further down.
  *
  * The MAIN world does the reading and hands over plain strings, so nothing is
  * left here but wording, and the wording is what decides whether Claude Code
@@ -299,25 +335,28 @@ function formatComponent(component) {
       // "levels" invites counting components, which is a different number.
       const steps = component.hops === 1 ? '1 DOM element' : `${component.hops} DOM elements`;
       identity +=
-        `. The selected element was not rendered by ${vue ? 'Vue' : 'React'} itself; ` +
+        `${identity.endsWith('.') ? '' : '.'} The selected element was not rendered by ` +
+        `${vue ? 'Vue' : 'React'} itself; ` +
         `this is the nearest component node, ${steps} up.`;
     }
     lines.push(identity);
   }
 
   if (source && vue) {
+    // Not "Call site". Vue's __file is the component's own file, so this is the
+    // one framework where the path is where the definition lives.
     lines.push(`Defined in ${source}`);
   } else if (source && owner) {
     lines.push(
-      `Rendered from ${source}, where ${owner} writes this JSX rather than where ` +
-        `${name || 'this component'} is defined`
+      `Call site: ${source} (where ${owner} writes this JSX; ` +
+        `${name || 'this component'} is defined elsewhere)`
     );
   } else if (source) {
     // The caveat has to survive an owner React could not name, because that is
     // still a call site and still not where the component is defined.
     lines.push(
-      `Rendered from ${source}, which is where this JSX is written rather than where ` +
-        `${name || 'this component'} is defined`
+      `Call site: ${source} (where this JSX is written; ` +
+        `${name || 'this component'} is defined elsewhere)`
     );
   }
 
@@ -360,20 +399,285 @@ function formatComponent(component) {
     );
   }
 
-  if (props.length && name) lines.push(`Props of \`${name}\`: ${props.join(', ')}`);
-  else if (props.length) lines.push(`Props: ${props.join(', ')}`);
+  // Handed back on their own rather than pushed onto the rest. The search line
+  // sits between the ancestors and the props, and it is built out of what the
+  // other lines already say, so it cannot exist until they do.
+  const propLines = [];
+  if (props.length && name) propLines.push(`Props of \`${name}\`: ${props.join(', ')}`);
+  else if (props.length) propLines.push(`Props: ${props.join(', ')}`);
+
+  return { lines, props: propLines, name, renamed: component.renamed === true };
+}
+
+/**
+ * The handler entries that will be printed.
+ *
+ * The search line reads the same list, and reads it through here rather than
+ * off the payload, so it cannot offer a name that the cap dropped before the
+ * handlers line was written.
+ */
+function handlerList(handlers) {
+  return (Array.isArray(handlers?.list) ? handlers.list : [])
+    .filter((entry) => typeof entry === 'string')
+    .map(flatten)
+    .filter(Boolean)
+    // A name only when it is one worth having. An anonymous handler and a
+    // bundler's single letter both print as "onClick=f o", which offers the
+    // reader a search target that matches nothing, and this file argues
+    // elsewhere that such a target is worse than none. The prop name is real
+    // either way, so that is what survives.
+    .map((entry) => {
+      const match = /^([^=]+)=ƒ\s*(.*)$/.exec(entry);
+      if (!match) return entry;
+      const name = match[2].trim();
+      const usable = name && !name.startsWith('(') && name.length >= 3;
+      return usable ? `${match[1]}=ƒ ${name}` : match[1];
+    })
+    .slice(0, 6);
+}
+
+/**
+ * The event handlers on the picked element, or on the ancestor that carries
+ * them.
+ *
+ * `hops` is the whole difficulty. Handlers found two elements up are that
+ * ancestor's, and a reader told they belong to the picked element opens its
+ * component, finds no onClick in it and concludes the report is wrong. So the
+ * ancestor is named outright and the distance is counted in DOM elements, the
+ * same unit the component block above counts in.
+ *
+ * `starts` is the first statement or two of the handler body. It is there to be
+ * recognised, not read: seeing `setPending(true); applyCoupon(` is what turns a
+ * grep for the handler name into the right file on the first try.
+ */
+function formatHandlers(handlers) {
+  if (!handlers || typeof handlers !== 'object') return [];
+
+  const list = handlerList(handlers);
+  const hops = Number.isFinite(handlers.hops) && handlers.hops > 0 ? Math.floor(handlers.hops) : 0;
+  const label = typeof handlers.label === 'string' ? flatten(handlers.label) : '';
+  const starts = typeof handlers.starts === 'string' ? flatten(handlers.starts) : '';
+  const startsOf = typeof handlers.startsOf === 'string' ? flatten(handlers.startsOf) : '';
+
+  const lines = [];
+
+  const steps = hops === 1 ? '1 element' : `${hops} elements`;
+  const where = label ? `\`${label}\`` : 'an ancestor';
+
+  if (list.length && !hops) {
+    lines.push(`Handlers: ${list.join(', ')}`);
+  } else if (list.length) {
+    lines.push(`Handlers on ${where}, ${steps} up the DOM, not on the picked element: ${list.join(', ')}`);
+  }
+
+  // Gated on the list rather than printed beside it. A body line with no list
+  // above it has lost the sentence saying whose element these belong to, and a
+  // reader who takes it for the picked element's opens the wrong component.
+  if (starts && list.length) {
+    const whose = startsOf ? `\`${startsOf}\` body` : 'Handler body';
+    lines.push(`${whose} starts: ${starts}`);
+  }
 
   return lines;
 }
 
 /**
+ * Where a class came from, as whole clauses the collector wrote.
+ *
+ * Nothing is parsed back out of them here beyond the stylesheet name for the
+ * search line. A clause is a sentence the collector is responsible for, and
+ * splitting it up here would make two files own one sentence.
+ */
+function formatClassHints(classHints) {
+  const clauses = (Array.isArray(classHints) ? classHints : [])
+    .filter((entry) => typeof entry === 'string')
+    .map(flatten)
+    .filter(Boolean)
+    .slice(0, 3);
+  return clauses.length ? [`Classes: ${clauses.join('; ')}`] : [];
+}
+
+/**
+ * Function names out of the `key=ƒ name` entries the collector writes for props
+ * and handlers.
+ *
+ * An anonymous function has no name to search for, and a one or two character
+ * name on a production build is the bundler's, which is worse than no target at
+ * all: it matches most lines in the file.
+ */
+function functionNames(entries) {
+  const names = [];
+  for (const entry of Array.isArray(entries) ? entries : []) {
+    if (typeof entry !== 'string') continue;
+    const match = /=ƒ\s+(.+)$/.exec(flatten(entry));
+    const name = match ? match[1].trim() : '';
+    if (!name || name.startsWith('(') || name.length < 3) continue;
+    names.push(name);
+  }
+  return names;
+}
+
+/** The attributes a test suite pins an element by, strongest first. */
+const TEST_ID_ATTRIBUTES = ['data-testid', 'data-test', 'data-cy', 'data-qa'];
+
+/** Values that reach the DOM as text and are never written in the source. */
+const RUNTIME_TEXT = new Set(['NaN', 'null', 'undefined', 'Infinity', 'true', 'false']);
+
+/**
+ * An id minted at runtime rather than written by hand. React's useId produces
+ * `:r3:`, component libraries append a counter, and a server rendered list
+ * appends the row's key. Searching for one of those finds nothing.
+ */
+function generatedId(value) {
+  return value.includes(':') || /\d{4,}/.test(value) || /^[0-9a-f]{8,}$/i.test(value);
+}
+
+/**
+ * The element's visible text, when it is a label somebody typed into the source
+ * rather than a value the page computed.
+ *
+ * Three things disqualify it. A digit means rendered data, and a price or a
+ * count is different on the next reload. A name JavaScript prints for a value
+ * it could not compute is the bug being reported, not a label. Length means the
+ * node is a container, whose textContent is every descendant's text run
+ * together into a string that exists nowhere in the source.
+ */
+function searchableText(text) {
+  const value = typeof text === 'string' ? flatten(text) : '';
+  if (value.length < 2 || value.length > 40) return '';
+  if (!/[A-Za-z]/.test(value) || /\d/.test(value)) return '';
+  if (RUNTIME_TEXT.has(value)) return '';
+  if (!/\s/.test(value) && value.length > 20) return '';
+  return value;
+}
+
+/**
+ * The stylesheet named inside a class hint.
+ *
+ * The hashed class the clause is about is the bundler's and appears nowhere in
+ * the source, so it is a dead search. The file the clause resolved it to is the
+ * part worth grepping for. Read off the raw clause, before flatten() turns its
+ * backticks into quotes.
+ */
+function styleFile(classHints) {
+  for (const hint of Array.isArray(classHints) ? classHints : []) {
+    if (typeof hint !== 'string') continue;
+    for (const [, token] of hint.matchAll(/`([^`]+)`/g)) {
+      if (/\.(css|scss|sass|less|styl|vue)$/i.test(token)) return flatten(token);
+    }
+  }
+  return '';
+}
+
+/**
+ * One line of grep targets, so Claude Code does not have to mine them out of
+ * the markup.
+ *
+ * Everything here is already somewhere in this report. The point is that the
+ * best of it is inside an HTML block, which costs a reader a parse and a
+ * judgment call before the first search. Priority is by how stable the string
+ * is in the source: a test id is put there to be found and survives a redesign,
+ * a label survives until the copy changes, a handler name until a refactor.
+ *
+ * `printed` is every other line this element will print. A target already on
+ * one of those is dropped, because repeating it teaches nothing and the line is
+ * only worth its tokens while every entry is new. The selector is deliberately
+ * not in that list: an id buried in `div.cart > #total > span` is exactly the
+ * kind of thing this line exists to lift out.
+ */
+function formatSearch(element, identity) {
+  const attributes =
+    element.attributes && typeof element.attributes === 'object' ? element.attributes : {};
+  const attribute = (key) => (typeof attributes[key] === 'string' ? flatten(attributes[key]) : '');
+
+  const candidates = [];
+  const add = (text, quoted = false) => {
+    // Past 60 characters a string is a sentence rather than a search. The
+    // source it came from will have been wrapped or interpolated somewhere
+    // along its length, so the grep for it comes back empty.
+    if (text && text.length <= 60) candidates.push({ text, quoted });
+  };
+
+  // Every attribute that names a thing gets the same two guards. A per row
+  // test id such as row-8f3a1c is as useless a search target as a generated
+  // id, and a one character name is worse than useless at the top of the list.
+  const stable = (value) => (value && value.length >= 3 && !generatedId(value) ? value : '');
+  for (const key of TEST_ID_ATTRIBUTES) add(stable(attribute(key)));
+  add(stable(attribute('id')));
+  add(attribute('aria-label'), true);
+  add(attribute('placeholder'), true);
+  add(stable(attribute('name')));
+  // A container's text is its children's runs joined with nothing between
+  // them, which greps for nothing. Length cannot tell that apart from a real
+  // label, but the markup can: an element with a child element did not write
+  // its own text.
+  const ownText = /<[a-z]/i.test(typeof element.html === 'string' ? element.html.slice(1) : '')
+    ? ''
+    : searchableText(element.text);
+  add(ownText, true);
+  for (const name of functionNames(handlerList(element.handlers))) add(name);
+  for (const name of functionNames(element.component?.props)) add(name);
+  // A bundler's name is not searchable, and neither is a two character one.
+  if (!identity.renamed && /^[A-Za-z_$][\w$.]{2,}$/.test(identity.name)) add(identity.name);
+  add(styleFile(element.classHints));
+
+  // Deduplicated only against itself. Suppressing a candidate because some
+  // other line happens to contain the same characters was worse than the
+  // repetition it saved: the lines it tested are prose, so `label="Save"` in
+  // the props deleted "Save" as a target, and the component name and every
+  // handler name were deleted by the lines that describe them. That left a
+  // line carrying only strings already visible in the markup fence below it,
+  // which is the one thing it must not be. Those other lines present identity
+  // and behaviour; this one is the grep list, and a name worth searching for
+  // is worth having in it even if it also appears above.
+  const chosen = [];
+  for (const candidate of candidates) {
+    if (chosen.length === 5) break;
+    if (chosen.some((entry) => entry.text === candidate.text)) continue;
+    chosen.push(candidate);
+  }
+  if (!chosen.length) return [];
+
+  // Quotes for a phrase a person wrote and backticks for an identifier, so the
+  // reader can tell a JSX string to search for from a symbol. A phrase with a
+  // quote of its own falls back to backticks rather than being rewritten: the
+  // target has to stay the string that is actually in the page.
+  const targets = chosen.map((entry) =>
+    entry.quoted && !entry.text.includes('"') ? `"${entry.text}"` : `\`${entry.text}\``
+  );
+  return [`Search for: ${targets.join(', ')}`];
+}
+
+/**
  * The lines describing a picked element, so the single-item layout can give
  * them a section of their own and the list layout can tuck them under the item
- * they belong to. Only the label on the first line differs.
+ * they belong to. Only the label on the selector line differs.
+ *
+ * Ordered by how close each line gets a reader to a file. The component, its
+ * call site and its ancestors name files outright; the search line, the
+ * handlers and the props name symbols to grep for. The selector led this
+ * section for a long time and has been moved down to sit with the markup,
+ * because it describes a path through the rendered tree and there is no file in
+ * a codebase it can be looked up in.
  */
 function formatElement(element, label = 'Selector') {
-  const parts = [`${label}: \`${element.selector}\``];
-  if (element.component) parts.push(...formatComponent(element.component));
+  const identity = element.component
+    ? formatComponent(element.component)
+    : { lines: [], props: [], name: '', renamed: false };
+  const handlers = formatHandlers(element.handlers);
+  const classHints = formatClassHints(element.classHints);
+  // Printed fourth, under the identity lines and above the detail, because it
+  // is what a reader should act on first.
+  const search = formatSearch(element, identity);
+
+  const parts = [
+    ...identity.lines,
+    ...search,
+    ...handlers,
+    ...identity.props,
+    ...classHints,
+    `${label}: \`${flatten(element.selector)}\``,
+  ];
   if (element.html) {
     parts.push(fence(element.html, 'html'));
   }
