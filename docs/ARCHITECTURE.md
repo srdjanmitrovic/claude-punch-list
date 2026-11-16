@@ -143,7 +143,8 @@ could see.
 | Message | From | To | Purpose |
 | :--- | :--- | :--- | :--- |
 | `cdr:arm` | panel | worker | Inject overlay or picker into a tab, under a fresh `armId` |
-| `cdr:disarm` | panel | worker | Tear down whatever is armed there, and every arm asked for there so far, replying once the page has repainted without it |
+| `cdr:disarm` | panel | worker | Tear down whatever is armed there, and every arm asked for there so far, replying once the page has repainted without it. The reply says `superseded` when an arm was asked for there meanwhile, whose overlay may be on the page |
+| `cdr:verify` | panel | worker | After a navigation, ask the page which mode, if any, is still live on it |
 | `cdr:check-tab` | panel | worker | Ask whether a tab is usable, and what is armed on it |
 | `cdr:armed` | worker | panel | A capture mode is now waiting on a tab. Carries the `armId` of the `cdr:arm` behind it, or none for the shortcut, so a panel can ignore the echo of an arm it cancelled in flight |
 | `cdr:region-selected` | overlay | panel | A rectangle was dragged |
@@ -205,6 +206,14 @@ tab before it, and an arm asked for after it stands. In practice the worker:
 Every arm from the panel carries an `armId`. The panel remembers the ids of the arms it
 cancelled or replaced and refuses both their `cdr:armed` broadcast and a `cdr:check-tab` answer
 that names one. The shortcut's arm has no id, so it is always news.
+
+**A navigation is checked, not assumed.** Chrome reports `pushState`, `replaceState` and a hash
+change as status `loading`, exactly as it does a real navigation, and only the real one takes
+the overlay with it. So on `loading` and on `complete` for an armed tab, the worker asks the page
+which controller is active (each exposes `isActive()`), after any arm still landing, and panel
+and worker go dark only if neither is. The overlay and the picker also stop themselves on
+`pagehide`, so a page restored from the back/forward cache cannot come back with a live overlay
+nothing outside it knows of.
 
 ### A failed request records who sent it
 

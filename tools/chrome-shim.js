@@ -94,10 +94,14 @@
           case 'cdr:disarm': {
             const latest = latestArm;
             if (landings.size) await Promise.allSettled([...landings]);
-            if (latestArm !== latest) return { ok: true };
+            if (latestArm !== latest) return { ok: true, superseded: true };
             if (stage) await stage.disarm();
-            return { ok: true };
+            return { ok: true, superseded: latestArm !== latest };
           }
+          case 'cdr:verify':
+            // The stage fires no tabs.onUpdated, so nothing asks this; the
+            // answer keeps whatever the panel shows.
+            return { ok: true, mode: 'unknown' };
           default:
             return undefined;
         }

@@ -11,7 +11,8 @@
  * ----------------
  * panel      -> worker   cdr:arm            { mode: 'region'|'element', tabId, armId }
  * worker     -> panel    cdr:armed          { mode, tabId, armId } (armId absent for the shortcut)
- * panel      -> worker   cdr:disarm         { tabId }
+ * panel      -> worker   cdr:disarm         { tabId } -> { ok, superseded }
+ * panel      -> worker   cdr:verify         { tabId } -> { ok, mode }
  * content    -> *        cdr:region-selected { rect, viewport }
  * content    -> *        cdr:element-picked  { rect, viewport, element }
  * content    -> *        cdr:capture-cancelled { mode }
@@ -176,8 +177,9 @@ async function disarm(tabId) {
 
   // An arm asked for while this waited came after the cancel. It lands after
   // the ones cancelled, and its start() takes the page over, stopping the
-  // other mode if need be, so the page is left to it.
-  if (latestArmByTab.get(tabId) !== latest) return { ok: true };
+  // other mode if need be, so the page is left to it. The reply says so: a
+  // Screen capture waiting on it must not read it as a page without overlay.
+  if (latestArmByTab.get(tabId) !== latest) return { ok: true, superseded: true };
 
   await chrome.scripting.executeScript({
     target: { tabId },
@@ -196,7 +198,49 @@ async function disarm(tabId) {
       });
     },
   });
-  return { ok: true };
+  // The stop ran, but an arm asked for since may be landing behind it.
+  return { ok: true, superseded: latestArmByTab.get(tabId) !== latest };
+}
+
+/**
+ * Which capture mode is live on a tab, asked of the page rather than inferred.
+ *
+ * Chrome reports a same document navigation (pushState, replaceState, a hash
+ * change) as status 'loading', just as it does a real one, and only the real
+ * one takes the overlay with it. Arms still landing go first, so an arm that
+ * lands in a document on its way out is seen to be gone, and one that lands in
+ * the page that stays is seen to be live. injectImmediately, so a page that is
+ * still loading answers now rather than at document_idle.
+ *
+ * Drops the tab's entry from armedByTab when nothing is live, unless an arm
+ * has replaced it meanwhile.
+ *
+ * @returns {Promise<'region'|'element'|null>}
+ */
+async function verifyArmed(tabId) {
+  const landings = landingsByTab.get(tabId);
+  if (landings?.size) await Promise.allSettled([...landings]);
+  const entry = armedByTab.get(tabId);
+
+  let mode = null;
+  try {
+    const [result] = await chrome.scripting.executeScript({
+      target: { tabId },
+      injectImmediately: true,
+      func: () => {
+        if (window.__cdrRegionOverlay?.isActive?.()) return 'region';
+        if (window.__cdrElementPicker?.isActive?.()) return 'element';
+        return null;
+      },
+    });
+    mode = result?.result ?? null;
+  } catch {
+    // A tab that is gone, or now shows a page Chrome will not script, has no
+    // overlay on it either.
+  }
+
+  if (!mode && armedByTab.get(tabId) === entry) armedByTab.delete(tabId);
+  return mode;
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -211,6 +255,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.type === 'cdr:disarm') {
     disarm(message.tabId).then(sendResponse, () => sendResponse({ ok: false }));
+    return true;
+  }
+
+  if (message.type === 'cdr:verify') {
+    verifyArmed(message.tabId).then(
+      (mode) => sendResponse({ ok: true, mode }),
+      () => sendResponse({ ok: false })
+    );
     return true;
   }
 
@@ -246,10 +298,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   return false;
 });
 
-// Keep armedByTab from going stale or growing without bound. A navigation
-// destroys the injected overlay, and a closed tab can never be armed again.
+// Keep armedByTab from going stale or growing without bound. A navigation to
+// another document destroys the injected overlay, one within the document does
+// not, and Chrome reports both as 'loading' (see verifyArmed). 'complete' is
+// checked too, for a navigation whose old document answered the first check
+// before it was replaced. A closed tab can never be armed again.
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  if (changeInfo.status === 'loading') armedByTab.delete(tabId);
+  if (changeInfo.status !== 'loading' && changeInfo.status !== 'complete') return;
+  if (!armedByTab.has(tabId) && !landingsByTab.get(tabId)?.size) return;
+  verifyArmed(tabId).catch(() => {});
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {

@@ -155,6 +155,7 @@ const el = {
 const state = {
   tab: null,
   restriction: null,
+  restrictionShown: false, // whether the banner is the restriction's, so resolveTab clears only its own
   intent: 'bug', // what the NEXT item starts as; sticky, like the toggles
   armedMode: null, // 'region' | 'element' | null
   armedTabId: null, // which tab that arm was issued against
@@ -335,6 +336,7 @@ async function resolveTab() {
   const call = ++state.resolving;
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (call !== state.resolving) return;
+  const switched = (state.tab?.id ?? null) !== (tab?.id ?? null);
   state.tab = tab || null;
 
   // Arming is per-tab. Switching tabs would otherwise leave the button lit for
@@ -381,7 +383,12 @@ async function resolveTab() {
   }
 
   el.statusDot.className = state.restriction ? 'dot blocked' : 'dot ready';
-  showBanner(state.restriction, state.restriction ? 'error' : 'warn');
+  // Only a banner this sets, unless the tab changed. A busy page sends its
+  // 'complete' or a new URL just after it frees, which is when a notice about
+  // the capture taken while it was busy matters most.
+  if (state.restriction) showBanner(state.restriction, 'error');
+  else if (switched || state.restrictionShown) showBanner(null);
+  state.restrictionShown = Boolean(state.restriction);
 
   const disabled = Boolean(state.restriction);
   el.modeRegion.disabled = disabled;
@@ -746,8 +753,10 @@ async function addItem(capture) {
     downloadId: null,
   };
 
+  // The armed state is not touched here. A region or element capture ended
+  // its arm when the page sent it (handleBroadcast), and Screen cancelled
+  // before it waited; a mode armed since then is the user's newer action.
   state.items.push(item);
-  setArmed(null);
   selectItem(item.id);
   updateSubmitState();
   refreshContext();
@@ -890,6 +899,30 @@ function armedHere() {
 }
 
 /**
+ * After a navigation on the armed tab, ask the page whether the overlay is
+ * still there, and go dark only if it is not.
+ *
+ * Chrome reports pushState, replaceState and a hash change as 'loading', the
+ * same as a real navigation, and those leave the overlay live. Going dark on
+ * them left the overlay on the page with nothing in the panel to cancel it,
+ * and Screen photographing it. The worker waits for an arm still landing
+ * before it asks, so an arm that lands in a document on its way out reads as
+ * gone, and its late cdr:armed is refused like any cancelled arm's.
+ */
+async function verifyArmed() {
+  const { armedTabId: tabId, armedId: armId } = state;
+  if (tabId == null) return;
+  const reply = await chrome.runtime
+    .sendMessage({ type: 'cdr:verify', tabId })
+    .catch(() => null);
+  if (!reply?.ok || reply.mode) return;
+  // Armed again, or cancelled, while the page was asked: that is newer news.
+  if (state.armedTabId !== tabId || state.armedId !== armId) return;
+  if (armId) state.cancelledArmIds.add(armId);
+  setArmed(null);
+}
+
+/**
  * Cancel the armed mode, as clicking its lit button does. Settles once the
  * worker has answered, which it does after the page has painted a frame
  * without the overlay, so a caller about to photograph the page can wait.
@@ -969,6 +1002,31 @@ async function arm(mode) {
   }
 }
 
+const OVERLAY_TOO_BUSY =
+  'The page was too busy to take the capture overlay down in time, so it may show in this screenshot.';
+
+/**
+ * Screen was clicked, and while it waited for the page to take the overlay
+ * down, a capture mode was armed on the same tab again: Region or Element
+ * clicked, or Alt+Shift+C pressed. That arm is the user's newer action and
+ * stays armed whatever this returns, so its overlay may already be drawn on
+ * the page the screenshot is about to be taken of.
+ *
+ * @param {'region'|'element'|null} mode  the mode now lit in this panel, or
+ *   null when only the worker knows of the arm so far (the shortcut, whose
+ *   broadcast has not arrived yet)
+ * @returns {{ capture: boolean, notice: string|null }}  whether to take the
+ *   screenshot anyway, and what the banner says either way (null for nothing)
+ */
+function screenAfterRearm(mode) {
+  // TODO(you): decide. The placeholder below keeps the old behaviour plus a
+  // warning: photograph the page anyway and say the overlay may show.
+  return {
+    capture: true,
+    notice: 'A capture mode was armed while this screenshot waited, so its overlay may show in it.',
+  };
+}
+
 async function captureVisible() {
   // One capture in flight at a time. This covers the capture itself, which
   // can take a while on a busy page; the second click of a double click is
@@ -986,12 +1044,26 @@ async function captureVisible() {
     // and said out loud when it runs out: a page too busy to take the overlay
     // down still gets photographed, since that page is often the bug, but
     // nobody should find the dim layer later without having been told.
-    let overlayMayShow = false;
+    let notice = null;
+    let reply = null;
     const pending = state.cancels.get(state.tab?.id);
     if (pending) {
-      await withTimeout(pending, ARM_TIMEOUT_MS).catch(() => {
-        overlayMayShow = true;
+      reply = await withTimeout(pending, ARM_TIMEOUT_MS).catch(() => {
+        notice = OVERLAY_TOO_BUSY;
+        return null;
       });
+    }
+    // A mode armed on this tab while Screen waited: Region or Element clicked,
+    // or the shortcut, which the worker reports before this panel has heard of
+    // it. That arm is the newer action and stands, and its overlay may be on
+    // the page by now.
+    if (reply?.superseded || armedHere()) {
+      const decision = screenAfterRearm(armedHere() ? state.armedMode : null);
+      if (!decision.capture) {
+        showBanner(decision.notice);
+        return;
+      }
+      notice = decision.notice || notice;
     }
     const dataUrl = await captureViewport();
     const image = await loadImage(dataUrl);
@@ -1000,9 +1072,7 @@ async function captureVisible() {
       width: image.naturalWidth,
       height: image.naturalHeight,
       mode: 'visible',
-      notice: overlayMayShow
-        ? 'The page was too busy to take the capture overlay down in time, so it may show in this screenshot.'
-        : null,
+      notice,
     });
   } catch (error) {
     showBanner(error?.message || 'Screenshot failed.', 'error');
@@ -1496,6 +1566,13 @@ function handleBroadcast(message) {
     return;
   }
 
+  // The page has ended its arm by finishing it. The button goes dark now
+  // rather than once the screenshot is in: a mode clicked in between is a new
+  // arm, and must stay lit.
+  if (message.type === 'cdr:region-selected' || message.type === 'cdr:element-picked') {
+    setArmed(null);
+  }
+
   if (message.type === 'cdr:region-selected') {
     captureViewport()
       .then((full) => cropCapture(full, message.rect, message.viewport))
@@ -1674,9 +1751,14 @@ document.addEventListener('keydown', (event) => {
 
 chrome.tabs.onActivated.addListener(resolveTab);
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  // A navigation destroys any injected overlay, so the panel must stop claiming
-  // this tab is armed. Otherwise the lit button would need two clicks to work.
-  if (tabId === state.armedTabId && changeInfo.status === 'loading') setArmed(null);
+  // A navigation may have destroyed the overlay, and a lit button over a page
+  // without one would need two clicks to work. May: see verifyArmed.
+  if (
+    tabId === state.armedTabId &&
+    (changeInfo.status === 'loading' || changeInfo.status === 'complete')
+  ) {
+    verifyArmed();
+  }
   // A single page app changes its URL without ever reaching 'complete'. Items
   // record the tab's URL at capture time, so it has to be current.
   if (tabId === state.tab?.id && (changeInfo.status === 'complete' || changeInfo.url)) {

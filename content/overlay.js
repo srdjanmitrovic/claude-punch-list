@@ -231,6 +231,9 @@
       root.addEventListener('pointermove', onPointerMove);
       root.addEventListener('pointerup', onPointerUp);
       window.addEventListener('keydown', onKeyDown, true);
+      // A page kept in the back/forward cache would come back with the overlay
+      // live and nothing outside the page aware of it.
+      window.addEventListener('pagehide', stop);
     }
 
     function stop() {
@@ -242,10 +245,13 @@
       root.removeEventListener('pointermove', onPointerMove);
       root.removeEventListener('pointerup', onPointerUp);
       window.removeEventListener('keydown', onKeyDown, true);
+      window.removeEventListener('pagehide', stop);
       if (host.parentNode) host.parentNode.removeChild(host);
     }
 
-    return { start, stop };
+    // isActive is how the worker asks whether the overlay survived a change of
+    // URL: Chrome reports pushState and a hash change as loading, too.
+    return { start, stop, isActive: () => active };
   }
 
   if (!window.__cdrRegionOverlay) {

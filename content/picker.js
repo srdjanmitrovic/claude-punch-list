@@ -670,6 +670,8 @@
       window.addEventListener('mousedown', swallow, true);
       window.addEventListener('mouseup', swallow, true);
       window.addEventListener('keydown', onKeyDown, true);
+      // See the matching line in overlay.js.
+      window.addEventListener('pagehide', stop);
     }
 
     function stop() {
@@ -686,10 +688,12 @@
       window.removeEventListener('mousedown', swallow, true);
       window.removeEventListener('mouseup', swallow, true);
       window.removeEventListener('keydown', onKeyDown, true);
+      window.removeEventListener('pagehide', stop);
       if (host && host.parentNode) host.parentNode.removeChild(host);
     }
 
-    return { start, stop };
+    // See the matching line in overlay.js.
+    return { start, stop, isActive: () => active };
   }
 
   if (!window.__cdrElementPicker) {
