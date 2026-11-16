@@ -89,10 +89,12 @@ every `chrome.*` API it needs.
 So the worker stays thin. It owns only what must survive the panel being closed: side panel
 behaviour, the keyboard command, script injection, and the armed tab map.
 
-One trap worth knowing. `activeTab` is **not** reliably granted to side panel contexts, which
-is why `host_permissions: <all_urls>` is required rather than optional. Without it,
-`captureVisibleTab` and `scripting.executeScript` called from the panel fail even though
-`activeTab` is declared.
+One trap worth knowing. `activeTab` cannot stand in for `host_permissions: <all_urls>`, which is
+why that is required rather than optional. Chrome grants `activeTab` for one tab when the user
+invokes the extension (the toolbar icon, the shortcut) and takes it back when that tab
+navigates, while the panel stays open across tabs and navigations and captures whichever tab is
+in view. Whether a click that opens a side panel grants it at all is not documented.
+`captureVisibleTab` needs one or the other, so with neither it fails on every page.
 
 ### Screenshots are saved when they are taken, not when the report is copied
 
@@ -333,11 +335,11 @@ narrowing `host_permissions` alone does not stop the collector wrapping `console
 `XMLHttpRequest` on every page. It also does not shrink the install warning, which is computed
 from content script matches as well.
 
-Anyone restricting this extension to specific origins therefore has to change `<all_urls>` in
-three places, not one.
+So the collector can be kept to specific origins by narrowing those two `matches` lists alone,
+and that is the only narrowing available: `host_permissions` has to stay `<all_urls>` for
+`captureVisibleTab`, as above. The README has the recipe.
 
-`activeTab` is not requested. It is not granted to side panel contexts, so it would be dead
-weight next to `<all_urls>`. `clipboardWrite` is not requested either, for the reason given in
+`activeTab` is not requested. For the reason above it would add nothing next to `<all_urls>`. `clipboardWrite` is not requested either, for the reason given in
 the README.
 
 ## Pages Chrome will not allow
@@ -358,9 +360,21 @@ to file URLs" hint lives in the missing URL branch rather than in a `file://` br
 the way the worker and content scripts would: `cdr:arm` injects the real overlay or picker
 into the demo frame, `cdr:get-context` reaches the real collector through the real bridge,
 and `captureVisibleTab` asks the stage for a screenshot of the demo frame. Everything on
-screen is the actual code; only the platform is faked. Two things it does not reproduce:
-downloads complete instantly unless `?save=<ms>` slows them, and there is only ever one
-panel, so the cross window adoption above cannot be exercised there.
+screen is the actual code; only the platform is faked. What it does not reproduce:
+
+* **The worker.** The shim answers `cdr:arm`, `cdr:disarm` and `cdr:verify` itself. It mirrors
+  the ordering rule, but there is no service worker to be stopped, no keyboard command and no
+  `sidePanel.open()`, and an arm lands as fast as the stage lets it.
+* **Tabs.** There is one tab, `tabs.onActivated` and `tabs.onUpdated` never fire, and
+  `cdr:check-tab` reports every page as usable, so switching tabs, navigating, restricted pages
+  and file access cannot be exercised.
+* **The screenshot.** `captureVisibleTab` is the stage drawing the demo frame, not Chrome's
+  compositor, so device pixel ratio, zoom and the visual viewport play no part.
+* **Downloads.** They complete instantly unless `?save=<ms>` slows them, there is no "Save as"
+  dialog to take focus away, and download ids start again on every reload.
+* **Windows and focus.** There is only ever one panel, so the cross window adoption above cannot
+  be exercised, and panel and page share one document, so focus moves between them as it does
+  between frames, not as between a side panel and a tab.
 
 It exists for two reasons. Working on the panel's design no longer means reloading an
 extension for every change, and the README's screenshots and GIF are produced from it by

@@ -13,6 +13,7 @@
  * worker     -> panel    cdr:armed          { mode, tabId, armId } (armId absent for the shortcut)
  * panel      -> worker   cdr:disarm         { tabId } -> { ok, superseded }
  * panel      -> worker   cdr:verify         { tabId } -> { ok, mode }
+ * panel      -> worker   cdr:check-tab      { tabId } -> { ok, restriction, armedMode, armId }
  * content    -> *        cdr:region-selected { rect, viewport }
  * content    -> *        cdr:element-picked  { rect, viewport, element }
  * content    -> *        cdr:capture-cancelled { mode }

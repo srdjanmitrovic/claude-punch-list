@@ -33,6 +33,42 @@
     if (list.length > LIMIT) list.shift();
   }
 
+  // SECRET NAMES BEGIN. The same block sits in content/collector-main.js,
+  // content/picker.js and shared/prompt-template.js, which cannot share code:
+  // two are injected into the page and one is a module. test/static.test.mjs
+  // fails if the copies differ.
+  const REDACTED = '<redacted>';
+
+  // Matched against the whole words of a name, so className is not caught by
+  // "ssn" nor passHref by "pass". A word of five letters or more also matches
+  // at either end of a run together lowercase name (authtoken, phonenumber).
+  // Deliberately broad: a needlessly hidden value costs a line of the prompt,
+  // and the other kind of mistake cannot be taken back.
+  const SECRET_WORDS = [
+    'password', 'passwd', 'passphrase', 'passcode', 'pwd', 'secret', 'token', 'auth', 'oauth',
+    'authorization', 'bearer', 'jwt', 'cookie', 'session', 'credential', 'apikey', 'accesskey',
+    'privatekey', 'signingkey', 'csrf', 'xsrf', 'otp', 'totp', 'pin', 'pincode', 'cvv', 'cvc',
+    'ssn', 'iban', 'cardnumber', 'creditcard', 'ccnumber', 'account', 'address', 'email', 'phone',
+    'dob', 'birth', 'signature',
+  ];
+
+  function isSecretName(name) {
+    const words = String(name)
+      .split(/[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])/)
+      .filter(Boolean)
+      .map((word) => word.toLowerCase());
+    return words.some((word, index) =>
+      SECRET_WORDS.some(
+        (secret) =>
+          word === secret ||
+          word === secret + 's' ||
+          word + (words[index + 1] || '') === secret ||
+          (secret.length >= 5 && (word.startsWith(secret) || word.endsWith(secret)))
+      )
+    );
+  }
+  // SECRET NAMES END
+
   function truncate(str) {
     if (typeof str !== 'string') str = String(str);
     return str.length > MAX_STRING ? str.slice(0, MAX_STRING) + ' …[truncated]' : str;
@@ -71,9 +107,12 @@
       const ancestors = [];
       let budget = 4000;
       return truncate(
-        JSON.stringify(value, function (_key, current) {
+        JSON.stringify(value, function (key, current) {
           if (budget <= 0) return '[…budget exceeded]';
           budget -= 1;
+          // A logged request or user object carries its Authorization header
+          // or password under a name that says so (see isSecretName).
+          if (key && isSecretName(key) && withheld(current)) return REDACTED;
           if (typeof current === 'object' && current !== null) {
             while (ancestors.length && ancestors[ancestors.length - 1] !== this) {
               ancestors.pop();
@@ -671,21 +710,14 @@
   }
 
   /**
-   * Prop names whose value must never be copied out of the application.
-   *
-   * This is the one place in the extension that reads live application state
-   * rather than what is on the screen, and the value goes into the prompt and
-   * into chrome.storage.local with it. A password, a bearer token or a card
-   * number sitting in a prop would otherwise be captured whole and pasted
-   * somewhere else entirely.
-   *
-   * The key is still reported, because knowing the prop exists is most of its
-   * debugging value and the value rarely is. Deliberately over-broad: a
-   * needlessly redacted prop costs one line, and the other kind of mistake
-   * cannot be taken back.
+   * Whether a value under a secret looking name is withheld. Not a boolean,
+   * null or undefined, which can hold no secret and often answer the
+   * question (hasPassword: false), and not a function, whose name is a
+   * handler's and not a value.
    */
-  const SECRET_KEY =
-    /pass|secret|token|auth|jwt|cookie|session|credential|apikey|api_key|email|phone|card|cvv|ssn|iban|account|address|dob|birth/i;
+  function withheld(value) {
+    return value != null && typeof value !== 'boolean' && typeof value !== 'function';
+  }
 
   function summariseProps(props) {
     const out = [];
@@ -703,7 +735,14 @@
         } catch {
           continue;
         }
-        out.push(key + '=' + (SECRET_KEY.test(key) ? '<redacted>' : summariseValue(value)));
+        // PRIVACY: this is the one place in the extension that reads live
+        // application state rather than what is on the screen, and the value
+        // goes into the prompt and into chrome.storage.local with it. The key
+        // is still reported, because knowing the prop exists is most of its
+        // debugging value and the value rarely is.
+        out.push(
+          key + '=' + (isSecretName(key) && withheld(value) ? REDACTED : summariseValue(value))
+        );
       }
     } catch {
       /* ignore */
@@ -1120,7 +1159,7 @@
       // perfectly readable handler was dropped) and too loose (a production
       // build with keepNames has real names over a minified body).
       if (!/[A-Za-z_$]{4,}/.test(text)) return '';
-      if (SECRET_KEY.test(text)) return '';
+      if (isSecretName(text)) return '';
       // The keyword test above only catches a secret that happens to sit next
       // to a telling word. A bearer token pasted into a headers object has no
       // such word near it, so this second test is on the shape of the value:

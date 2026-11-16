@@ -38,7 +38,7 @@ Search for: `cart-total`, "Order total", `handleApply`, `handleSave`, `Total`
 Handlers on `form.coupon`, 2 elements up the DOM, not on the picked element: onSubmit=ƒ handleApply, onChange
 `onSubmit` body starts: setPending(true); applyCoupon(inputRef.current ? ...
 Props of `Total`: amount=NaN, currency="EUR", onRetry=ƒ handleSave
-Classes: _total_1f3k9_12 is a CSS Module: .total in CartSummary.module.css
+Classes: _total_1f3k9_12 is a Vite CSS Module: local .total declared on line 12 of its module file, whose name the class does not carry
 Selector: `form.coupon > div.cart-summary > span.total`
 ```html
 <span class="total price price--emphasis _total_1f3k9_12" data-testid="cart-total" aria-label="Order total">NaN</span>

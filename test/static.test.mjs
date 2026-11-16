@@ -100,6 +100,34 @@ test('static: the collector ends with a source map that ignore lists it', () => 
   assert.equal(map.sources.length, 1);
 });
 
+// The secret name test is written three times, because the collector and the
+// picker are injected into the page and cannot import the template. A word
+// added to one copy and not the others would leave a value hidden in props
+// and printed in markup, or the other way round.
+test('static: the copies of the secret name blocks are identical', () => {
+  const block = (file, name) => {
+    const source = read(file);
+    const begin = source.indexOf(`// ${name} BEGIN`);
+    const end = source.indexOf(`// ${name} END`);
+    assert.ok(begin !== -1 && end > begin, `${file} has no ${name} block`);
+    // The injected copies sit one level in, inside their wrapper; that
+    // indentation is all that may differ.
+    const dedent = file.startsWith('content/');
+    return source
+      .slice(begin, end)
+      .split('\n')
+      .map((line) => (dedent ? line.replace(/^ {2}/, '') : line))
+      .join('\n');
+  };
+  const template = block('shared/prompt-template.js', 'SECRET NAMES');
+  assert.equal(block('content/collector-main.js', 'SECRET NAMES'), template);
+  assert.equal(block('content/picker.js', 'SECRET NAMES'), template);
+  assert.equal(
+    block('content/picker.js', 'SECRET URLS'),
+    block('shared/prompt-template.js', 'SECRET URLS')
+  );
+});
+
 // Chrome runs these again, in the same world, every time a capture mode is
 // armed. A top level const, let or class from the first run is still declared
 // when the second arrives, and the second run throws before doing anything.

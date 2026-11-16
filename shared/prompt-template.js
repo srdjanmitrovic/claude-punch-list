@@ -210,7 +210,9 @@ function formatConsole(consoleLines = [], errors = []) {
 
   for (const error of errors) {
     const label = error.kind === 'unhandled-rejection' ? 'unhandled' : 'error';
-    lines.push(`[${label}] ${error.text}`);
+    // A failed resource and many a logged message carry a url, and a url can
+    // carry a token (see safeUrl).
+    lines.push(`[${label}] ${safeText(error.text)}`);
 
     if (error.stack) {
       // Skip line 0: it repeats the message already printed above. The next few
@@ -230,7 +232,7 @@ function formatConsole(consoleLines = [], errors = []) {
   }
 
   for (const entry of consoleLines) {
-    lines.push(`[${entry.level}] ${entry.text}`);
+    lines.push(`[${entry.level}] ${safeText(entry.text)}`);
   }
 
   return lines;
@@ -261,7 +263,7 @@ function formatNetwork(network = []) {
     const status = cancelledLabel(request) || (request.status === 0 ? 'FAILED' : request.status);
     // Joined rather than interpolated: HTTP/2 responses have no status text,
     // and a fixed template would leave two spaces where it was.
-    const parts = [request.method, request.url || '(no url)', '->', status];
+    const parts = [request.method, request.url ? safeUrl(request.url) : '(no url)', '->', status];
     if (request.statusText) parts.push(request.statusText);
     if (request.ms) parts.push(`(${request.ms}ms)`);
     lines.push(parts.join(' ').trim());
@@ -737,7 +739,7 @@ function pathOf(url) {
   try {
     const parsed = new URL(url);
     if (!['http:', 'https:', 'file:'].includes(parsed.protocol)) return safeUrl(url);
-    const path = `${parsed.pathname}${parsed.search}${parsed.hash}`;
+    const path = `${parsed.pathname}${maskParams(parsed.search)}${maskParams(parsed.hash)}`;
     // A landing page has no path to speak of, and "Fix this issue on /" names
     // nothing at all. The host is the only identifying thing left, so keep it.
     return path === '/' ? safeUrl(url) : path;
@@ -746,24 +748,101 @@ function pathOf(url) {
   }
 }
 
+// SECRET NAMES BEGIN. The same block sits in content/collector-main.js,
+// content/picker.js and shared/prompt-template.js, which cannot share code:
+// two are injected into the page and one is a module. test/static.test.mjs
+// fails if the copies differ.
+const REDACTED = '<redacted>';
+
+// Matched against the whole words of a name, so className is not caught by
+// "ssn" nor passHref by "pass". A word of five letters or more also matches
+// at either end of a run together lowercase name (authtoken, phonenumber).
+// Deliberately broad: a needlessly hidden value costs a line of the prompt,
+// and the other kind of mistake cannot be taken back.
+const SECRET_WORDS = [
+  'password', 'passwd', 'passphrase', 'passcode', 'pwd', 'secret', 'token', 'auth', 'oauth',
+  'authorization', 'bearer', 'jwt', 'cookie', 'session', 'credential', 'apikey', 'accesskey',
+  'privatekey', 'signingkey', 'csrf', 'xsrf', 'otp', 'totp', 'pin', 'pincode', 'cvv', 'cvc',
+  'ssn', 'iban', 'cardnumber', 'creditcard', 'ccnumber', 'account', 'address', 'email', 'phone',
+  'dob', 'birth', 'signature',
+];
+
+function isSecretName(name) {
+  const words = String(name)
+    .split(/[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])/)
+    .filter(Boolean)
+    .map((word) => word.toLowerCase());
+  return words.some((word, index) =>
+    SECRET_WORDS.some(
+      (secret) =>
+        word === secret ||
+        word === secret + 's' ||
+        word + (words[index + 1] || '') === secret ||
+        (secret.length >= 5 && (word.startsWith(secret) || word.endsWith(secret)))
+    )
+  );
+}
+// SECRET NAMES END
+
+// SECRET URLS BEGIN. The same block sits in content/picker.js and
+// shared/prompt-template.js; test/static.test.mjs fails if they differ.
+
+// Whole names that carry a secret in a url, though as words they are too
+// common to treat as secret anywhere (errorCode, sortKey): an OAuth code, an
+// API key, a signed url's signature.
+const SECRET_PARAMS = ['code', 'key', 'sig'];
+
 /**
- * A url with any embedded credentials removed.
+ * A query (`?a=1&token=x`) or fragment (`#access_token=x`) with the value of
+ * every secret looking name masked. Handed back unchanged, the very same
+ * string, when there is nothing to mask.
+ */
+function maskParams(part) {
+  if (part.length < 2 || !part.includes('=')) return part;
+  let changed = false;
+  const pairs = part
+    .slice(1)
+    .split('&')
+    .map((pair) => {
+      const eq = pair.indexOf('=');
+      if (eq <= 0 || eq === pair.length - 1) return pair;
+      let name = pair.slice(0, eq);
+      try {
+        name = decodeURIComponent(name.replace(/\+/g, ' '));
+      } catch {
+        /* a malformed escape is still a name to test */
+      }
+      // A hash router's fragment carries a route before its query.
+      name = name.slice(name.lastIndexOf('?') + 1);
+      if (!SECRET_PARAMS.includes(name.toLowerCase()) && !isSecretName(name)) return pair;
+      changed = true;
+      return pair.slice(0, eq + 1) + REDACTED;
+    });
+  return changed ? part[0] + pairs.join('&') : part;
+}
+
+/**
+ * A url, absolute or relative, without embedded credentials and with secret
+ * query and fragment values masked. Unchanged when there is nothing to remove.
  *
- * Printing one in full is the two origin fallback, and https://user:pass@host/
- * is a real thing to have in an address bar. Dropping the origin happened to
- * strip it; printing the url must not put it back, on the clipboard and into a
- * prompt the user is about to paste somewhere.
+ * Plain string work rather than new URL(), which would reject a relative url
+ * and rewrite the rest of an absolute one on its way back out.
  */
 function safeUrl(url) {
-  try {
-    const parsed = new URL(url);
-    if (!parsed.username && !parsed.password) return url;
-    parsed.username = '';
-    parsed.password = '';
-    return parsed.href;
-  } catch {
-    return url;
-  }
+  if (typeof url !== 'string') return url;
+  const bare = url.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^/?#@]*@/i, '$1');
+  const cut = bare.search(/[?#]/);
+  if (cut === -1) return bare;
+  const hashAt = bare.indexOf('#', cut);
+  const search = hashAt === -1 ? bare.slice(cut) : bare.slice(cut, hashAt);
+  const hash = hashAt === -1 ? '' : bare.slice(hashAt);
+  return bare.slice(0, cut) + maskParams(search) + maskParams(hash);
+}
+// SECRET URLS END
+
+/** Every url in a line of page text, through safeUrl. */
+function safeText(text) {
+  return String(text).replace(/\b(?:https?|wss?|file):\/\/[^\s"'<>`)\]]+/gi, (url) => safeUrl(url));
 }
 
 function originOf(url) {

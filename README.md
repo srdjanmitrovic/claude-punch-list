@@ -250,7 +250,7 @@ Search for: `cart-total`, "Order total", `handleApply`, `handleSave`, `Total`
 Handlers on `form.coupon`, 2 elements up the DOM, not on the picked element: onSubmit=ƒ handleApply, onChange
 `onSubmit` body starts: setPending(true); applyCoupon(inputRef.current ? ...
 Props of `Total`: amount=NaN, currency="EUR", onRetry=ƒ handleSave
-Classes: _total_1f3k9_12 is a CSS Module: .total in CartSummary.module.css
+Classes: _total_1f3k9_12 is a Vite CSS Module: local .total declared on line 12 of its module file, whose name the class does not carry
 Selector: `form.coupon > div.cart-summary > span.total`
 ```
 
@@ -299,7 +299,7 @@ Inside CartSummary > CheckoutPage
 Search for: `cart-total`, "Order total", `handleApply`, `handleSave`, `Total`
 Handlers on `form.coupon`, 2 elements up the DOM, not on the picked element: onSubmit=ƒ handleApply, onChange
 `onSubmit` body starts: setPending(true); applyCoupon(inputRef.current ? ...
-Classes: _total_1f3k9_12 is a CSS Module: .total in CartSummary.module.css
+Classes: _total_1f3k9_12 is a Vite CSS Module: local .total declared on line 12 of its module file, whose name the class does not carry
 ```
 
 Handler names and the first statements of a handler's body come off the DOM node itself, so they
@@ -434,20 +434,45 @@ your Downloads folder, the sheet itself (thumbnails, sentences, screenshot paths
 and any picked element's markup, component name and prop values) goes to the extension's own
 local storage, and text goes to your clipboard.
 
-Component props are worth one extra paragraph, because they are the one thing here that is read
-out of a running application rather than off the screen. Only the nearest component's props are
-read, `children` is skipped, at most twelve keys are kept, and every string is cut at sixty
-characters.
+Local is not the same as harmless, though: the prompt is meant to be pasted, and the sheet sits
+in storage for up to a week. So values that look secret are replaced with `<redacted>`: props,
+markup and logged objects where they are read, before anything is stored, and URLs when the
+prompt is built. "Look secret" is decided by name: a
+name made of words such as `password`, `token`, `secret`, `auth`, `session`, `cookie`, `apiKey`,
+`csrf`, `otp`, `pin`, `cvc`, `cardNumber`, `email` or `phone` (about forty in all, matched as
+whole words, so `className` and `passHref` are left alone). What is screened:
 
-Any prop whose name suggests a secret (`password`, `token`, `apiKey`, `email`, `cardNumber` and
-a couple of dozen more) has its value replaced with `<redacted>` before it leaves the page. A
-handler's body is read the same way and dropped entirely, rather than masked in part, if it
-either mentions one of those words or contains a quoted run of twenty or more token characters,
-which is the shape a key or a bearer token has whatever the code around it is called. The
-name is still reported, because knowing the prop is there is most of its debugging value and
-the value rarely is. That rule is a name match, not a guarantee: a secret in a prop called
-`data` would still be captured, so untick **element** before capturing on a page where that
-matters.
+* **Component props.** Only the nearest component's props are read, `children` is skipped, at
+  most twelve keys are kept, and every string is cut at sixty characters. A prop with a secret
+  looking name keeps its name and loses its value, unless the value is a boolean, null or a
+  function (printed by name), none of which can hold one.
+* **Handler bodies.** Dropped entirely, rather than masked in part, if they mention one of those
+  words or contain a quoted run of twenty or more token characters, which is the shape a key or
+  a bearer token has whatever the code around it is called.
+* **Picked markup and attributes.** The value of a password or hidden input, of a field the
+  browser would fill with a password, a one time code or a card number, and of any field whose
+  name or id looks secret. Any attribute whose own name looks secret (`data-auth-token`). In
+  `href`, `src`, `srcset`, `action`, `formaction` and `poster`, credentials and secret query
+  values.
+* **Logged objects.** In an object passed to `console.error` or `console.warn`, the value under
+  any secret looking key, at any depth (`headers.Authorization`, `user.password`).
+* **Every URL the prompt prints.** Page addresses, request URLs and any URL inside a console or
+  error message lose embedded credentials (`user:pass@`) and the values of secret looking query
+  and fragment parameters, plus `code`, `key` and `sig`, which carry an OAuth code, an API key
+  or a signature.
+
+What is not screened:
+
+* Free text. A message logged as `'token is ' + token`, an exception message, a stack frame and
+  the picked element's visible text print as they are.
+* A secret under an innocent name: a prop called `data`, an object key called `value`, a
+  `textarea`'s contents.
+* The screenshot, which shows whatever was on the screen.
+* The page address stored with each item, which is kept as it was and masked only when the
+  prompt is built.
+
+It is a name match, not a guarantee. On a page where that matters, untick **element** before
+capturing, and **console** and **network** before copying.
 
 The one caveat worth stating plainly is that the collector has to run in the page's own
 JavaScript world to wrap the real `console` and `fetch`, and anything in that world is
@@ -460,33 +485,30 @@ available. It does mean the buffer is not a private channel.
 from extension pages without it, so asking would add the "Modify data you copy and paste"
 install warning while buying nothing.
 
-### Restricting it to your own sites
+### Keeping the collector to your own sites
 
-`<all_urls>` appears in `manifest.json` **three** times, and they are separate grants that do
-different jobs. Narrowing one and not the others is the mistake to avoid, because each half
-fails quietly in its own way.
+`<all_urls>` appears in `manifest.json` **three** times, as two separate grants that do
+different jobs. Only one of them can be narrowed.
 
 | Where | What it controls |
 | :--- | :--- |
-| `host_permissions` | Screenshotting the tab, injecting the overlay and picker, and whether Chrome reveals the tab's URL to the extension at all |
-| `content_scripts[].matches`, twice | Where the collector arms, and therefore which sites `console`, `fetch` and `XMLHttpRequest` get wrapped on. This is also what drives the site list in the install warning. |
+| `host_permissions` | Screenshotting the tab, injecting the overlay and picker, and whether Chrome reveals the tab's URL to the extension at all. **Leave it as it is.** Chrome's `tabs.captureVisibleTab` needs `<all_urls>` or `activeTab`, and `activeTab` cannot stand in (see the [architecture notes](docs/ARCHITECTURE.md#permissions)), so a narrower list stops Region, Element and Screen on every site, listed or not. |
+| `content_scripts[].matches`, twice | Where the collector arms, and therefore which sites `console`, `fetch` and `XMLHttpRequest` get wrapped on. |
 
-To limit the extension to the sites you actually work on, change **all three** to the same
-list:
+To keep the collector off every site but the ones you work on, change the two `matches` lists
+and nothing else:
 
 ```json
-"host_permissions": ["http://localhost/*", "https://*.yourcompany.com/*"],
-
 "content_scripts": [
   { "matches": ["http://localhost/*", "https://*.yourcompany.com/*"], "js": ["content/collector-bridge.js"], "world": "ISOLATED", "run_at": "document_start" },
   { "matches": ["http://localhost/*", "https://*.yourcompany.com/*"], "js": ["content/collector-main.js"], "world": "MAIN", "run_at": "document_start" }
 ]
 ```
 
-Editing only `host_permissions` leaves the collector still injecting on every page you visit
-and still wrapping `console`, `fetch` and `XMLHttpRequest` there, which is usually the exact
-thing you were trying to stop. Editing only `matches` leaves capture working nowhere, since
-Chrome withholds the URL and the panel reports the page as unreadable.
+Capture still works everywhere. On a site outside the list, a prompt says its console and
+network were not read, rather than leaving them out without a word. The install warning does
+not get shorter, because `host_permissions` still names every site. This recipe follows Chrome's
+documentation and was not tried with an edited manifest.
 
 [Permissions are explained one by one in the architecture notes](docs/ARCHITECTURE.md#permissions).
 

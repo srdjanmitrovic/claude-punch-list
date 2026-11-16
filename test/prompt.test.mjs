@@ -130,7 +130,40 @@ const EXTRA = {
     });
     return report;
   },
+
+  // Secrets in every place a url prints: the page, a request, a logged
+  // message, a failed resource, and credentials in an address on a second
+  // origin. Each keeps its shape and loses only the value.
+  secrets: () => {
+    const report = sampleReport('mixed');
+    report.page.url = 'http://localhost:3000/checkout?step=2&session_id=s3cr3t#access_token=t0k3n';
+    report.items[2].url = 'https://admin:hunter2@staging.example.com/cart?code=oauthc0de&state=xyz';
+    report.network.push({
+      method: 'POST',
+      url: '/api/login?api_key=k3y&redirect=%2Fhome',
+      status: 401,
+      statusText: 'Unauthorized',
+      ms: 33,
+      via: 'fetch',
+    });
+    report.consoleLines.push({ level: 'warn', text: 'retrying https://api.example.com/v1/me?token=abc.def&fields=name' });
+    report.errors.push({
+      kind: 'resource',
+      text: 'Failed to load <img>: https://cdn.example.com/a.png?X-Amz-Signature=f00d&w=40',
+    });
+    return report;
+  },
 };
+
+const SECRET_VALUES = ['s3cr3t', 't0k3n', 'hunter2', 'oauthc0de', 'k3y', 'abc.def', 'f00d'];
+
+test('prompt: no secret value from a url survives into the prompt', () => {
+  const prompt = buildPrompt(EXTRA.secrets());
+  for (const value of SECRET_VALUES) assert.ok(!prompt.includes(value), `${value} printed`);
+  for (const kept of ['step=2', 'state=xyz', 'redirect=%2Fhome', 'fields=name', 'w=40']) {
+    assert.ok(prompt.includes(kept), `${kept} was masked too`);
+  }
+});
 
 const CASES = [...MODES.map((mode) => [mode, () => sampleReport(mode)]), ...Object.entries(EXTRA)];
 

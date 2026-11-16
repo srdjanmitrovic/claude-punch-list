@@ -93,10 +93,13 @@ const ELEMENT = {
     starts: 'setPending(true); applyCoupon(inputRef.current ? ...',
     startsOf: 'onSubmit',
   },
-  // What Vite's dev server makes of a CSS Module: the hash is per build, so the
-  // class in the DOM is not in the source and the stylesheet is the only part
-  // of this clause worth searching for.
-  classHints: ['_total_1f3k9_12 is a CSS Module: .total in CartSummary.module.css'],
+  // What content/picker.js says of a Vite CSS Module class. Vite's class carries
+  // the local name and the line it is declared on, and a hash of the file path
+  // in place of the path, so the clause can name the rule and its line but not
+  // the file. The webpack and Next.js shape is the one that names a file.
+  classHints: [
+    '_total_1f3k9_12 is a Vite CSS Module: local .total declared on line 12 of its module file, whose name the class does not carry',
+  ],
 };
 
 // The same element on a production build, and the case the component wording
@@ -231,8 +234,9 @@ const NETWORK = [
     statusText: 'Internal Server Error',
     ms: 243,
     via: 'fetch',
-    // Nearest frame first, and already resolved through the source map, which
-    // is why these are src paths and not bundle offsets.
+    // Nearest frame first, as V8 reports them. Nothing applies a source map:
+    // these read as src paths because Vite's dev server serves each module at
+    // its source path. A bundled build gives bundle urls and offsets.
     caller: [
       'applyCoupon (/src/components/cart/CartSummary.tsx:70:36)',
       'handleApply (/src/components/cart/CartSummary.tsx:84:13)',

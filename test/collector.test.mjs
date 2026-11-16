@@ -221,6 +221,22 @@ test('collector: a value that cannot be serialized still reaches the real consol
   assert.equal(page.snapshot().console[0].text, '[unserializable]');
 });
 
+test('collector: a logged object keeps its shape and loses the values of secret looking keys', () => {
+  const page = arm();
+  page.page.console.error('login failed', {
+    user: { name: 'ada', password: 'hunter2', hasPassword: true },
+    headers: { Authorization: 'Bearer abc', Accept: 'json' },
+    className: 'row',
+    passHref: true,
+    apiKey: null,
+  });
+  assert.equal(
+    page.snapshot().console[0].text,
+    'login failed {"user":{"name":"ada","password":"<redacted>","hasPassword":true},' +
+      '"headers":{"Authorization":"<redacted>","Accept":"json"},"className":"row","passHref":true,"apiKey":null}'
+  );
+});
+
 test('collector: each ring keeps the last 30 entries', () => {
   const page = arm();
   for (let i = 1; i <= 35; i += 1) page.page.console.error(`error ${i}`);

@@ -91,6 +91,98 @@
 
   const MAX_HTML = 1600;
 
+  // SECRET NAMES BEGIN. The same block sits in content/collector-main.js,
+  // content/picker.js and shared/prompt-template.js, which cannot share code:
+  // two are injected into the page and one is a module. test/static.test.mjs
+  // fails if the copies differ.
+  const REDACTED = '<redacted>';
+
+  // Matched against the whole words of a name, so className is not caught by
+  // "ssn" nor passHref by "pass". A word of five letters or more also matches
+  // at either end of a run together lowercase name (authtoken, phonenumber).
+  // Deliberately broad: a needlessly hidden value costs a line of the prompt,
+  // and the other kind of mistake cannot be taken back.
+  const SECRET_WORDS = [
+    'password', 'passwd', 'passphrase', 'passcode', 'pwd', 'secret', 'token', 'auth', 'oauth',
+    'authorization', 'bearer', 'jwt', 'cookie', 'session', 'credential', 'apikey', 'accesskey',
+    'privatekey', 'signingkey', 'csrf', 'xsrf', 'otp', 'totp', 'pin', 'pincode', 'cvv', 'cvc',
+    'ssn', 'iban', 'cardnumber', 'creditcard', 'ccnumber', 'account', 'address', 'email', 'phone',
+    'dob', 'birth', 'signature',
+  ];
+
+  function isSecretName(name) {
+    const words = String(name)
+      .split(/[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])/)
+      .filter(Boolean)
+      .map((word) => word.toLowerCase());
+    return words.some((word, index) =>
+      SECRET_WORDS.some(
+        (secret) =>
+          word === secret ||
+          word === secret + 's' ||
+          word + (words[index + 1] || '') === secret ||
+          (secret.length >= 5 && (word.startsWith(secret) || word.endsWith(secret)))
+      )
+    );
+  }
+  // SECRET NAMES END
+
+  // SECRET URLS BEGIN. The same block sits in content/picker.js and
+  // shared/prompt-template.js; test/static.test.mjs fails if they differ.
+
+  // Whole names that carry a secret in a url, though as words they are too
+  // common to treat as secret anywhere (errorCode, sortKey): an OAuth code, an
+  // API key, a signed url's signature.
+  const SECRET_PARAMS = ['code', 'key', 'sig'];
+
+  /**
+   * A query (`?a=1&token=x`) or fragment (`#access_token=x`) with the value of
+   * every secret looking name masked. Handed back unchanged, the very same
+   * string, when there is nothing to mask.
+   */
+  function maskParams(part) {
+    if (part.length < 2 || !part.includes('=')) return part;
+    let changed = false;
+    const pairs = part
+      .slice(1)
+      .split('&')
+      .map((pair) => {
+        const eq = pair.indexOf('=');
+        if (eq <= 0 || eq === pair.length - 1) return pair;
+        let name = pair.slice(0, eq);
+        try {
+          name = decodeURIComponent(name.replace(/\+/g, ' '));
+        } catch {
+          /* a malformed escape is still a name to test */
+        }
+        // A hash router's fragment carries a route before its query.
+        name = name.slice(name.lastIndexOf('?') + 1);
+        if (!SECRET_PARAMS.includes(name.toLowerCase()) && !isSecretName(name)) return pair;
+        changed = true;
+        return pair.slice(0, eq + 1) + REDACTED;
+      });
+    return changed ? part[0] + pairs.join('&') : part;
+  }
+
+  /**
+   * A url, absolute or relative, without embedded credentials and with secret
+   * query and fragment values masked. Unchanged when there is nothing to remove.
+   *
+   * Plain string work rather than new URL(), which would reject a relative url
+   * and rewrite the rest of an absolute one on its way back out.
+   */
+  function safeUrl(url) {
+    if (typeof url !== 'string') return url;
+    const bare = url.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^/?#@]*@/i, '$1');
+    const cut = bare.search(/[?#]/);
+    if (cut === -1) return bare;
+    const hashAt = bare.indexOf('#', cut);
+    const search = hashAt === -1 ? bare.slice(cut) : bare.slice(cut, hashAt);
+    const hash = hashAt === -1 ? '' : bare.slice(hashAt);
+    return bare.slice(0, cut) + maskParams(search) + maskParams(hash);
+  }
+  // SECRET URLS END
+
   function createController() {
     let host = null;
     let shadow = null;
@@ -413,13 +505,15 @@
      * only the children are cut.
      */
     function markup(element) {
-      const full = element.outerHTML || '';
+      // Masked before anything is cut, so a cut cannot fall inside a tag and
+      // leave half a secret that no longer looks like one.
+      const full = maskMarkup(element.outerHTML || '');
       if (full.length <= MAX_HTML) return { html: full, truncated: false };
 
       const openTagEnd = full.indexOf('>');
       const openTag = openTagEnd === -1 ? full.slice(0, 200) : full.slice(0, openTagEnd + 1);
       const budget = MAX_HTML - openTag.length - 60;
-      const inner = (element.innerHTML || '').slice(0, Math.max(budget, 0));
+      const inner = maskMarkup(element.innerHTML || '').slice(0, Math.max(budget, 0));
       return {
         html: `${openTag}\n${inner}\n  <!-- …${element.children.length} child element(s), truncated -->\n</${element.tagName.toLowerCase()}>`,
         truncated: true,
@@ -442,17 +536,84 @@
 
     function attributes(element) {
       const out = {};
+      const control = secretControl(element.tagName.toLowerCase(), (name) =>
+        element.getAttribute(name)
+      );
       for (const attribute of Array.from(element.attributes || [])) {
         // data-cdr-pick is this extension's own, live only while a pick is in
         // flight. The payload is built before it is set, so this is belt and
         // braces against a page that re-serialises a subtree in that window.
         if (attribute.name === 'class' || attribute.name === 'style') continue;
         if (attribute.name === 'data-cdr-pick') continue;
-        out[attribute.name] =
-          attribute.value.length > 120 ? attribute.value.slice(0, 120) + '…' : attribute.value;
+        const value = maskAttribute(attribute.name, attribute.value, control);
+        out[attribute.name] = value.length > 120 ? value.slice(0, 120) + '…' : value;
       }
       return out;
     }
+
+    // MASKING BEGIN (test/picker.test.mjs runs this block on its own)
+    // PRIVACY: markup and attributes go into the prompt and into
+    // chrome.storage.local for up to a week, and a picked form carries what
+    // was typed into it. What is hidden is decided by name, as for props
+    // (isSecretName), plus the controls below. A name match, not a guarantee.
+
+    // Attributes whose value is a url, which can carry a token in its query.
+    const URL_ATTRIBUTES = ['href', 'src', 'srcset', 'action', 'formaction', 'poster'];
+
+    /**
+     * Whether a form control's value is a secret whatever it is called: a
+     * password or hidden input, a field the browser fills with a password, a
+     * one time code or a card, or one whose name or id says so. React mirrors
+     * a controlled input's live value into its value attribute, so without
+     * this a picked login form prints the password typed into it.
+     *
+     * @param {(name: string) => string|null} get  an attribute's value
+     */
+    function secretControl(tag, get) {
+      if (tag !== 'input' && tag !== 'textarea' && tag !== 'select') return false;
+      const type = (get('type') || '').toLowerCase();
+      if (tag === 'input' && (type === 'password' || type === 'hidden')) return true;
+      if (/password|one-time-code|cc-(?:number|csc|exp)/i.test(get('autocomplete') || '')) {
+        return true;
+      }
+      return isSecretName(get('name') || '') || isSecretName(get('id') || '');
+    }
+
+    /** One attribute's value as the payload may carry it. */
+    function maskAttribute(name, value, control) {
+      if (!value) return value;
+      const lower = name.toLowerCase();
+      if ((control && lower === 'value') || isSecretName(lower)) return REDACTED;
+      if (URL_ATTRIBUTES.includes(lower)) return safeUrl(value);
+      return value;
+    }
+
+    // An opening tag as outerHTML writes it, which always puts a value in
+    // double quotes; the value can still hold a '>' in older Chrome.
+    const OPEN_TAG = /<([A-Za-z][^\s/>]*)((?:\s+[^\s"'>/=]+="[^"]*")*)(\s*\/?)>/g;
+    const ATTRIBUTE = /(\s+)([^\s"'>/=]+)="([^"]*)"/g;
+
+    /**
+     * Serialised markup with every value maskAttribute would hide hidden. A
+     * tag with nothing to hide is left exactly as written. A match inside a
+     * script's text can only hide too much, never too little.
+     */
+    function maskMarkup(html) {
+      return html.replace(OPEN_TAG, (tag, name, attrs, end) => {
+        const list = [...attrs.matchAll(ATTRIBUTE)];
+        const get = (wanted) => list.find((match) => match[2].toLowerCase() === wanted)?.[3] ?? null;
+        const control = secretControl(name.toLowerCase(), get);
+        let changed = false;
+        const rebuilt = list.map(([whole, space, attr, value]) => {
+          const masked = maskAttribute(attr, value, control);
+          if (masked === value) return whole;
+          changed = true;
+          return `${space}${attr}="${masked}"`;
+        });
+        return changed ? `<${name}${rebuilt.join('')}${end}>` : tag;
+      });
+    }
+    // MASKING END
 
     /**
      * What a generated class name proves about where its CSS lives.

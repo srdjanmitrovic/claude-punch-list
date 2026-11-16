@@ -60,7 +60,7 @@ npm run prompt minified # the same, for a production build with no real componen
 ```
 
 The tests use `node:test`, which ships with Node, so there is nothing to install. They live in
-`test/` and come in three kinds:
+`test/` and come in four kinds:
 
 * `test/prompt.test.mjs` renders the template against the samples in `tools/preview-prompt.mjs`,
   plus a few variations no preview shows, and compares each prompt byte for byte with a file in
@@ -68,9 +68,11 @@ The tests use `node:test`, which ships with Node, so there is nothing to install
   the regenerated files with the change, so the diff shows exactly what Claude Code will now read.
 * `test/collector.test.mjs` runs `content/collector-main.js` in a fresh `node:vm` realm and holds
   every wrapper to the rules below.
+* `test/picker.test.mjs` runs the picker's masking block, lifted out of `content/picker.js`
+  between its `MASKING BEGIN` and `MASKING END` markers, against markup a picked form produces.
 * `test/static.test.mjs` checks what would otherwise only fail in Chrome: every file the manifest,
-  the worker and the panel name exists, every file parses, and the re-injected capture scripts
-  declare nothing at the top level.
+  the worker and the panel name exists, every file parses, the re-injected capture scripts
+  declare nothing at the top level, and the copies of the secret name blocks agree.
 
 None of this runs Chrome. The stage and a real install are still the check for anything visual,
 for the worker, and for how the panel and the page hand focus back and forth. Keep any new test
@@ -94,6 +96,12 @@ reading a single file, and breaking them tends to fail silently rather than loud
   locally. `npm test` fails if the line goes missing.
 * `content/overlay.js` and `content/picker.js` are re-injected in full on every use. They must
   not declare anything at the top level with `const`, `let` or `class`.
+* What counts as a secret is written down three times, between `SECRET NAMES BEGIN` and
+  `SECRET NAMES END` in `content/collector-main.js`, `content/picker.js` and
+  `shared/prompt-template.js`, because two of those are injected into the page and cannot import
+  the third. Change all three together (the url block likewise, in the picker and the template);
+  `npm test` fails if they differ. The README's privacy section lists what is screened and what
+  is not, and should change with them.
 * The picker reads a React fiber or a Vue instance by asking `content/collector-main.js`, because
   those live on the node as properties only the page's own JavaScript world can see. The node
   crosses the boundary as a temporary `data-cdr-pick` attribute, since the DOM is shared and the
