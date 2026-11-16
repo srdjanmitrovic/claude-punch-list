@@ -43,7 +43,7 @@ The cart page should show the same shipping estimate the checkout uses. Right no
 
 Screenshot: /Users/you/Downloads/claude-punch-list/2026-08-07_20-51-33_localhost-cart.png
 
-Console and network: recorded on another page or an earlier load, which this report did not read.
+Console and network: recorded on another page, which this report did not read.
 
 ---
 For each bug, find the root cause in this codebase before changing anything, and if the screenshot and the console point at different things, say so rather than guessing. For each change, find where it is implemented before writing anything and follow the patterns already in this codebase rather than introducing new ones; if it is larger than it looks, say so and propose the smallest version that delivers it. Cover every item, and say which item each change belongs to. If several items turn out to share a cause or a fix, say so rather than treating them separately.

@@ -107,14 +107,15 @@
     'authorization', 'bearer', 'jwt', 'cookie', 'session', 'credential', 'apikey', 'accesskey',
     'privatekey', 'signingkey', 'csrf', 'xsrf', 'otp', 'totp', 'pin', 'pincode', 'cvv', 'cvc',
     'ssn', 'iban', 'cardnumber', 'creditcard', 'ccnumber', 'account', 'address', 'email', 'phone',
-    'dob', 'birth', 'signature',
+    'dob', 'birth', 'signature', 'jsessionid', 'sessid', 'securitycode', 'verificationcode',
   ];
 
   function isSecretName(name) {
     const words = String(name)
       .split(/[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])/)
       .filter(Boolean)
-      .map((word) => word.toLowerCase());
+      // otp1, cvv2, address2: a field numbered in a row is still that field.
+      .map((word) => word.toLowerCase().replace(/(?<=[a-z])\d+$/, ''));
     return words.some((word, index) =>
       SECRET_WORDS.some(
         (secret) =>
@@ -132,36 +133,73 @@
 
   // Whole names that carry a secret in a url, though as words they are too
   // common to treat as secret anywhere (errorCode, sortKey): an OAuth code, an
-  // API key, a signed url's signature.
-  const SECRET_PARAMS = ['code', 'key', 'sig'];
+  // API key, a signed url's signature, a single sign on ticket.
+  const SECRET_PARAMS = ['code', 'key', 'sig', 'ticket'];
+
+  // Embedded credentials: up to the last '@' before the path, since a password
+  // can hold one. A scheme relative url (//user:pass@host) carries them too.
+  const CREDENTIALS = /^((?:[a-z][a-z0-9+.-]*:)?\/\/)([^/?#\s]*)@/i;
+
+  // How many urls deep a value is followed (a return address holding a return
+  // address). Past that the value is masked whole: a page that nests further is
+  // either broken or built to run this out of stack.
+  const MAX_NESTING = 4;
 
   /**
    * A query (`?a=1&token=x`) or fragment (`#access_token=x`) with the value of
-   * every secret looking name masked. Handed back unchanged, the very same
-   * string, when there is nothing to mask.
+   * every secret looking name masked, and any url inside a value (a redirect,
+   * a return address) masked the same way. Handed back unchanged, the very
+   * same string, when there is nothing to mask.
    */
-  function maskParams(part) {
+  function maskParams(part, depth = 0) {
     if (part.length < 2 || !part.includes('=')) return part;
     let changed = false;
-    const pairs = part
-      .slice(1)
-      .split('&')
-      .map((pair) => {
-        const eq = pair.indexOf('=');
-        if (eq <= 0 || eq === pair.length - 1) return pair;
-        let name = pair.slice(0, eq);
-        try {
-          name = decodeURIComponent(name.replace(/\+/g, ' '));
-        } catch {
-          /* a malformed escape is still a name to test */
-        }
-        // A hash router's fragment carries a route before its query.
-        name = name.slice(name.lastIndexOf('?') + 1);
-        if (!SECRET_PARAMS.includes(name.toLowerCase()) && !isSecretName(name)) return pair;
-        changed = true;
-        return pair.slice(0, eq + 1) + REDACTED;
-      });
-    return changed ? part[0] + pairs.join('&') : part;
+    // Pairs end at '&', and at a ';' that a name and '=' follow. Some servers
+    // separate pairs with ';', and serialised markup writes '&' as '&amp;',
+    // whose ';' would otherwise leave the next name as 'amp;token'. A ';' with
+    // no '=' after it is part of the value, and goes with it.
+    const pieces = part.slice(1).split(/(&|;(?=[^&;=]*=))/);
+    for (let index = 0; index < pieces.length; index += 2) {
+      const pair = pieces[index];
+      const eq = pair.indexOf('=');
+      if (eq <= 0 || eq === pair.length - 1) continue;
+      let name = pair.slice(0, eq);
+      try {
+        name = decodeURIComponent(name.replace(/\+/g, ' '));
+      } catch {
+        /* a malformed escape is still a name to test */
+      }
+      // A hash router's fragment carries a route before its query.
+      name = name.slice(name.lastIndexOf('?') + 1);
+      const value = pair.slice(eq + 1);
+      const masked =
+        SECRET_PARAMS.includes(name.toLowerCase()) || isSecretName(name)
+          ? REDACTED
+          : nestedUrl(value, depth);
+      if (masked === value) continue;
+      pieces[index] = pair.slice(0, eq + 1) + masked;
+      changed = true;
+    }
+    return changed ? part[0] + pieces.join('') : part;
+  }
+
+  /**
+   * A parameter's value with the secrets of any url it holds masked, whether
+   * written out (`next=/verify?token=x`) or percent encoded. An encoded one is
+   * masked whole: put back encoded, the marker would print as %3Credacted%3E.
+   */
+  function nestedUrl(value, depth) {
+    const holdsUrl = (text) => /[?#]/.test(text) || credentialsAt(text) !== null;
+    if (holdsUrl(value)) return depth < MAX_NESTING ? screenUrl(value, depth + 1) : REDACTED;
+    if (!/%3F|%23|%40/i.test(value)) return value;
+    let decoded;
+    try {
+      decoded = decodeURIComponent(value);
+    } catch {
+      return value;
+    }
+    if (!holdsUrl(decoded)) return value;
+    return depth < MAX_NESTING && screenUrl(decoded, depth + 1) === decoded ? value : REDACTED;
   }
 
   /**
@@ -172,14 +210,30 @@
    * and rewrite the rest of an absolute one on its way back out.
    */
   function safeUrl(url) {
-    if (typeof url !== 'string') return url;
-    const bare = url.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^/?#@]*@/i, '$1');
+    return typeof url === 'string' ? screenUrl(url, 0) : url;
+  }
+
+  /**
+   * The credentials at the start of a url, as CREDENTIALS matches them, or
+   * null. A userinfo with letters outside ASCII counts only with a ':' in it
+   * (josé:pw@, u:Pässwort@). Without one, in running text, it is a run of
+   * another script up to an e-mail address further on
+   * (请访问https://example.com或联系admin@example.com), and no password.
+   */
+  function credentialsAt(url) {
+    const found = CREDENTIALS.exec(url);
+    return found && (found[2].includes(':') || !/[^\x00-\x7f]/.test(found[2])) ? found : null;
+  }
+
+  function screenUrl(url, depth) {
+    const credentials = credentialsAt(url);
+    const bare = credentials ? credentials[1] + url.slice(credentials[0].length) : url;
     const cut = bare.search(/[?#]/);
     if (cut === -1) return bare;
     const hashAt = bare.indexOf('#', cut);
     const search = hashAt === -1 ? bare.slice(cut) : bare.slice(cut, hashAt);
     const hash = hashAt === -1 ? '' : bare.slice(hashAt);
-    return bare.slice(0, cut) + maskParams(search) + maskParams(hash);
+    return bare.slice(0, cut) + maskParams(search, depth) + maskParams(hash, depth);
   }
   // SECRET URLS END
 
@@ -499,6 +553,34 @@
     }
 
     /**
+     * The element's text for the payload, without what a secret textarea
+     * holds. textContent takes in a textarea's text like any other, so with a
+     * textarea inside, the text is put together from its text nodes, leaving
+     * out the ones a secret textarea holds and nothing else.
+     */
+    function visibleText(element) {
+      const secret = (node) =>
+        node.tagName === 'TEXTAREA' && secretTextarea((name) => node.getAttribute(name));
+      let text;
+      if (secret(element)) text = '';
+      else if (!element.querySelector('textarea')) text = element.textContent || '';
+      else {
+        const parts = [];
+        const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+        for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+          parts.push(node.parentElement && secret(node.parentElement) ? ' ' : node.data);
+        }
+        text = parts.join('');
+      }
+      return text.trim().replace(/\s+/g, ' ').slice(0, 200);
+    }
+
+    // The opening tag at the start of outerHTML. It always writes a value in
+    // double quotes and escapes any '"' inside it, but Chrome before 138
+    // leaves a '>' in a value as it is, so the first '>' is not always the end.
+    const LEADING_TAG = /^<[A-Za-z][^\s/>]*(?:\s+[^\s"'>/=]+="[^"]*")*\s*\/?>/;
+
+    /**
      * A deeply nested element's outerHTML can be hundreds of kilobytes. The
      * opening tag carries most of the debugging value (that is where classes,
      * data attributes and inline styles live), so it is always preserved and
@@ -507,11 +589,15 @@
     function markup(element) {
       // Masked before anything is cut, so a cut cannot fall inside a tag and
       // leave half a secret that no longer looks like one.
-      const full = maskMarkup(element.outerHTML || '');
+      const raw = element.outerHTML || '';
+      const full = maskMarkup(raw);
       if (full.length <= MAX_HTML) return { html: full, truncated: false };
 
-      const openTagEnd = full.indexOf('>');
-      const openTag = openTagEnd === -1 ? full.slice(0, 200) : full.slice(0, openTagEnd + 1);
+      // The opening tag is found before masking, since the marker holds a
+      // '>' of its own. A tag the pattern cannot read (an attribute name with
+      // a quote in it) is cut from the masked whole instead.
+      const leading = LEADING_TAG.exec(raw);
+      const openTag = leading ? maskMarkup(leading[0]) : full.slice(0, 200);
       const budget = MAX_HTML - openTag.length - 60;
       const inner = maskMarkup(element.innerHTML || '').slice(0, Math.max(budget, 0));
       return {
@@ -558,7 +644,23 @@
     // (isSecretName), plus the controls below. A name match, not a guarantee.
 
     // Attributes whose value is a url, which can carry a token in its query.
-    const URL_ATTRIBUTES = ['href', 'src', 'srcset', 'action', 'formaction', 'poster'];
+    // The data- ones are where lazy loading libraries park a src until it
+    // scrolls into view.
+    const URL_ATTRIBUTES = [
+      'href', 'src', 'action', 'formaction', 'poster', 'ping', 'xlink:href', 'data-src', 'data-href',
+    ];
+
+    // Lists of urls, each candidate with a query of its own.
+    const URL_LISTS = ['srcset', 'data-srcset'];
+
+    // A url() in a style: in double quotes, single quotes, the &quot; that
+    // markup writes, or bare. A quoted url may hold a parenthesis (a CDN's
+    // photo%20(1).jpg), so each quoted form runs to its own closing quote.
+    // No two neighbouring parts can match the same characters, so a style
+    // built to make this backtrack (url( and a long run of spaces, or
+    // thousands of url( in a row) costs one pass.
+    const STYLE_URL =
+      /url\(\s*(?:"([^"]*)"|'([^']*)'|&quot;((?:[^&]|&(?!quot;))*)&quot;|([^\s"'()]+))\s*\)/gi;
 
     /**
      * Whether a form control's value is a secret whatever it is called: a
@@ -570,9 +672,10 @@
      * @param {(name: string) => string|null} get  an attribute's value
      */
     function secretControl(tag, get) {
-      if (tag !== 'input' && tag !== 'textarea' && tag !== 'select') return false;
+      if (!['input', 'textarea', 'select', 'button'].includes(tag)) return false;
       const type = (get('type') || '').toLowerCase();
-      if (tag === 'input' && (type === 'password' || type === 'hidden')) return true;
+      // An email or phone field is personal whatever it is called.
+      if (tag === 'input' && ['password', 'hidden', 'email', 'tel'].includes(type)) return true;
       if (/password|one-time-code|cc-(?:number|csc|exp)/i.test(get('autocomplete') || '')) {
         return true;
       }
@@ -583,8 +686,26 @@
     function maskAttribute(name, value, control) {
       if (!value) return value;
       const lower = name.toLowerCase();
-      if ((control && lower === 'value') || isSecretName(lower)) return REDACTED;
+      // HTML's accesskey is a keyboard shortcut, one character, not a key.
+      if (lower !== 'accesskey' && ((control && lower === 'value') || isSecretName(lower))) {
+        return REDACTED;
+      }
       if (URL_ATTRIBUTES.includes(lower)) return safeUrl(value);
+      // A candidate ends at the comma before the next one, but a url can
+      // hold a comma of its own (an image CDN's w_100,h_100).
+      if (URL_LISTS.includes(lower)) {
+        return value.replace(/[^\s,][^\s]*?(?=,?(?:\s|$))/g, (url) => safeUrl(url));
+      }
+      // A signed background image. Markup writes the quotes as &quot;.
+      if (lower === 'style') {
+        return value.replace(STYLE_URL, (whole, double, single, entity, bare) => {
+          const url = double ?? single ?? entity ?? bare;
+          const masked = safeUrl(url);
+          if (masked === url) return whole;
+          const quote = double != null ? '"' : single != null ? "'" : entity != null ? '&quot;' : '';
+          return `url(${quote}${masked}${quote})`;
+        });
+      }
       return value;
     }
 
@@ -592,6 +713,15 @@
     // double quotes; the value can still hold a '>' in older Chrome.
     const OPEN_TAG = /<([A-Za-z][^\s/>]*)((?:\s+[^\s"'>/=]+="[^"]*")*)(\s*\/?)>/g;
     const ATTRIBUTE = /(\s+)([^\s"'>/=]+)="([^"]*)"/g;
+
+    // A textarea's value is its text, not an attribute. Serialisation
+    // escapes every '<' in that text, so it runs to the closing tag.
+    const TEXTAREA = /(<textarea((?:\s+[^\s"'>/=]+="[^"]*")*)\s*>)([^<]+)(?=<\/textarea>)/gi;
+
+    /** Whether a textarea, given its attributes, holds a secret. */
+    function secretTextarea(get) {
+      return secretControl('textarea', get);
+    }
 
     /**
      * Serialised markup with every value maskAttribute would hide hidden. A
@@ -611,6 +741,10 @@
           return `${space}${attr}="${masked}"`;
         });
         return changed ? `<${name}${rebuilt.join('')}${end}>` : tag;
+      }).replace(TEXTAREA, (whole, open, attrs) => {
+        const list = [...attrs.matchAll(ATTRIBUTE)];
+        const get = (wanted) => list.find((match) => match[2].toLowerCase() === wanted)?.[3] ?? null;
+        return secretTextarea(get) ? open + REDACTED : whole;
       });
     }
     // MASKING END
@@ -728,8 +862,8 @@
         tagName: element.tagName.toLowerCase(),
         classes: Array.from(element.classList),
         attributes: attributes(element),
-        inlineStyle: element.getAttribute('style') || '',
-        text: (element.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 200),
+        inlineStyle: maskAttribute('style', element.getAttribute('style') || '', false),
+        text: visibleText(element),
         ...markup(element),
         styles: styles(element),
       };

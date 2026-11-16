@@ -33,14 +33,20 @@
   // is the newest LIMIT of a longer one rather than all there was.
   const dropped = { console: 0, warnings: 0, errors: 0, network: 0 };
 
-  const startedAt = Date.now();
+  // The clocks as they are at document_start. A page can replace Date or
+  // performance.now later (MockDate, sinon's fake timers, Playwright's
+  // page.clock), and the prompt orders entries and splits them between
+  // captures by these times, against the panel's own clock.
+  const now = Date.now;
+  const elapsed = performance.now.bind(performance);
+  const startedAt = now();
   // One count across every ring. A failed request, the warning it causes and
   // the throw after it routinely land in the same millisecond, and the prompt
   // prints them in the order they happened, which t alone cannot tell.
   let pushed = 0;
 
   function push(ring, entry) {
-    entry.t = Date.now() - startedAt; // ms since collector armed
+    entry.t = now() - startedAt; // ms since collector armed
     pushed += 1;
     entry.seq = pushed;
     const list = buffers[ring];
@@ -67,14 +73,15 @@
     'authorization', 'bearer', 'jwt', 'cookie', 'session', 'credential', 'apikey', 'accesskey',
     'privatekey', 'signingkey', 'csrf', 'xsrf', 'otp', 'totp', 'pin', 'pincode', 'cvv', 'cvc',
     'ssn', 'iban', 'cardnumber', 'creditcard', 'ccnumber', 'account', 'address', 'email', 'phone',
-    'dob', 'birth', 'signature',
+    'dob', 'birth', 'signature', 'jsessionid', 'sessid', 'securitycode', 'verificationcode',
   ];
 
   function isSecretName(name) {
     const words = String(name)
       .split(/[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])/)
       .filter(Boolean)
-      .map((word) => word.toLowerCase());
+      // otp1, cvv2, address2: a field numbered in a row is still that field.
+      .map((word) => word.toLowerCase().replace(/(?<=[a-z])\d+$/, ''));
     return words.some((word, index) =>
       SECRET_WORDS.some(
         (secret) =>
@@ -97,6 +104,33 @@
    * references and DOM nodes. Anything thrown here would surface as a broken
    * console in the user's page, so every branch is defensive.
    */
+  // A logged object repeats its keys (two hundred rows of one shape), and
+  // this runs in the page's own time, so each name is judged once. The cache
+  // is bounded because a page can log any number of names: once full it
+  // keeps what it has and judges new names afresh, rather than emptying and
+  // judging every one of them again. A longer key (a url or a data: url used
+  // as a cache key) is judged by its two ends, where a field name sits, so
+  // that its cost has a bound whatever its length. It is kept only in
+  // longKeys, which lasts for one serialize call, so that the page's long
+  // strings are not held after it.
+  const secretKeys = new Map();
+
+  function isSecretKey(key, longKeys) {
+    // An array's index, the most common key of all, is never a field name,
+    // and is kept out of the cache, which one long array would fill.
+    if (/^\d+$/.test(key)) return false;
+    const known = secretKeys.get(key) ?? longKeys.get(key);
+    if (known !== undefined) return known;
+    if (key.length <= 400) {
+      const secret = isSecretName(key);
+      if (secretKeys.size < 2000) secretKeys.set(key, secret);
+      return secret;
+    }
+    const secret = isSecretName(key.slice(0, 200)) || isSecretName(key.slice(-200));
+    longKeys.set(key, secret);
+    return secret;
+  }
+
   function serialize(value) {
     try {
       if (value instanceof Error) {
@@ -123,6 +157,7 @@
       // On a page logging a large interlinked object graph that would hang the
       // page itself, since this runs in the page's own world.
       const ancestors = [];
+      const longKeys = new Map();
       let budget = 4000;
       return truncate(
         JSON.stringify(value, function (key, current) {
@@ -130,7 +165,7 @@
           budget -= 1;
           // A logged request or user object carries its Authorization header
           // or password under a name that says so (see isSecretName).
-          if (key && isSecretName(key) && withheld(current)) return REDACTED;
+          if (key && isSecretKey(key, longKeys) && withheld(current)) return REDACTED;
           if (typeof current === 'object' && current !== null) {
             while (ancestors.length && ancestors[ancestors.length - 1] !== this) {
               ancestors.pop();
@@ -366,7 +401,7 @@
       } catch {
         /* ignore */
       }
-      const started = performance.now();
+      const started = elapsed();
       // Here, where the caller is still on the stack. By the time the promise
       // settles it is not, and the frames below this one are the microtask
       // queue rather than anybody's code.
@@ -384,7 +419,7 @@
                 url: truncate(url),
                 status: response.status,
                 statusText: response.statusText,
-                ms: Math.round(performance.now() - started),
+                ms: Math.round(elapsed() - started),
                 via: 'fetch',
               };
               const caller = callerFrames(stack);
@@ -406,7 +441,7 @@
               statusText: outcome
                 ? ''
                 : `Network failure: ${error && error.message ? error.message : error}`,
-              ms: Math.round(performance.now() - started),
+              ms: Math.round(elapsed() - started),
               via: 'fetch',
             };
             if (outcome) entry.outcome = outcome;
@@ -528,7 +563,7 @@
         url: truncate(record.url || xhr.responseURL || ''),
         status,
         statusText: status === 0 ? (outcome ? '' : 'Network failure') : statusText,
-        ms: Math.round(performance.now() - (record.started || performance.now())),
+        ms: Math.round(elapsed() - (record.started || elapsed())),
         via: 'xhr',
       };
       if (outcome) entry.outcome = outcome;
@@ -619,7 +654,7 @@
       opened = this.readyState === 1;
       if (record) {
         before = { started: record.started, sent: record.sent };
-        record.started = performance.now();
+        record.started = elapsed();
         record.sent = true;
       }
 
@@ -737,10 +772,26 @@
     return value != null && typeof value !== 'boolean' && typeof value !== 'function';
   }
 
+  // The value of a password field under an innocent name: a design system's
+  // <PasswordField type="password" value={pw}>, or a Vue v-model.
+  const VALUE_PROPS = ['value', 'defaultValue', 'modelValue'];
+
+  /** Whether the props describe a field that holds a password, code or card. */
+  function secretField(props) {
+    try {
+      const type = String(props.type || '').toLowerCase();
+      const fill = String(props.autoComplete || props.autocomplete || '');
+      return type === 'password' || /password|one-time-code|cc-(?:number|csc|exp)/i.test(fill);
+    } catch {
+      return false;
+    }
+  }
+
   function summariseProps(props) {
     const out = [];
     try {
       if (!props || typeof props !== 'object') return out;
+      const field = secretField(props);
       for (const key of Object.keys(props)) {
         if (out.length >= PROP_LIMIT) break;
         // children is the subtree the user can already see, not a setting.
@@ -757,10 +808,13 @@
         // application state rather than what is on the screen, and the value
         // goes into the prompt and into chrome.storage.local with it. The key
         // is still reported, because knowing the prop exists is most of its
-        // debugging value and the value rarely is.
-        out.push(
-          key + '=' + (isSecretName(key) && withheld(value) ? REDACTED : summariseValue(value))
-        );
+        // debugging value and the value rarely is. An object or array prints
+        // as {…} or Array(n), which shows nothing, so it is never withheld.
+        const secret =
+          withheld(value) &&
+          typeof value !== 'object' &&
+          (isSecretName(key) || (field && VALUE_PROPS.includes(key)));
+        out.push(key + '=' + (secret ? REDACTED : summariseValue(value)));
       }
     } catch {
       /* ignore */

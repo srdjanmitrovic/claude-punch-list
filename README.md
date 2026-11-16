@@ -223,12 +223,16 @@ Anything logged after the last capture gets a section of its own at the end. Nob
 open DevTools.
 
 **The log reads as a timeline.** Every line starts with the time it was logged, to the
-millisecond, and console lines, uncaught errors and failed requests are merged into one order
-(the collector numbers what it records, so three entries from the same millisecond still come
-out in the order they happened). A run of identical entries, such as a poll failing every two
-seconds, prints once with a count and the time of the last. The collector keeps the newest 30
-of each kind, warnings in a ring of their own so that a flood of them cannot push out the one
-error that mattered, and the prompt says how many it had to drop.
+millisecond (with the date in front when it was logged on another day). Within each item of a
+list, console lines, uncaught errors and failed requests are merged into one order; a single
+report keeps its console and its failed requests in two sections, each in time order. The
+collector numbers what it records, so three entries from the same millisecond still come out in
+the order they happened, and it keeps the clock it had when the page started, so a page that
+mocks `Date` cannot shift the times. A run of identical entries, such as a poll failing every
+two seconds, prints once with a count and the time of the last. The collector keeps the newest
+30 of each kind, warnings in a ring of their own so that a flood of them cannot push out the one
+error that mattered. The prompt says how many it had to drop, and in a list each item whose
+stretch of the log may have lost entries says so.
 
 **A single ticked item** reads as a single report rather than a list, in the same shape this
 extension has produced since its first version: a heading, a screenshot section with its own
@@ -238,9 +242,13 @@ only appears once more than one item is going.
 **Items from different pages** are handled too. Capture on the cart, click through to the
 checkout, capture again: the opening line says "across 2 pages", each item names its own
 page, and the page section names the page the console was read on (the tab you are looking at
-when you copy). The log only covers that page since it last loaded, so an item captured on
-another page, or before a reload, says that its entries were not read rather than borrowing
-someone else's.
+when you copy). The log only covers that page since it last loaded. In a list with at least one
+item from that load, an item captured on another page, or on another load of that page (an
+earlier one, or another tab), says that its entries were not read rather than borrowing someone
+else's.
+When no item comes from that load, or for a single item, the log prints whole, under a caution
+that names the mismatch when the page section is on. With it off there is no such caution yet,
+so a log read on another page can read as the items' own.
 
 That computed styles line is thirteen properties out of the roughly 340 `getComputedStyle`
 returns. Properties still sitting at their initial value are dropped automatically, so nothing
@@ -422,7 +430,7 @@ page. For local files, turn on "Allow access to file URLs" on the extension's ca
 | Toggle | What it adds |
 | :--- | :--- |
 | **console** | `console.error` and `console.warn` calls, uncaught exceptions with stack frames, unhandled promise rejections, and failed resource loads |
-| **network** | Requests that returned 4xx or 5xx or failed outright, with method, URL, status, timing, and the function that sent them with its file and line. Requests the page ended itself, by aborting them or through a timeout it set, come last and are labelled as such |
+| **network** | Requests that returned 4xx or 5xx or failed outright, with method, URL, status, timing, and the function that sent them with its file and line. Requests the page ended itself, by aborting them or through a timeout it set, are labelled as such, and in a single report they come after the real failures |
 | **element** | For each item picked with the element tool: the component behind it on a React or Vue page, the handlers bound to it and the first line of their source, a line of search targets, any file its class names imply, the node's markup, a CSS selector that finds it again, and a curated set of computed styles |
 | **page** | URL, title, viewport size and device pixel ratio, plus each item's own URL when the sheet spans more than one page. URLs print as paths (`/checkout?step=2`) while the sheet stays on one origin, and in full once it spans two |
 
@@ -448,40 +456,60 @@ in storage for up to a week. So values that look secret are replaced with `<reda
 markup and logged objects where they are read, before anything is stored, and URLs when the
 prompt is built. "Look secret" is decided by name: a
 name made of words such as `password`, `token`, `secret`, `auth`, `session`, `cookie`, `apiKey`,
-`csrf`, `otp`, `pin`, `cvc`, `cardNumber`, `email` or `phone` (about forty in all, matched as
-whole words, so `className` and `passHref` are left alone). What is screened:
+`csrf`, `otp`, `pin`, `cvc`, `cardNumber`, `email` or `phone` (about forty in all). They are
+matched as whole words, so `className` and `passHref` are left alone. A word of five letters or
+more also matches at either end of a run together name (`authtoken`, `phonenumber`, and also
+`microphone`), and a number at the end of a word is ignored (`otp1`, `cvv2`, and also `auth0`).
+What is screened:
 
 * **Component props.** Only the nearest component's props are read, `children` is skipped, at
   most twelve keys are kept, and every string is cut at sixty characters. A prop with a secret
-  looking name keeps its name and loses its value, unless the value is a boolean, null or a
-  function (printed by name), none of which can hold one.
+  looking name keeps its name and loses its value, unless the value is a boolean, null, a
+  function (printed by name) or an object (printed as `{…}`), none of which shows one. On a
+  component that describes a password, one time code or card field (`type="password"`, or an
+  `autoComplete` that says so), `value`, `defaultValue` and `modelValue` are hidden too.
 * **Handler bodies.** Dropped entirely, rather than masked in part, if they mention one of those
   words or contain a quoted run of twenty or more token characters, which is the shape a key or
   a bearer token has whatever the code around it is called.
-* **Picked markup and attributes.** The value of a password or hidden input, of a field the
-  browser would fill with a password, a one time code or a card number, and of any field whose
-  name or id looks secret. Any attribute whose own name looks secret (`data-auth-token`). In
-  `href`, `src`, `srcset`, `action`, `formaction` and `poster`, credentials and secret query
-  values.
+* **Picked markup and attributes.** The value of a password, hidden, email or phone input, of a
+  field the browser would fill with a password, a one time code or a card number, and of any
+  field or button whose name or id looks secret. The text of a textarea whose name or id looks
+  secret. Any attribute whose own name looks secret (`data-auth-token`), except HTML's one
+  character `accesskey`. Credentials and secret query values in `href`, `src`, `action`,
+  `formaction`, `poster`, `ping`, `xlink:href`, `data-src` and `data-href`, in every candidate of
+  `srcset` and `data-srcset`, and in an inline style's `url()`.
 * **Logged objects.** In an object passed to `console.error` or `console.warn`, the value under
   any secret looking key, at any depth (`headers.Authorization`, `user.password`).
-* **Every URL the prompt prints.** Page addresses, request URLs and any URL inside a console or
-  error message lose embedded credentials (`user:pass@`) and the values of secret looking query
-  and fragment parameters, plus `code`, `key` and `sig`, which carry an OAuth code, an API key
-  or a signature.
+* **Every URL the prompt prints.** Page addresses, request URLs, stack frames, and any URL inside
+  a console or error message (absolute, or a path with a query such as `GET /api/me?token=…`)
+  lose embedded credentials (`user:pass@`) and the values of secret looking query and fragment
+  parameters, plus `code`, `key`, `sig` and `ticket`, which carry an OAuth code, an API key, a
+  signature or a single sign on ticket. A URL inside a parameter (`?next=/verify?token=…`) is
+  screened the same way, up to four levels deep, past which the parameter is hidden whole. One
+  that is percent encoded is hidden whole if it holds a secret.
 
 What is not screened:
 
-* Free text. A message logged as `'token is ' + token`, an exception message, a stack frame and
-  the picked element's visible text print as they are.
-* A secret under an innocent name: a prop called `data`, an object key called `value`, a
-  `textarea`'s contents.
+* Free text. A message logged as `'token is ' + token`, an exception message, and the picked
+  element's text (its `textContent`, which takes in hidden text too) print as they are.
+* A secret under an innocent name: a prop called `data`, an object key called `value`, the text
+  of a textarea with an ordinary name.
+* URLs in any other attribute, such as `content` or a custom `data-` name, and markup whose
+  attribute names hold a quote or start with `=`, which the masking cannot parse.
+* A URL in text that the scan does not take for one: a path that does not start with `/` after a
+  space or a bracket (`GET api/me?token=…`, `./api`, `v1.2/api`, `Failed./api`), a bare query or
+  fragment (`#access_token=…`), credentials in a second URL run together with the first
+  (`https://proxy.test/https://user:pass@…`), and a URL written the way JSON escapes it
+  (`https:\/\/…`, `\u0026token=`). Path parameters (`;jsessionid=…`) are not masked either.
+* The middle of a logged key longer than 400 characters (a URL or a `data:` URL used as a key),
+  which is judged by its first and last 200 characters.
+* The page title, which prints and is stored as it is (`Inbox (3) | you@example.com`).
 * The screenshot, which shows whatever was on the screen.
 * The page address stored with each item, which is kept as it was and masked only when the
   prompt is built.
 
 It is a name match, not a guarantee. On a page where that matters, untick **element** before
-capturing, and **console** and **network** before copying.
+capturing, and **console**, **network** and **page** before copying.
 
 The one caveat worth stating plainly is that the collector has to run in the page's own
 JavaScript world to wrap the real `console` and `fetch`, and anything in that world is
@@ -515,7 +543,9 @@ and nothing else:
 ```
 
 Capture still works everywhere. On a site outside the list, a prompt says its console and
-network were not read, rather than leaving them out without a word. The install warning does
+network were not read, rather than leaving them out without a word. The panel's own notice on
+such a site says to reload the page to start collecting, which cannot help there; it is meant
+for tabs opened before the extension was installed. The install warning does
 not get shorter, because `host_permissions` still names every site. This recipe follows Chrome's
 documentation and was not tried with an edited manifest.
 

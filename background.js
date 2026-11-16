@@ -130,23 +130,27 @@ async function arm(mode, tabId, armId) {
   const disarms = disarmsByTab.get(tabId) || 0;
   latestArmByTab.set(tabId, Symbol('arm'));
 
-  const tab = await chrome.tabs.get(tabId);
-  const restriction = await restrictionFor(tab);
-  if (restriction) throw new Error(restriction);
+  // Tracked from here, not from the injection. A verify that arrives while
+  // this still looks the tab up would otherwise probe a page the overlay has
+  // not reached yet, answer that nothing is armed, and turn the panel's button
+  // dark over the overlay that lands a moment later.
+  const landing = (async () => {
+    const tab = await chrome.tabs.get(tabId);
+    const restriction = await restrictionFor(tab);
+    if (restriction) throw new Error(restriction);
 
-  // Cancelled before anything reached the page, so there is nothing to put
-  // there and nothing to take down.
-  if (disarmedSince(tabId, disarms)) return { ok: true };
+    // Cancelled before anything reached the page, so there is nothing to put
+    // there and nothing to take down.
+    if (disarmedSince(tabId, disarms)) return false;
 
-  // executeScript re-runs the file on every call. Both capture scripts are
-  // written to be idempotent: they cache their controller on window and only
-  // call start() again.
-  const landing = chrome.scripting.executeScript({
-    target: { tabId },
-    files: [file],
-  });
+    // executeScript re-runs the file on every call. Both capture scripts are
+    // written to be idempotent: they cache their controller on window and
+    // only call start() again.
+    await chrome.scripting.executeScript({ target: { tabId }, files: [file] });
+    return true;
+  })();
   trackLanding(tabId, landing);
-  await landing;
+  if (!(await landing)) return { ok: true };
 
   // Cancelled while landing. The disarm stops it now that it is there.
   if (disarmedSince(tabId, disarms)) return { ok: true };

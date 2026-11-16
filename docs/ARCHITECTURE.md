@@ -91,9 +91,10 @@ behaviour, the keyboard command, script injection, and the armed tab map.
 
 One trap worth knowing. `activeTab` cannot stand in for `host_permissions: <all_urls>`, which is
 why that is required rather than optional. Chrome grants `activeTab` for one tab when the user
-invokes the extension (the toolbar icon, the shortcut) and takes it back when that tab
-navigates, while the panel stays open across tabs and navigations and captures whichever tab is
-in view. Whether a click that opens a side panel grants it at all is not documented.
+invokes the extension (the shortcut, or a click on the toolbar icon) and takes it back when that
+tab navigates, while the panel stays open across tabs and navigations and captures whichever tab
+is in view. Here the toolbar icon opens the side panel (`openPanelOnActionClick`), and whether
+that click still grants `activeTab` is not documented.
 `captureVisibleTab` needs one or the other, so with neither it fails on every page.
 
 ### Screenshots are saved when they are taken, not when the report is copied
@@ -213,7 +214,10 @@ that names one. The shortcut's arm has no id, so it is always news.
 change as status `loading`, exactly as it does a real navigation, and only the real one takes
 the overlay with it. So on `loading` and on `complete` for an armed tab, the worker asks the page
 which controller is active (each exposes `isActive()`), after any arm still landing, and panel
-and worker go dark only if neither is. The overlay and the picker also stop themselves on
+and worker go dark only if neither is. An arm counts as landing from the moment it is asked for,
+not from its injection: a check that arrived while the worker still looked the tab up would
+otherwise ask a page the overlay had not reached, and turn the button dark over the overlay that
+landed a moment later. The overlay and the picker also stop themselves on
 `pagehide`, so a page restored from the back/forward cache cannot come back with a live overlay
 nothing outside it knows of.
 
@@ -279,23 +283,36 @@ Each ring counts what it drops, and the snapshot carries the counts, so the prom
 log is the tail of a longer one. Every entry gets `t`, milliseconds since the collector started
 (`armedAt` in the snapshot), and `seq`, one count across all four rings: a failed request, the
 warning it causes and the throw after it routinely share a millisecond, and only the count keeps
-them in the order they happened.
+them in the order they happened. Both clocks the collector reads, `Date.now` and
+`performance.now`, are the ones the page had at `document_start`. MockDate, sinon's fake timers
+and Playwright's `page.clock` replace them later, and `t` is compared with the panel's own clock.
 
 The template merges the rings by `t` and then `seq` and prints a clock time in front of each
 entry, built by hand rather than with `toLocaleTimeString` so every line of a prompt has the same
-width. A run of entries that would print the same (the timing of a request aside) folds into the
-first, with a count and the time of the last.
+width, with the date in front when the entry falls on another day than the report. A run of
+entries that would print the same (the timing of a request aside) folds into the first, with a
+count and the time of the last. A single item keeps the two sections it always had, each in time
+order, with cancelled requests after the real failures.
 
-A list splits the log by capture. When an item is added, the panel's next context read tells it
-which load of the page the capture belongs to, and the item keeps that `armedAt`; a read whose
-collector started after the capture is ignored, since that load came later. When the report is
-copied, an item whose `armedAt` matches the log's gets the entries logged since the capture
-before it, entries after the last capture get a section of their own, and an item from another
-page or an earlier load says its entries were not read. An item with no `armedAt` (stored by an
-older build, or captured on a page too busy to answer) is judged by its page and its capture
-time instead. A single item keeps the two sections it always had, now in time order, and keeps
-its cautions, because in that layout the caution is the only line that says where the
-screenshot was taken.
+A list splits the log by capture. Each item's `capturedAt` is read just before
+`captureVisibleTab` takes the pixels, not when the item is added after decoding and cropping, so
+an entry logged in between goes to the next capture. When an item is added, the panel's next
+context read tells it which load of the page the capture belongs to, and the item keeps that
+`armedAt`; a read whose collector started after the capture is ignored, since that load came
+later. When the report is copied, an item whose `armedAt` matches the log's gets the entries
+logged since the capture before it, and entries after the last capture get a section of their
+own. An item from another page, or from another load of the same address, says its entries were
+not read. Another load is not called a reload, because a second tab open on the same address
+looks the same. An item with no `armedAt` (stored by an older build, or captured on a page too
+busy to answer) is judged by its page and its capture time, and only when both are known: the
+panel passes the url it read the log on as `readUrl`, which is compared and never printed, so
+the page toggle off does not leave the template guessing. When a ring dropped entries, each item
+whose stretch of the log starts before the oldest entry that ring kept says its log may be
+incomplete, since a quiet stretch would otherwise read as a clean one.
+
+When no item comes from the load that was read, or nothing was read, a list falls back to the
+global sections and cautions, as does a single item: in that layout the caution is the only line
+that says where the screenshot was taken.
 
 ## Capture and cropping
 

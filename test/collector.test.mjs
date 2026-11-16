@@ -244,6 +244,16 @@ test('collector: entries carry one count across every ring, so a single millisec
   assert.deepEqual(plain(order), ['first', 'second', 'third']);
 });
 
+test('collector: times come from the clock the page had at document_start, not one it mocked later', () => {
+  const page = arm();
+  // MockDate and fake timers replace the global after the page's own scripts
+  // start, which is after the collector has armed.
+  page.realm('Date.now = () => 0;');
+  page.page.console.error('after the page froze its clock');
+  const [entry] = page.snapshot().console;
+  assert.ok(entry.t >= 0 && entry.t < 5000, `t was ${entry.t}`);
+});
+
 test('collector: clear empties every ring and forgets what was dropped', async () => {
   const page = arm();
   for (let i = 1; i <= 35; i += 1) page.page.console.warn(`w ${i}`);
@@ -268,6 +278,33 @@ test('collector: a logged object keeps its shape and loses the values of secret 
     'login failed {"user":{"name":"ada","password":"<redacted>","hasPassword":true},' +
       '"headers":{"Authorization":"<redacted>","Accept":"json"},"className":"row","passHref":true,"apiKey":null}'
   );
+});
+
+test('collector: a long key is judged like a short one, and a full cache still judges new keys', () => {
+  const page = arm();
+  // A cache keyed by url, past the length the per key cache keeps.
+  const long = `https://api.test/v1/session/refresh_token?${'x'.repeat(90)}`;
+  page.page.console.error({ [long]: 'LONGKEYVAL' });
+  assert.ok(!page.snapshot().console[0].text.includes('LONGKEYVAL'));
+  // More distinct keys than the cache holds, then a secret one on its own,
+  // where the 600 character cut cannot hide it either way.
+  page.page.console.error(Object.fromEntries(Array.from({ length: 2100 }, (_, i) => [`field${i}x`, i])));
+  page.page.console.error({ sessionToken: 'LATETOKEN' });
+  assert.equal(page.snapshot().console[2].text, '{"sessionToken":"<redacted>"}');
+  // A very long key is judged by its ends, and costs the same whatever its length.
+  const huge = `refresh_token_${'aB'.repeat(50000)}`;
+  const started = performance.now();
+  page.page.console.error(Array.from({ length: 200 }, () => ({ [huge]: 'HUGEVAL' })));
+  assert.ok(performance.now() - started < 500, `took ${Math.round(performance.now() - started)} ms`);
+  assert.ok(!page.snapshot().console[3].text.includes('HUGEVAL'));
+  // A long array's indexes do not fill the cache, so a key logged after it
+  // is still judged once rather than once a row.
+  const fresh = arm();
+  fresh.page.console.error(Array.from({ length: 2100 }, (_, i) => i));
+  const key = 'aB'.repeat(200);
+  const begun = performance.now();
+  fresh.page.console.error(Array.from({ length: 2000 }, () => ({ [key]: 1 })));
+  assert.ok(performance.now() - begun < 100, `took ${Math.round(performance.now() - begun)} ms`);
 });
 
 test('collector: each ring keeps the last 30 entries', () => {

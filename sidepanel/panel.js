@@ -18,6 +18,10 @@ import { buildPrompt } from '../shared/prompt-template.js';
 
 const SAVE_FOLDER = 'claude-punch-list';
 const SLOW_DOWNLOAD_HINT_MS = 2500;
+const SLOW_SAVE_HINT =
+  'Waiting on Chrome. If a "Save as" dialog opened, confirm it, or turn off ' +
+  '"Ask where to save each file" in chrome://settings/downloads.';
+
 const ARM_TIMEOUT_MS = 3000; // cap on waiting for a page to take a capture overlay down
 const CONTEXT_TIMEOUT_MS = 2000; // cap on reading the log; the bridge gives the page 1000 of it
 const REPORT_TTL_MS = 7 * 24 * 60 * 60 * 1000; // how long an uncopied report survives
@@ -156,6 +160,10 @@ const state = {
   tab: null,
   restriction: null,
   restrictionShown: false, // whether the banner is the restriction's, so resolveTab clears only its own
+  bannerScope: null, // what the banner is about, see showBanner
+  slowSaves: 0, // saves still waiting that have shown the slow save hint
+  settledTabId: null, // the tab, and its url, of the last resolveTab to finish
+  settledUrl: null,
   intent: 'bug', // what the NEXT item starts as; sticky, like the toggles
   armedMode: null, // 'region' | 'element' | null
   armedTabId: null, // which tab that arm was issued against
@@ -189,11 +197,25 @@ function withTimeout(promise, ms) {
   ]).finally(() => clearTimeout(timer));
 }
 
-function showBanner(message, kind = 'warn') {
+/**
+ * @param {string|null} message  null hides the banner
+ * @param {'warn'|'error'} kind
+ * @param {'page'|'capture'|'report'|'missing'} scope  what the message is
+ *   about, which decides when resolveTab takes it down: the page in view
+ *   (goes when that page changes), one capture (goes when the tab changes),
+ *   or the report (stays until its cause is dealt with). 'missing' is the
+ *   report's missing file, which a discard recounts.
+ */
+function showBanner(message, kind = 'warn', scope = 'capture') {
+  // resolveTab sets it again once it has shown the restriction itself. Any
+  // other banner has replaced the restriction's, and is not its to clear.
+  state.restrictionShown = false;
   if (!message) {
     el.banner.hidden = true;
+    state.bannerScope = null;
     return;
   }
+  state.bannerScope = scope;
   el.banner.textContent = message;
   el.banner.className = kind === 'error' ? 'notice error' : 'notice';
   el.banner.hidden = false;
@@ -336,7 +358,6 @@ async function resolveTab() {
   const call = ++state.resolving;
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (call !== state.resolving) return;
-  const switched = (state.tab?.id ?? null) !== (tab?.id ?? null);
   state.tab = tab || null;
 
   // Arming is per-tab. Switching tabs would otherwise leave the button lit for
@@ -369,6 +390,16 @@ async function resolveTab() {
   if (call !== state.resolving) return;
   state.restriction = response?.restriction || null;
 
+  // Measured against the last call that got this far, not against state.tab,
+  // which calls overtaken on the way here have written too: opening a tab
+  // fires onActivated and onUpdated together, and only the first of those
+  // calls would otherwise have seen the switch. The panel's first call is no
+  // switch.
+  const switched = state.settledTabId != null && state.settledTabId !== tab.id;
+  const moved = switched || (state.settledUrl != null && state.settledUrl !== (tab.url || ''));
+  state.settledTabId = tab.id;
+  state.settledUrl = tab.url || '';
+
   // The worker tracks which tab has an overlay waiting. Adopting it here covers
   // the case a one-shot broadcast cannot: Alt+Shift+C arms the page and opens
   // the panel together, so the cdr:armed message can be sent before this
@@ -383,12 +414,24 @@ async function resolveTab() {
   }
 
   el.statusDot.className = state.restriction ? 'dot blocked' : 'dot ready';
-  // Only a banner this sets, unless the tab changed. A busy page sends its
-  // 'complete' or a new URL just after it frees, which is when a notice about
-  // the capture taken while it was busy matters most.
-  if (state.restriction) showBanner(state.restriction, 'error');
-  else if (switched || state.restrictionShown) showBanner(null);
+  // Only a banner this sets, unless what it is about has gone. A busy page
+  // sends its 'complete' or a new URL just after it frees, which is when a
+  // notice about the capture taken while it was busy matters most, so that
+  // stays until the tab changes. An error about the page goes with the page.
+  // One about the report (a missing file, a failed copy) is left alone. A
+  // restriction does replace any banner, and once it goes, a missing file,
+  // which still holds the copy back, is said again.
+  const scope = state.bannerScope;
+  if (state.restriction) showBanner(state.restriction, 'error', 'page');
+  else if (
+    state.restrictionShown ||
+    (moved && scope === 'page') ||
+    (switched && scope === 'capture')
+  ) {
+    showBanner(null);
+  }
   state.restrictionShown = Boolean(state.restriction);
+  if (el.banner.hidden) sayMissing();
 
   const disabled = Boolean(state.restriction);
   el.modeRegion.disabled = disabled;
@@ -400,6 +443,14 @@ async function resolveTab() {
 
 // --------------------------------------------------------------- capture --
 
+/**
+ * The visible tab as a PNG data url, and when it was taken. The time is read
+ * just before the call that takes the pixels, not when the item is added
+ * after decoding and cropping: a list sorts each logged entry to the
+ * capture it came before, and one logged in that gap came after the image.
+ *
+ * @returns {Promise<{ dataUrl: string, takenAt: number }>}
+ */
 async function captureViewport() {
   // captureVisibleTab is rate limited to roughly two calls per second across
   // the whole extension. Captures here are user-initiated so collisions are
@@ -407,7 +458,9 @@ async function captureViewport() {
   let lastError;
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
-      return await chrome.tabs.captureVisibleTab(state.tab.windowId, { format: 'png' });
+      const takenAt = Date.now();
+      const dataUrl = await chrome.tabs.captureVisibleTab(state.tab.windowId, { format: 'png' });
+      return { dataUrl, takenAt };
     } catch (error) {
       lastError = error;
       if (!/MAX_CAPTURE|quota|too many/i.test(String(error?.message))) throw error;
@@ -745,7 +798,7 @@ async function addItem(capture) {
     included: true,
     // An element payload only belongs to the capture it was picked with.
     element: capture.mode === 'element' ? capture.element || null : null,
-    capturedAt: Date.now(),
+    capturedAt: Number.isFinite(capture.takenAt) ? capture.takenAt : Date.now(),
     // The full capture stands in until the thumbnail exists, so the frame is
     // never briefly empty. It is replaced before anything is persisted.
     thumb: capture.dataUrl,
@@ -805,8 +858,10 @@ async function addItem(capture) {
     renderFrame();
     const row = el.list.children[state.items.indexOf(item)];
     if (row) fillRowText(row, item, state.items.indexOf(item));
-    // Clears the slow save hint, but not a warning about this capture.
-    showBanner(capture.notice || null);
+    // A warning about this capture is shown again if the slow save hint
+    // replaced it and went with the last slow save, but only over the tab it
+    // is about: a switch to another tab took it down on purpose.
+    if (capture.notice && el.banner.hidden && state.tab?.id === item.tabId) showBanner(capture.notice);
   } catch (error) {
     // Nothing reached the disk, so there is nothing to keep: the description
     // field has only been open for as long as the save took, and an item with
@@ -814,7 +869,8 @@ async function addItem(capture) {
     // already discarded while the dialog was open needs no explanation.
     if (!state.items.includes(item)) return;
     removeItem(item.id, { deleteFile: false });
-    showBanner(`${error?.message || error} Capture it again.`, 'error');
+    // About the report, not the page: it is all that is left of the item.
+    showBanner(`${error?.message || error} Capture it again.`, 'error', 'report');
   } finally {
     updateSubmitState();
   }
@@ -826,8 +882,12 @@ function removeItem(id, { deleteFile: shouldDelete }) {
 
   const [item] = state.items.splice(index, 1);
   if (shouldDelete && item.downloadId != null) deleteFile(item.downloadId);
-  // The banner about its missing file has done its job.
-  if (item.missing && !state.items.some((other) => other.missing)) showBanner(null);
+  // The banner about a missing file names it by its number, which a discard
+  // can change, and goes once no file is missing. Any other banner stays.
+  if (state.bannerScope === 'missing') {
+    showBanner(null);
+    sayMissing();
+  }
 
   const next = state.items[index] || state.items[index - 1] || null;
   selectItem(next?.id ?? null);
@@ -851,7 +911,7 @@ function clearItems({ deleteFiles }) {
       if (item.downloadId != null) deleteFile(item.downloadId);
     }
   }
-  if (state.items.some((item) => item.missing)) showBanner(null);
+  if (state.bannerScope === 'missing') showBanner(null);
   state.items = [];
   selectItem(null);
   persist();
@@ -1004,7 +1064,7 @@ async function arm(mode) {
     // replaced, or that was cancelled, must not turn off what came after it.
     if (!response?.ok && state.armedId === armId) {
       setArmed(null);
-      showBanner(response?.error || 'Could not start capture on this tab.', 'error');
+      showBanner(response?.error || 'Could not start capture on this tab.', 'error', 'page');
     }
   } catch (error) {
     // sendMessage rejects outright if the worker is torn down mid-request, for
@@ -1013,7 +1073,7 @@ async function arm(mode) {
     // cancel rather than arming.
     if (state.armedId === armId) {
       setArmed(null);
-      showBanner(error?.message || 'Could not start capture on this tab.', 'error');
+      showBanner(error?.message || 'Could not start capture on this tab.', 'error', 'page');
     }
   }
 }
@@ -1035,8 +1095,9 @@ const OVERLAY_TOO_BUSY =
  *   screenshot anyway, and what the banner says either way (null for nothing)
  */
 function screenAfterRearm(mode) {
-  // TODO(you): decide. The placeholder below keeps the old behaviour plus a
-  // warning: photograph the page anyway and say the overlay may show.
+  // Photographed anyway, and said: the page as it was is often the point, and
+  // the notice covers the overlay that may be in it. Skipping the shot, or
+  // deciding by mode, are the other choices (docs/REVIEW.md, F2).
   return {
     capture: true,
     notice: 'A capture mode was armed while this screenshot waited, so its overlay may show in it.',
@@ -1081,7 +1142,7 @@ async function captureVisible() {
       }
       notice = decision.notice || notice;
     }
-    const dataUrl = await captureViewport();
+    const { dataUrl, takenAt } = await captureViewport();
     const image = await loadImage(dataUrl);
     addItem({
       dataUrl,
@@ -1089,6 +1150,7 @@ async function captureVisible() {
       height: image.naturalHeight,
       mode: 'visible',
       notice,
+      takenAt,
     });
   } catch (error) {
     showBanner(error?.message || 'Screenshot failed.', 'error');
@@ -1179,33 +1241,43 @@ async function waitForDownloadPath(downloadId) {
   let hintShown = false;
   let missing = 0;
 
-  for (;;) {
-    const [item] = await chrome.downloads.search({ id: downloadId });
+  try {
+    for (;;) {
+      const [item] = await chrome.downloads.search({ id: downloadId });
 
-    if (item?.state === 'complete') return item.filename;
-    if (item?.state === 'interrupted') {
-      throw new Error(`Download failed: ${item.error || 'interrupted'}.`);
+      if (item?.state === 'complete') return item.filename;
+      if (item?.state === 'interrupted') {
+        throw new Error(`Download failed: ${item.error || 'interrupted'}.`);
+      }
+
+      if (!item) {
+        // The record should always exist; if it has vanished (erased from
+        // history mid-flight) nothing will ever resolve, so stop.
+        missing += 1;
+        if (missing > 20) throw new Error('Chrome lost track of the download.');
+      } else {
+        missing = 0;
+      }
+
+      if (!hintShown && Date.now() - started > SLOW_DOWNLOAD_HINT_MS) {
+        hintShown = true;
+        state.slowSaves += 1;
+        showBanner(SLOW_SAVE_HINT);
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 150));
     }
-
-    if (!item) {
-      // The record should always exist; if it has vanished (erased from
-      // history mid-flight) nothing will ever resolve, so stop.
-      missing += 1;
-      if (missing > 20) throw new Error('Chrome lost track of the download.');
-    } else {
-      missing = 0;
-    }
-
-    if (!hintShown && Date.now() - started > SLOW_DOWNLOAD_HINT_MS) {
-      hintShown = true;
-      showBanner(
-        'Waiting on Chrome. If a "Save as" dialog opened, confirm it, or turn off ' +
-          '"Ask where to save each file" in chrome://settings/downloads.'
-      );
-    }
-
-    await new Promise((resolve) => setTimeout(resolve, 150));
+  } finally {
+    // The hint is shared by every save slow enough to show it, so it goes
+    // when the last of them ends, however it ends: saved, failed, cancelled
+    // in the dialog, or for an item already discarded.
+    if (hintShown && --state.slowSaves === 0) clearSlowSaveHint();
   }
+}
+
+/** Take the slow save hint down, and nothing else that may be showing. */
+function clearSlowSaveHint() {
+  if (!el.banner.hidden && el.banner.textContent === SLOW_SAVE_HINT) showBanner(null);
 }
 
 /** @returns {Promise<{ path: string, downloadId: number }>} */
@@ -1311,6 +1383,10 @@ function assembleReport(items, read) {
     builtAt: Date.now(),
     // Tells the template an item was captured on an earlier load of this page.
     armedAt: wantedLog && Number.isFinite(collected.armedAt) ? collected.armedAt : undefined,
+    // The page the log was read on, compared with each item's page and never
+    // printed, so the page toggle off still keeps an entry from another page
+    // out of an item's log.
+    readUrl: wantedLog ? context?.page?.url || undefined : undefined,
     contextError: wantedLog && error ? error : undefined,
   };
 }
@@ -1368,7 +1444,7 @@ async function copyReport() {
     // emptied panel.
     if (method) resetAfterCopy(items);
   } catch (error) {
-    showBanner(error?.message || String(error), 'error');
+    showBanner(error?.message || String(error), 'error', 'report');
   } finally {
     state.busy = false;
     el.submit.classList.remove('busy');
@@ -1409,10 +1485,17 @@ function markMissing(item) {
   renderFrame();
   renderSheet();
   updateSubmitState();
-  const number = state.items.indexOf(item) + 1;
+  sayMissing();
+}
+
+/** The banner that explains a Copy held back by a missing file, if one is. */
+function sayMissing() {
+  const index = state.items.findIndex((item) => item.missing);
+  if (index === -1) return;
   showBanner(
-    `The screenshot for item ${number} is no longer on disk. Discard it, or capture it again.`,
-    'error'
+    `The screenshot for item ${index + 1} is no longer on disk. Discard it, or capture it again.`,
+    'error',
+    'missing'
   );
 }
 
@@ -1610,20 +1693,28 @@ function handleBroadcast(message) {
 
   if (message.type === 'cdr:region-selected') {
     captureViewport()
-      .then((full) => cropCapture(full, message.rect, message.viewport))
+      .then(async ({ dataUrl, takenAt }) => ({
+        ...(await cropCapture(dataUrl, message.rect, message.viewport)),
+        takenAt,
+      }))
       .then((cropped) => addItem({ ...cropped, mode: 'region' }))
       .catch((error) => {
-        setArmed(null);
+        // The arm already ended when this message arrived (above); a mode
+        // lit since is the user's newer action and stays.
         showBanner(error?.message || 'Region capture failed.', 'error');
       });
   }
 
   if (message.type === 'cdr:element-picked') {
     captureViewport()
-      .then((full) => cropCapture(full, message.rect, message.viewport))
+      .then(async ({ dataUrl, takenAt }) => ({
+        ...(await cropCapture(dataUrl, message.rect, message.viewport)),
+        takenAt,
+      }))
       .then((cropped) => addItem({ ...cropped, mode: 'element', element: message.element }))
       .catch((error) => {
-        setArmed(null);
+        // The arm already ended when this message arrived (above); a mode
+        // lit since is the user's newer action and stays.
         showBanner(error?.message || 'Element capture failed.', 'error');
       });
   }
@@ -1764,7 +1855,7 @@ el.clearBuffers.addEventListener('click', async () => {
     await refreshContext();
     showBanner(null);
   } catch {
-    showBanner('No collector on this page to clear.', 'error');
+    showBanner('No collector on this page to clear.', 'error', 'page');
   }
 });
 

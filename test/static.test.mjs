@@ -128,6 +128,27 @@ test('static: the copies of the secret name blocks are identical', () => {
   );
 });
 
+// test/picker.test.mjs runs the masking block on its own, so it cannot see
+// the picker stop calling it, or a copy of the word list emptied after the
+// block that the sync check above compares.
+test('static: the picker masks what it sends, and nothing rewrites the secret words', () => {
+  const source = read('content/picker.js');
+  const body = (name) => {
+    const from = source.indexOf(`    function ${name}(`);
+    assert.ok(from !== -1, `content/picker.js has lost ${name}()`);
+    return source.slice(from, source.indexOf('\n    }\n', from));
+  };
+  assert.match(body('markup'), /maskMarkup\(raw\)/);
+  assert.match(body('attributes'), /maskAttribute\(/);
+  assert.match(source, /inlineStyle: maskAttribute\('style'/);
+  assert.match(source, /text: visibleText\(element\)/);
+  for (const file of ['content/picker.js', 'content/collector-main.js', 'shared/prompt-template.js']) {
+    const text = read(file);
+    const after = text.slice(text.indexOf('SECRET NAMES END'));
+    assert.doesNotMatch(after, /SECRET_WORDS\s*(?:\.|\[|=)/, `${file} changes SECRET_WORDS after its block`);
+  }
+});
+
 // Chrome runs these again, in the same world, every time a capture mode is
 // armed. A top level const, let or class from the first run is still declared
 // when the second arrives, and the second run throws before doing anything.

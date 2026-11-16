@@ -224,15 +224,36 @@ function stamp(ms) {
  * by hand rather than with toLocaleTimeString, whose shape follows the
  * machine, so that every line of one prompt has the same width.
  */
-function clockOf(t, armedAt) {
+function clockOf(t, clock) {
   if (!Number.isFinite(t)) return '';
-  if (!Number.isFinite(armedAt)) return `+${(t / 1000).toFixed(3)}s`;
-  const date = new Date(armedAt + t);
+  if (!Number.isFinite(clock.armedAt)) return `+${(t / 1000).toFixed(3)}s`;
+  const date = new Date(clock.armedAt + t);
   const pad = (n, width = 2) => String(n).padStart(width, '0');
+  // A tab left open overnight keeps yesterday's entries in its log, and a
+  // bare time would read as minutes before the capture.
+  const day = dayOf(date);
   return (
+    `${day === clock.day ? '' : `${day} `}` +
     `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}` +
     `.${pad(date.getMilliseconds(), 3)}`
   );
+}
+
+/**
+ * The date, year first. The Captured line follows the machine's locale, so
+ * 8/6 beside it would read as August in one and June in another.
+ */
+function dayOf(date) {
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
+/** What clockOf needs from the report: the log's start, and the day the report was made. */
+function clockFor(report) {
+  return {
+    armedAt: report.armedAt,
+    day: dayOf(new Date(Number.isFinite(report.builtAt) ? report.builtAt : Date.now())),
+  };
 }
 
 /**
@@ -274,8 +295,10 @@ function errorEntry(error) {
   // internals and not worth the tokens. The location the collector recorded
   // is only worth printing when the stack has no frame, since the first frame
   // names the same place and adds the function.
-  let frames = error.stack ? stackFrames(error.stack) : [];
-  if (!frames.length && error.where) frames = [`at ${error.where}`];
+  // A frame names the script's url, and a script loaded as maps/api/js?key=
+  // carries its key into every frame.
+  let frames = error.stack ? stackFrames(error.stack).map(safeText) : [];
+  if (!frames.length && error.where) frames = [`at ${safeText(error.where)}`];
   const more = frames.map((text) => ({ indent: 10, text }));
   return { t: error.t, seq: error.seq, head, more, key: [head, ...frames].join('\n') };
 }
@@ -302,7 +325,8 @@ function networkEntry(request) {
     .filter((frame) => typeof frame === 'string')
     .map(flatten)
     .filter(Boolean)
-    .slice(0, 3);
+    .slice(0, 3)
+    .map(safeText);
   // The timing is left out of the key: a poll failing thirty times takes a
   // slightly different time on each, and is still one thing that happened.
   const key = [parts.join(' '), ...frames].join('\n');
@@ -331,7 +355,7 @@ function byTime(a, b) {
  *
  * @param {Entry[]} entries  already in the order to print
  */
-function renderEntries(entries, armedAt) {
+function renderEntries(entries, clock) {
   const lines = [];
   for (let start = 0; start < entries.length; ) {
     const entry = entries[start];
@@ -339,9 +363,9 @@ function renderEntries(entries, armedAt) {
     while (end < entries.length && entries[end].key === entry.key) end += 1;
     const count = end - start;
 
-    const time = clockOf(entry.t, armedAt);
+    const time = clockOf(entry.t, clock);
     const prefix = time ? `${time} ` : '';
-    const last = count > 1 ? clockOf(entries[end - 1].t, armedAt) : '';
+    const last = count > 1 ? clockOf(entries[end - 1].t, clock) : '';
     const repeats = count > 1 ? ` (×${count}${last ? `, last ${last}` : ''})` : '';
     // A message that runs over several lines keeps its later lines under its
     // own text, where they cannot be read as entries of their own.
@@ -358,12 +382,12 @@ function renderEntries(entries, armedAt) {
 }
 
 /** Console lines and uncaught errors, merged into the order they happened. */
-function formatConsole(consoleLines = [], errors = [], armedAt) {
+function formatConsole(consoleLines = [], errors = [], clock) {
   const entries = [...errors.map(errorEntry), ...consoleLines.map(consoleEntry)].sort(byTime);
-  return renderEntries(entries, armedAt);
+  return renderEntries(entries, clock);
 }
 
-function formatNetwork(network = [], armedAt) {
+function formatNetwork(network = [], clock) {
   // A request the page ended itself (an effect cleaning up, a search box
   // replacing its previous query, a timeout it set) is not a failure. It still
   // prints, because a page can cancel the one request it needed, but labelled
@@ -372,8 +396,8 @@ function formatNetwork(network = [], armedAt) {
   const real = network.filter((request) => !cancelledLabel(request)).map(networkEntry);
   const ended = network.filter((request) => cancelledLabel(request)).map(networkEntry);
   return [
-    ...renderEntries(real.sort(byTime), armedAt),
-    ...renderEntries(ended.sort(byTime), armedAt),
+    ...renderEntries(real.sort(byTime), clock),
+    ...renderEntries(ended.sort(byTime), clock),
   ];
 }
 
@@ -761,8 +785,8 @@ function formatSearch(element, identity) {
   // A container's text is its children's runs joined with nothing between
   // them, which greps for nothing. Length cannot tell that apart from a real
   // label, but the markup can: an element with a child element did not write
-  // its own text.
-  const ownText = /<[a-z]/i.test(typeof element.html === 'string' ? element.html.slice(1) : '')
+  // its own text. The marker a masked value leaves is not a child.
+  const ownText = /<(?!redacted>)[a-z]/i.test(typeof element.html === 'string' ? element.html.slice(1) : '')
     ? ''
     : searchableText(element.text);
   add(ownText, true);
@@ -856,16 +880,19 @@ function voiceOf(item) {
  * origin is gone. A chrome-extension:// or data: url is handed back whole.
  */
 function pathOf(url) {
+  let parsed;
   try {
-    const parsed = new URL(url);
-    if (!['http:', 'https:', 'file:'].includes(parsed.protocol)) return safeUrl(url);
-    const path = `${parsed.pathname}${maskParams(parsed.search)}${maskParams(parsed.hash)}`;
-    // A landing page has no path to speak of, and "Fix this issue on /" names
-    // nothing at all. The host is the only identifying thing left, so keep it.
-    return path === '/' ? safeUrl(url) : path;
+    parsed = new URL(url);
   } catch {
-    return url;
+    // Not a url new URL() reads. Still screened: whatever it is, it is
+    // about to print.
+    return safeUrl(url);
   }
+  if (!['http:', 'https:', 'file:'].includes(parsed.protocol)) return safeUrl(url);
+  const path = `${parsed.pathname}${maskParams(parsed.search)}${maskParams(parsed.hash)}`;
+  // A landing page has no path to speak of, and "Fix this issue on /" names
+  // nothing at all. The host is the only identifying thing left, so keep it.
+  return path === '/' ? safeUrl(url) : path;
 }
 
 // SECRET NAMES BEGIN. The same block sits in content/collector-main.js,
@@ -884,14 +911,15 @@ const SECRET_WORDS = [
   'authorization', 'bearer', 'jwt', 'cookie', 'session', 'credential', 'apikey', 'accesskey',
   'privatekey', 'signingkey', 'csrf', 'xsrf', 'otp', 'totp', 'pin', 'pincode', 'cvv', 'cvc',
   'ssn', 'iban', 'cardnumber', 'creditcard', 'ccnumber', 'account', 'address', 'email', 'phone',
-  'dob', 'birth', 'signature',
+  'dob', 'birth', 'signature', 'jsessionid', 'sessid', 'securitycode', 'verificationcode',
 ];
 
 function isSecretName(name) {
   const words = String(name)
     .split(/[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])/)
     .filter(Boolean)
-    .map((word) => word.toLowerCase());
+    // otp1, cvv2, address2: a field numbered in a row is still that field.
+    .map((word) => word.toLowerCase().replace(/(?<=[a-z])\d+$/, ''));
   return words.some((word, index) =>
     SECRET_WORDS.some(
       (secret) =>
@@ -909,36 +937,73 @@ function isSecretName(name) {
 
 // Whole names that carry a secret in a url, though as words they are too
 // common to treat as secret anywhere (errorCode, sortKey): an OAuth code, an
-// API key, a signed url's signature.
-const SECRET_PARAMS = ['code', 'key', 'sig'];
+// API key, a signed url's signature, a single sign on ticket.
+const SECRET_PARAMS = ['code', 'key', 'sig', 'ticket'];
+
+// Embedded credentials: up to the last '@' before the path, since a password
+// can hold one. A scheme relative url (//user:pass@host) carries them too.
+const CREDENTIALS = /^((?:[a-z][a-z0-9+.-]*:)?\/\/)([^/?#\s]*)@/i;
+
+// How many urls deep a value is followed (a return address holding a return
+// address). Past that the value is masked whole: a page that nests further is
+// either broken or built to run this out of stack.
+const MAX_NESTING = 4;
 
 /**
  * A query (`?a=1&token=x`) or fragment (`#access_token=x`) with the value of
- * every secret looking name masked. Handed back unchanged, the very same
- * string, when there is nothing to mask.
+ * every secret looking name masked, and any url inside a value (a redirect,
+ * a return address) masked the same way. Handed back unchanged, the very
+ * same string, when there is nothing to mask.
  */
-function maskParams(part) {
+function maskParams(part, depth = 0) {
   if (part.length < 2 || !part.includes('=')) return part;
   let changed = false;
-  const pairs = part
-    .slice(1)
-    .split('&')
-    .map((pair) => {
-      const eq = pair.indexOf('=');
-      if (eq <= 0 || eq === pair.length - 1) return pair;
-      let name = pair.slice(0, eq);
-      try {
-        name = decodeURIComponent(name.replace(/\+/g, ' '));
-      } catch {
-        /* a malformed escape is still a name to test */
-      }
-      // A hash router's fragment carries a route before its query.
-      name = name.slice(name.lastIndexOf('?') + 1);
-      if (!SECRET_PARAMS.includes(name.toLowerCase()) && !isSecretName(name)) return pair;
-      changed = true;
-      return pair.slice(0, eq + 1) + REDACTED;
-    });
-  return changed ? part[0] + pairs.join('&') : part;
+  // Pairs end at '&', and at a ';' that a name and '=' follow. Some servers
+  // separate pairs with ';', and serialised markup writes '&' as '&amp;',
+  // whose ';' would otherwise leave the next name as 'amp;token'. A ';' with
+  // no '=' after it is part of the value, and goes with it.
+  const pieces = part.slice(1).split(/(&|;(?=[^&;=]*=))/);
+  for (let index = 0; index < pieces.length; index += 2) {
+    const pair = pieces[index];
+    const eq = pair.indexOf('=');
+    if (eq <= 0 || eq === pair.length - 1) continue;
+    let name = pair.slice(0, eq);
+    try {
+      name = decodeURIComponent(name.replace(/\+/g, ' '));
+    } catch {
+      /* a malformed escape is still a name to test */
+    }
+    // A hash router's fragment carries a route before its query.
+    name = name.slice(name.lastIndexOf('?') + 1);
+    const value = pair.slice(eq + 1);
+    const masked =
+      SECRET_PARAMS.includes(name.toLowerCase()) || isSecretName(name)
+        ? REDACTED
+        : nestedUrl(value, depth);
+    if (masked === value) continue;
+    pieces[index] = pair.slice(0, eq + 1) + masked;
+    changed = true;
+  }
+  return changed ? part[0] + pieces.join('') : part;
+}
+
+/**
+ * A parameter's value with the secrets of any url it holds masked, whether
+ * written out (`next=/verify?token=x`) or percent encoded. An encoded one is
+ * masked whole: put back encoded, the marker would print as %3Credacted%3E.
+ */
+function nestedUrl(value, depth) {
+  const holdsUrl = (text) => /[?#]/.test(text) || credentialsAt(text) !== null;
+  if (holdsUrl(value)) return depth < MAX_NESTING ? screenUrl(value, depth + 1) : REDACTED;
+  if (!/%3F|%23|%40/i.test(value)) return value;
+  let decoded;
+  try {
+    decoded = decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+  if (!holdsUrl(decoded)) return value;
+  return depth < MAX_NESTING && screenUrl(decoded, depth + 1) === decoded ? value : REDACTED;
 }
 
 /**
@@ -949,20 +1014,136 @@ function maskParams(part) {
  * and rewrite the rest of an absolute one on its way back out.
  */
 function safeUrl(url) {
-  if (typeof url !== 'string') return url;
-  const bare = url.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^/?#@]*@/i, '$1');
+  return typeof url === 'string' ? screenUrl(url, 0) : url;
+}
+
+/**
+ * The credentials at the start of a url, as CREDENTIALS matches them, or
+ * null. A userinfo with letters outside ASCII counts only with a ':' in it
+ * (josé:pw@, u:Pässwort@). Without one, in running text, it is a run of
+ * another script up to an e-mail address further on
+ * (请访问https://example.com或联系admin@example.com), and no password.
+ */
+function credentialsAt(url) {
+  const found = CREDENTIALS.exec(url);
+  return found && (found[2].includes(':') || !/[^\x00-\x7f]/.test(found[2])) ? found : null;
+}
+
+function screenUrl(url, depth) {
+  const credentials = credentialsAt(url);
+  const bare = credentials ? credentials[1] + url.slice(credentials[0].length) : url;
   const cut = bare.search(/[?#]/);
   if (cut === -1) return bare;
   const hashAt = bare.indexOf('#', cut);
   const search = hashAt === -1 ? bare.slice(cut) : bare.slice(cut, hashAt);
   const hash = hashAt === -1 ? '' : bare.slice(hashAt);
-  return bare.slice(0, cut) + maskParams(search) + maskParams(hash);
+  return bare.slice(0, cut) + maskParams(search, depth) + maskParams(hash, depth);
 }
 // SECRET URLS END
 
-/** Every url in a line of page text, through safeUrl. */
+// A url's characters: anything but whitespace, quotes, angle brackets, the
+// backtick, and the quotes and commas of other scripts that end a url in
+// running text. Letters of any script stay in, so an international domain or
+// path does not cut the url short ahead of its query; text straight after a
+// url (Japanese has no spaces) can be taken in with it, which at worst masks
+// a little more of a secret value.
+const URL_CHAR = '[^\\s"\'<>`\\u00ab\\u00bb\\u2018\\u2019\\u201c\\u201d\\u3001\\u3002\\uff08\\uff09\\uff0c]';
+
+// A run of url characters, the only place a url can be. Found in one pass,
+// runs never overlap, and the url inside each is then picked out by hand, so
+// no input can make the scan go back over text it has already passed.
+const URL_RUN = new RegExp(`${URL_CHAR}+`, 'g');
+
+// An absolute url of any scheme (https://, wss://, postgres://).
+const SCHEME = /\b[a-z][a-z0-9+.-]{0,31}:\/\//i;
+
+/**
+ * Where the url in a run starts, or -1 for none: an absolute url, or a path
+ * with a query or fragment (GET /api/session?token=x), which is how a log
+ * line names a request. A path starts at a '/' that does not follow a word
+ * character, '/' or '.', so a file path or a fraction is not taken for one.
+ *
+ * @param {string} run
+ * @param {string} before  the character before the run, '' at the start
+ */
+function urlStart(run, before) {
+  const scheme = SCHEME.exec(run);
+  let start = scheme ? scheme.index : -1;
+  // A query or fragment mark with something after it, the last one in the run.
+  let mark = -1;
+  for (let index = run.length - 2; index >= 0; index -= 1) {
+    if (run[index] === '?' || run[index] === '#') {
+      mark = index;
+      break;
+    }
+  }
+  for (let index = 0; index < mark && (start === -1 || index < start); index += 1) {
+    if (run[index] === '/' && !/[\w/.]/.test(index ? run[index - 1] : before)) {
+      // A path with no query of its own only leads up to an absolute url
+      // (/proxy/https://user:pass@host/x?y=1). The url is the absolute one,
+      // and its credentials are only looked for at its start.
+      if (start !== -1 && !/[?#]/.test(run.slice(index, start))) return start;
+      return index;
+    }
+  }
+  return start;
+}
+
+// A stack frame's line up to the url it names: V8's "    at f (" and
+// "    at ", Firefox and Safari's "f@", "@" and "global code@".
+const FRAME_LEAD = /^\s*at\s(?:.*\(|\s*)$|^\s*(?:[^\s@()]*|(?:global|module|eval) code)@$/;
+
+/**
+ * Whether the url that starts at this offset is the one a stack frame names.
+ * The whole line before it must read as a frame: a '(' or an 'at' in prose
+ * (Login failed (https://…), Look at https://…) does not make one. A line
+ * that runs longer than a frame's name before its url is not a frame.
+ */
+function inFrame(text, at) {
+  const before = text.slice(Math.max(0, at - 300), at);
+  const lineStart = before.lastIndexOf('\n');
+  if (lineStart === -1 && at > 300) return false;
+  return FRAME_LEAD.test(before.slice(lineStart + 1));
+}
+
+/**
+ * Every url in a line of page text or a stack frame, through safeUrl. What
+ * the scan took in that belongs to the text is kept out of the url first:
+ * closing punctuation, a bracket the url did not open, and a frame's
+ * :line:col, which would otherwise vanish into a masked value.
+ */
 function safeText(text) {
-  return String(text).replace(/\b(?:https?|wss?|file):\/\/[^\s"'<>`)\]]+/gi, (url) => safeUrl(url));
+  const whole = String(text);
+  return whole.replace(URL_RUN, (run, offset) => {
+    const start = urlStart(run, offset ? whole[offset - 1] : '');
+    if (start === -1) return run;
+    const found = run.slice(start);
+    // Counted once and kept up to date as the end moves back, so a long run
+    // of closing brackets costs one pass rather than one per bracket.
+    const tally = { '(': 0, ')': 0, '[': 0, ']': 0 };
+    for (const char of found) if (char in tally) tally[char] += 1;
+    let end = found.length;
+    for (;;) {
+      const last = found[end - 1];
+      const open = { ')': '(', ']': '[' }[last];
+      if ('.,;:!?'.includes(last)) end -= 1;
+      else if (open && tally[open] < tally[last]) {
+        tally[last] -= 1;
+        end -= 1;
+      } else break;
+    }
+    let url = found.slice(0, end);
+    // In a stack frame, the url is followed by its position: "at f (url:3:9)",
+    // "at url:3:9", "f@url:3:9". Every current engine writes both the line and
+    // the column, so a single number, or any number outside a frame, is taken
+    // to be part of the last value (auth=admin:1234, alice@url?auth=admin:1234).
+    const position = /:\d+:\d+$/.exec(url);
+    if (position && /[?#]/.test(url.slice(0, position.index)) && inFrame(whole, offset + start)) {
+      end = position.index;
+      url = found.slice(0, end);
+    }
+    return run.slice(0, start) + safeUrl(url) + found.slice(end);
+  });
 }
 
 function originOf(url) {
@@ -1027,29 +1208,89 @@ function unreadNotice(contextError) {
 }
 
 /**
- * Whether an item was captured on an earlier load of the page the buffers
- * came from. Two loads of one address print the same url, so only the
- * collector's start time can tell them apart: the one the item recorded when
- * it was captured, or failing that, the time it was captured.
+ * Whether an item recorded the page load it was captured on, and that load
+ * is not the one this report read: an earlier load of the address, or
+ * another tab open on it. Which of the two is not known, so nothing printed
+ * claims a reload on this evidence.
+ */
+function otherLoad(item, armedAt) {
+  return Number.isFinite(item.armedAt) && Number.isFinite(armedAt) && item.armedAt !== armedAt;
+}
+
+/**
+ * For an item that recorded no load (kept from an older build, or captured
+ * on a page too busy to answer): whether it was captured before the page the
+ * buffers came from last loaded. Two loads of one address print the same
+ * url, so only the time can tell them apart.
  */
 function capturedBeforeLoad(item, armedAt) {
-  if (!Number.isFinite(armedAt)) return false;
-  if (Number.isFinite(item.armedAt)) return item.armedAt < armedAt;
-  return Number.isFinite(item.capturedAt) && item.capturedAt < armedAt;
+  return (
+    !Number.isFinite(item.armedAt) &&
+    Number.isFinite(armedAt) &&
+    Number.isFinite(item.capturedAt) &&
+    item.capturedAt < armedAt
+  );
+}
+
+/** The page the log was read on, printed or not. */
+function readPage(report) {
+  return report.page?.url || report.readUrl || '';
+}
+
+/**
+ * Whether two urls name the same page: the same origin, path, query and
+ * fragment as new URL() reads them, so an empty '?' or '#' makes no
+ * difference, and the values of secret parameters make none either. Not the
+ * printed form, which with the page toggle off drops the origin, and would
+ * take /checkout on staging for /checkout on localhost.
+ */
+function samePlace(a, b) {
+  const place = (url) => {
+    try {
+      const parsed = new URL(url);
+      return `${parsed.origin} ${parsed.protocol}${parsed.host}${parsed.pathname}${maskParams(parsed.search)}${maskParams(parsed.hash)}`;
+    } catch {
+      return safeUrl(url);
+    }
+  };
+  return place(a) === place(b);
 }
 
 /**
  * Whether an item was captured on the very page load whose log this report
- * read, so that the log holds what led up to it. Each item records the
- * collector's start time when it is captured. One that has none (captured
- * before this existed, or on a page too busy to answer) is judged by its
- * page and its time instead.
+ * read, so that the log holds what led up to it. An item that recorded no
+ * load is judged by its page and its time instead, and only when both are
+ * known: placed on the wrong log, another page's errors would read as the
+ * cause of its screenshot.
  */
-function onThisLog(item, report, showUrl) {
+function onThisLog(item, report) {
   if (!Number.isFinite(report.armedAt)) return false;
   if (Number.isFinite(item.armedAt)) return item.armedAt === report.armedAt;
   if (!Number.isFinite(item.capturedAt) || item.capturedAt < report.armedAt) return false;
-  return !report.page || !item.url || showUrl(item.url) === showUrl(report.page.url);
+  const read = readPage(report);
+  return Boolean(read && item.url) && samePlace(item.url, read);
+}
+
+/**
+ * The time from which no ring had yet pushed anything out: before it, an
+ * entry may have been dropped. -Infinity when nothing was dropped.
+ */
+function completeSince(report) {
+  const dropped = report.dropped || {};
+  const lines = report.consoleLines || [];
+  const rings = [
+    [dropped.console, lines.filter((entry) => entry.level !== 'warn')],
+    [dropped.warnings, lines.filter((entry) => entry.level === 'warn')],
+    [dropped.errors, report.errors || []],
+    [dropped.network, report.network || []],
+  ];
+  let since = -Infinity;
+  for (const [count, kept] of rings) {
+    if (!Number.isInteger(count) || count <= 0) continue;
+    const times = kept.map((entry) => entry.t).filter(Number.isFinite);
+    if (times.length) since = Math.max(since, Math.min(...times));
+  }
+  return since;
 }
 
 /**
@@ -1062,7 +1303,7 @@ function onThisLog(item, report, showUrl) {
  * Null when there is no log to split: one item, nothing read, or no
  * collector start time to measure captures against.
  */
-function splitLog(items, report, showUrl) {
+function splitLog(items, report) {
   if (items.length < 2 || report.contextError || !Number.isFinite(report.armedAt)) return null;
   const entries = [
     ...(report.errors || []).map(errorEntry),
@@ -1070,7 +1311,7 @@ function splitLog(items, report, showUrl) {
     ...(report.network || []).map(networkEntry),
   ].sort(byTime);
   const logged = items.filter(
-    (item) => Number.isFinite(item.capturedAt) && onThisLog(item, report, showUrl)
+    (item) => Number.isFinite(item.capturedAt) && onThisLog(item, report)
   );
   // No capture on this load, so nothing to split by: the log prints whole,
   // under the caution that it was read somewhere none of them were taken.
@@ -1083,37 +1324,48 @@ function splitLog(items, report, showUrl) {
       : undefined;
     (owner ? buckets.get(owner) : after).push(entry);
   }
-  return { logged, buckets, after };
+  return { logged, buckets, after, since: completeSince(report) };
 }
 
 /** The lines an item of a list carries about the log: its own entries, or why there are none. */
-function itemLog(item, items, split, report, showUrl) {
+function itemLog(item, items, split, report) {
+  const said = (text) => ['', `Console and network: ${text}`];
   const bucket = split.buckets.get(item);
   if (bucket) {
-    if (!bucket.length) return [];
     const previous = split.logged[split.logged.indexOf(item) - 1];
+    // A quiet log reads as a clean one, so an item whose stretch of the log
+    // began before the collector last dropped something says so.
+    const start = previous ? previous.capturedAt - report.armedAt : -Infinity;
+    const cut =
+      start < split.since
+        ? said('the collector had already dropped older entries, so this log may be incomplete.')
+        : [];
+    if (!bucket.length) return cut;
     const since = previous
       ? `since item ${items.indexOf(previous) + 1}`
       : 'on this page load before this capture';
-    return ['', `Logged ${since}:`, fence(renderEntries(bucket, report.armedAt).join('\n'))];
+    return ['', `Logged ${since}:`, fence(renderEntries(bucket, clockFor(report)).join('\n')), ...cut];
   }
-  const said = (text) => ['', `Console and network: ${text}`];
-  // With the page toggle off there is no url to tell another page from an
-  // earlier load of this one, and only that it is not in this log is known.
-  if (!report.page) return said('recorded on another page or an earlier load, which this report did not read.');
-  if (item.url && showUrl(item.url) !== showUrl(report.page.url)) {
+  const read = readPage(report);
+  // Nothing to compare against: only that this log does not hold it is known.
+  if (!read) return said('recorded on another page or another load of this one, which this report did not read.');
+  if (item.url && !samePlace(item.url, read)) {
     return said('recorded on another page, which this report did not read.');
   }
-  if (capturedBeforeLoad(item, report.armedAt)) return said('lost when the page reloaded after this capture.');
-  // The same address, but a load that started after this report's: another
-  // tab open on the same page, say.
-  if (Number.isFinite(item.armedAt)) return said('recorded on another load of this page, which this report did not read.');
+  if (otherLoad(item, report.armedAt)) {
+    return said('recorded on another load of this page (an earlier one, or another tab), which this report did not read.');
+  }
+  if (capturedBeforeLoad(item, report.armedAt)) {
+    return said('recorded before this page last loaded, which this report could not read.');
+  }
   return [];
 }
 
 /**
- * @param {{ elsewhere: Item[], before: Item[] }} stale Items captured on
- *   another page, and items captured on this page before it last loaded.
+ * @param {{ elsewhere: Item[], other: Item[], before: Item[] }} stale Items
+ *   captured on another page, items that recorded another load of this page
+ *   (an earlier one, or another tab), and items that recorded no load but
+ *   were captured before this page last loaded.
  */
 function formatPage(report, stale, showUrl) {
   const { page } = report;
@@ -1151,18 +1403,28 @@ function formatPage(report, stale, showUrl) {
   // The image is a moment in time; the console and network buffers are read
   // when the report is built. A navigation or a reload in between makes them
   // disagree, and Claude Code should know which half to trust.
-  const { elsewhere, before } = stale;
-  const affected = report.items.filter((item) => elsewhere.includes(item) || before.includes(item));
+  const { elsewhere, other, before } = stale;
+  const affected = report.items.filter(
+    (item) => elsewhere.includes(item) || other.includes(item) || before.includes(item)
+  );
   if (affected.length === 1 && report.items.length === 1) {
-    details.push(
-      elsewhere.length
-        ? `- CAUTION: the screenshot was taken on ${showUrl(elsewhere[0].url)}, but the page ` +
-            'changed before this report was generated. The console and network entries below ' +
-            'come from the current page, so they may not correspond to the image.'
-        : '- CAUTION: the page was reloaded after the screenshot was taken. The console and ' +
-            'network entries below come from the reloaded page, so they may not correspond to ' +
-            'the image.'
-    );
+    let caution;
+    if (elsewhere.length) {
+      caution =
+        `the screenshot was taken on ${showUrl(elsewhere[0].url)}, but the page changed before ` +
+        'this report was generated. The console and network entries below come from the ' +
+        'current page, so they may not correspond to the image.';
+    } else if (other.length) {
+      caution =
+        'the screenshot was taken on another load of this page (an earlier one, or another ' +
+        'tab). The console and network entries below come from the load this report read, ' +
+        'so they may not correspond to the image.';
+    } else {
+      caution =
+        'the page was reloaded after the screenshot was taken. The console and network ' +
+        'entries below come from the reloaded page, so they may not correspond to the image.';
+    }
+    details.push(`- CAUTION: ${caution}`);
   } else if (affected.length) {
     const named = (items) => {
       const numbers = items.map((item) => report.items.indexOf(item) + 1);
@@ -1171,21 +1433,21 @@ function formatPage(report, stale, showUrl) {
         : { noun: `Items ${numbers.slice(0, -1).join(', ')} and ${numbers.at(-1)}`, verb: 'were' };
     };
     // Each reason names its own items, so the reader knows which screenshots
-    // were taken on another page and which on an earlier load of this one.
-    let which;
-    if (!before.length) {
-      const away = named(elsewhere);
-      which = `${away.noun} ${away.verb} captured elsewhere`;
-    } else if (!elsewhere.length) {
-      const early = named(before);
-      which = `${early.noun} ${early.verb} captured before this page last loaded`;
-    } else {
-      const away = named(elsewhere);
-      const early = named(before);
-      which =
-        `${away.noun} ${away.verb} captured elsewhere, and ` +
-        `${early.noun.toLowerCase()} before this page last loaded`;
-    }
+    // were taken on another page and which on another load of this one.
+    const reasons = [
+      [elsewhere, 'elsewhere'],
+      [other, 'on another load of this page'],
+      [before, 'before this page last loaded'],
+    ]
+      .filter(([list]) => list.length)
+      .map(([list, where], index) => {
+        const { noun, verb } = named(list);
+        return index === 0 ? `${noun} ${verb} captured ${where}` : `${noun.toLowerCase()} ${where}`;
+      });
+    const which =
+      reasons.length === 1
+        ? reasons[0]
+        : `${reasons.slice(0, -1).join(', ')}, and ${reasons.at(-1)}`;
     details.push(
       `- CAUTION: the console and network entries below were read on this page. ${which}, ` +
         'so they may not correspond to those screenshots.'
@@ -1211,7 +1473,7 @@ export function buildPrompt(report) {
   // the opening line and in full three sections later.
   const showUrl = oneOrigin(items, report.page) ? pathOf : safeUrl;
   const where = describeScope(items, report.page, showUrl);
-  const split = splitLog(items, report, showUrl);
+  const split = splitLog(items, report);
 
   sections.push(mixed ? MIXED.lead(counts, where) : voice.lead(items.length, where));
 
@@ -1250,7 +1512,7 @@ export function buildPrompt(report) {
       if (!samePage && item.url && report.page) facts.push(`Page: ${showUrl(item.url)}`);
       if (facts.length) lines.push('', ...facts);
       if (item.element) lines.push('', ...formatElement(item.element, 'Selected element'));
-      if (split) lines.push(...itemLog(item, items, split, report, showUrl));
+      if (split) lines.push(...itemLog(item, items, split, report));
       sections.push(lines.join('\n'));
     });
   }
@@ -1261,13 +1523,16 @@ export function buildPrompt(report) {
     const elsewhere = items.filter(
       (item) => item.url && showUrl(item.url) !== showUrl(report.page.url)
     );
+    const other = items.filter(
+      (item) => !elsewhere.includes(item) && otherLoad(item, report.armedAt)
+    );
     const before = items.filter(
       (item) => !elsewhere.includes(item) && capturedBeforeLoad(item, report.armedAt)
     );
     // A split log says under each item where its entries are, or why there
     // are none, so a caution here would only repeat it, about entries "below"
     // that are above.
-    const stale = split ? { elsewhere: [], before: [] } : { elsewhere, before };
+    const stale = split ? { elsewhere: [], other: [], before: [] } : { elsewhere, other, before };
     sections.push(formatPage(report, stale, showUrl));
   } else {
     // The page toggle is off, which keeps urls out, but a missing log, or a
@@ -1281,16 +1546,16 @@ export function buildPrompt(report) {
     if (split.after.length) {
       sections.push(
         `## Logged after the last capture on this page\n` +
-          fence(renderEntries(split.after, report.armedAt).join('\n'))
+          fence(renderEntries(split.after, clockFor(report)).join('\n'))
       );
     }
   } else {
-    const consoleLines = formatConsole(report.consoleLines, report.errors, report.armedAt);
+    const consoleLines = formatConsole(report.consoleLines, report.errors, clockFor(report));
     if (consoleLines.length) {
       sections.push(`## Console output\n${fence(consoleLines.join('\n'))}`);
     }
 
-    const networkLines = formatNetwork(report.network, report.armedAt);
+    const networkLines = formatNetwork(report.network, clockFor(report));
     if (networkLines.length) {
       sections.push(`## Failed network requests\n${fence(networkLines.join('\n'))}`);
     }

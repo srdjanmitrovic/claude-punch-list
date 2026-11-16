@@ -22,7 +22,7 @@ Selected element: `form.coupon > div.cart-summary > span.total`
 ```
 Computed styles: display: inline; color: rgb(220, 38, 38); font-size: 18px; font-weight: 700
 
-Console and network: lost when the page reloaded after this capture.
+Console and network: recorded on another load of this page (an earlier one, or another tab), which this report did not read.
 
 ## 2. What's wrong
 The order total shows NaN after applying a coupon. Expected the discounted price.

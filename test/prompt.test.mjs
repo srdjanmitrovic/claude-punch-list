@@ -95,11 +95,43 @@ const EXTRA = {
     return report;
   },
 
-  // The walkthrough with the page toggle off: no url to tell the cart page
-  // from an earlier load, so item 3 says only that its log was not read.
+  // The walkthrough with the page toggle off. The panel still passes the url
+  // it read the log on, never printed, so item 3 (which recorded no load) is
+  // still told apart from the checkout page by its own.
   'list-no-page': () => {
     const report = sampleReport('mixed');
     report.page = null;
+    report.readUrl = 'http://localhost:3000/checkout';
+    delete report.items[2].armedAt;
+    return report;
+  },
+
+  // One capture in a second tab open on the same address, copied from the
+  // first: another load, which the caution must not call a reload.
+  'other-tab': () => {
+    const report = sampleReport('bug');
+    report.items[0].armedAt = report.armedAt - 10 * 1000;
+    return report;
+  },
+
+  // The walkthrough after a poll filled the network ring: six requests were
+  // pushed out, and both checkout items may have lost some of theirs.
+  'list-dropped': () => {
+    const report = sampleReport('mixed');
+    report.dropped = { network: 6 };
+    return report;
+  },
+
+  // A tab left open overnight on one load: an entry from the evening before
+  // carries its date, and today's entries do not.
+  overnight: () => {
+    const report = sampleReport('bug');
+    const day = 24 * 60 * 60 * 1000;
+    for (const list of [report.consoleLines, report.errors, report.network]) {
+      for (const entry of list) entry.t += day;
+    }
+    report.armedAt -= day;
+    report.consoleLines.push({ level: 'error', text: 'Error: socket closed', t: 30 * 60 * 1000 });
     return report;
   },
 
@@ -177,6 +209,16 @@ const EXTRA = {
       kind: 'resource',
       text: 'Failed to load <img>: https://cdn.example.com/a.png?X-Amz-Signature=f00d&w=40',
     });
+    // A frame names its script, and a script loaded with its key in the url
+    // carries the key into every frame.
+    report.errors.push({
+      kind: 'exception',
+      text: 'TypeError: map is undefined',
+      stack:
+        'TypeError: map is undefined\n' +
+        '    at initMap (https://maps.googleapis.com/maps/api/js?key=AIzaFAKE&callback=initMap:210:13)',
+    });
+    report.consoleLines.push({ level: 'error', text: 'GET /api/session?token=rel4t1ve 401' });
     return report;
   },
 };
@@ -221,14 +263,104 @@ EXTRA['timeline-list'] = () => {
   return report;
 };
 
-const SECRET_VALUES =['s3cr3t', 't0k3n', 'hunter2', 'oauthc0de', 'k3y', 'abc.def', 'f00d'];
+const SECRET_VALUES = ['s3cr3t', 't0k3n', 'hunter2', 'oauthc0de', 'k3y', 'abc.def', 'f00d', 'AIzaFAKE', 'rel4t1ve'];
 
 test('prompt: no secret value from a url survives into the prompt', () => {
   const prompt = buildPrompt(EXTRA.secrets());
   for (const value of SECRET_VALUES) assert.ok(!prompt.includes(value), `${value} printed`);
-  for (const kept of ['step=2', 'state=xyz', 'redirect=%2Fhome', 'fields=name', 'w=40']) {
+  for (const kept of ['step=2', 'state=xyz', 'redirect=%2Fhome', 'fields=name', 'w=40', 'callback=initMap:210:13)']) {
     assert.ok(prompt.includes(kept), `${kept} was masked too`);
   }
+});
+
+test('prompt: urls in page text are screened whatever their script, scheme or depth', () => {
+  const report = sampleReport('bug');
+  const said = (text, t) => report.consoleLines.push({ level: 'warn', text, t });
+  said('retry https://bücher.example/a?token=IDNSECRET', 100);
+  said('connect postgres://app:PGSECRET@db.internal/x', 101);
+  said('GET https://example.com/a?auth=admin:9876543', 102);
+  said('reload https://a.test/?token=SEC;RETTAIL done', 103);
+  said('at f (https://x.test/app.js?token=FRAMETOK:10:5)', 104);
+  // A relative url wherever a log line puts one: after punctuation, inside
+  // escaped JSON, after another script, or with brackets in its path.
+  const relative = [
+    'Failed:/api/x?token=REL01', 'retry #2:/api/x?token=REL02', 'GET|/api/x?token=REL03|500',
+    '2026-11-16,GET,/api/x?token=REL04,500', 'navigate #/reset?token=REL05', '(GET)/api/x?token=REL06',
+    'GET /odata/Products(1)/x?token=REL07', 'GET /api/users/[id]/x?token=REL08', '{"u":"https:\\/\\/a.test\\/r?token=REL09"}',
+    '请求/api/login?token=REL10失败', 'GET /search/a=b/x?token=REL11', 'redirect→/login?token=REL12',
+  ];
+  relative.forEach((text, index) => said(text, 110 + index));
+  report.page.url = `https://x.test/p?api_key=TOPKEY&n=${'?a='.repeat(4000)}`;
+  const prompt = buildPrompt(report);
+  for (const value of ['IDNSECRET', 'PGSECRET', '9876543', 'RETTAIL', 'FRAMETOK', 'TOPKEY']) {
+    assert.ok(!prompt.includes(value), `${value} printed`);
+  }
+  for (let index = 1; index <= relative.length; index += 1) {
+    const marker = `REL${String(index).padStart(2, '0')}`;
+    assert.ok(!prompt.includes(marker), `${marker} printed`);
+  }
+  assert.ok(prompt.includes('token=<redacted>:10:5)'), 'a frame lost its position');
+});
+
+test('prompt: a frame keeps its position whatever its script is called, and running text is left alone', () => {
+  const report = sampleReport('bug');
+  const said = (text, t) => report.consoleLines.push({ level: 'warn', text, t });
+  said('at f (https://maps.test/maps/api/js?key=K1:12:34)', 100);
+  said('    at https://a.test/reset?token=K2:12:7', 101);
+  said('g@https://a.test/feed?access_token=K3:1:20', 102);
+  said('请访问https://example.com或联系admin@example.com', 103);
+  said('Error: boom\n    at f (https://a.test/x.js:1:2)\n    global code@https://a.test/y?token=K4:3:1', 104);
+  // A '(' or an 'at' in prose is no frame, so digits after a colon stay in the value.
+  const prose = [
+    'Login failed (https://a.test/login?auth=admin:77056277)', 'Look at https://a.test/reset?pin=12:44556677',
+    '(/api/login?auth=admin:66778899)', '{"cb":"(https://a.test/?code=4:88990011)"}', 'Retrying at https://a.test/x?token=abc:55667788',
+    'alice@https://a.test/?auth=admin:33445566',
+  ];
+  prose.forEach((text, index) => said(text, 110 + index));
+  // Credentials stripped after a leading path, and in any script.
+  const credentials = [
+    '代理/https://user:PWA1@api.test/x?y=1', 'upstream:/x,https://user:PWA2@h.test/?a=1', 'GET,/v1,postgres://app:PWA3@db.test/app?ssl=1',
+    '/set=https://user:PWA4@host.test/?x=1', 'https://u:PässwörtPWB1@host.test/', 'https://josé:PWB2@host.test/',
+    'postgres://user:PWB3é@db.test/app', 'GET /x?next=//josé:PWB4@host.test/',
+  ];
+  credentials.forEach((text, index) => said(text, 120 + index));
+  const prompt = buildPrompt(report);
+  for (const kept of ['key=<redacted>:12:34)', 'token=<redacted>:12:7', 'access_token=<redacted>:1:20', '请访问https://example.com或联系admin@example.com', 'token=<redacted>:3:1']) {
+    assert.ok(prompt.includes(kept), `${kept} is missing`);
+  }
+  for (const value of ['77056277', '44556677', '66778899', '88990011', '55667788', '33445566', 'PWA1', 'PWA2', 'PWA3', 'PWA4', 'PWB1', 'PWB2', 'PWB3', 'PWB4']) {
+    assert.ok(!prompt.includes(value), `${value} printed`);
+  }
+});
+
+test('prompt: text built to make the url scan backtrack costs one pass', () => {
+  for (const text of [`/?a${')'.repeat(100000)}`, `http://x/?a${']'.repeat(100000)}`, '-/'.repeat(50000), '(/'.repeat(50000), 'a.'.repeat(50000)]) {
+    const report = sampleReport('bug');
+    report.errors.push({ kind: 'resource', text: `Failed to load <img>: ${text}`, stack: '', t: 50 });
+    const started = performance.now();
+    buildPrompt(report);
+    assert.ok(performance.now() - started < 500, `${text.slice(0, 6)}… took ${Math.round(performance.now() - started)} ms`);
+  }
+});
+
+test('prompt: with the page toggle off, a log read on another origin is not filed under the items', () => {
+  const report = sampleReport('mixed');
+  for (const item of report.items) delete item.armedAt;
+  const read = new URL(report.items.at(-1).url);
+  report.readUrl = `https://staging.example.com${read.pathname}${read.search}`;
+  report.page = null;
+  const prompt = buildPrompt(report);
+  assert.ok(!/Logged (?:since item|on this page load)/.test(prompt), 'staging entries were filed under an item');
+});
+
+test('prompt: an element whose markup holds a masked value keeps its own text as a search target', () => {
+  const report = sampleReport('bug');
+  report.items[0].element = {
+    ...report.items[0].element,
+    html: '<a href="/reset?token=<redacted>">Forgot password?</a>',
+    text: 'Forgot password?',
+  };
+  assert.match(buildPrompt(report), /Search for: .*"Forgot password\?"/);
 });
 
 const CASES = [...MODES.map((mode) => [mode, () => sampleReport(mode)]), ...Object.entries(EXTRA)];
