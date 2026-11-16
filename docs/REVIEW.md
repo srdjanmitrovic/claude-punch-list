@@ -1,0 +1,1038 @@
+# Review: Punch List for Claude Code 0.4.0
+
+Reviewed at commit `a0c9335` on 2026-11-15. The analysis was made without changing code. Two
+sections at the end, added on 2026-11-16, record what was implemented afterwards and what turned
+up while doing it. Line references in the sections before them point at `a0c9335`.
+
+This file sits under `docs/`, which the release zip does not include. `tools/build.mjs:32` packages
+from an allowlist of six paths (`manifest.json`, `background.js`, `icons`, `content`, `shared`,
+`sidepanel`), and a scratch build with this file present produced the same 14 files and the same
+checksum as one without it.
+
+## Summary
+
+**What the extension does today.** A Manifest V3 side panel extension (`manifest.json:2`,
+`manifest.json:31`). You frame something on a page in one of three ways (drag a region, click an
+element, take the whole viewport), type one sentence, mark it as a bug or a suggestion, and repeat.
+Each capture is written to Downloads as a PNG the moment it is taken (`sidepanel/panel.js:1015`) and
+becomes a row on a sheet kept in `chrome.storage.local` (`sidepanel/panel.js:1205`). One click builds
+a single markdown prompt (`shared/prompt-template.js:831`) that names every ticked item with the
+absolute path of its screenshot, adds the console errors and failed requests an always on collector
+recorded in the page (`content/collector-main.js:94`, `content/collector-main.js:275`,
+`content/collector-main.js:339`), and puts it on the clipboard. Element captures also carry markup,
+computed styles and, on React and Vue pages, the component, its props and its handlers
+(`content/collector-main.js:1160`).
+
+There is no backend. The only `fetch` in the shipped files turns a data URL into a blob
+(`sidepanel/panel.js:1017`), and no shipped file contains a remote URL, `eval` or `new Function`.
+
+**Where it stands.**
+
+* The core flow is sound: mouse driven region capture, saving with a real path, the clipboard copy
+  and the one item prompt all held up under test. The code is unusually well commented, and most
+  oddities turned out to be deliberate and explained in `docs/ARCHITECTURE.md`.
+* No issue is rated high after verification. 35 are medium and about 80 are low. Both findings a
+  reviewer first rated high were downgraded by a second, skeptical pass.
+* The weakest part is the evidence, which is the product's main promise. Console and network are
+  read once, at copy time, from one tab (`sidepanel/panel.js:1115`), are never dated, and are
+  polluted by requests that did not fail (`content/collector-main.js:294`) and requests the page
+  cancelled on purpose (`content/collector-main.js:312`).
+* The collector is felt on every page whether or not the panel is used: DevTools attributes every
+  `console.error`, `console.warn` and failed request to `collector-main.js`
+  (`content/collector-main.js:105`).
+* Element captures print markup and attributes with no redaction (`content/picker.js:416`), while the
+  README says props are the only data read out of the running application (`README.md:428`).
+* The project's own rules (byte for byte output, wrappers that never break a page, no top level
+  `const` in injected scripts) are enforced by nothing: there is no test and no CI on push
+  (`CONTRIBUTING.md:61`).
+* Versions 0.3.0 and 0.4.0 were never released, so the README's release zip path leads to a
+  differently named 0.2.0 build (`README.md:345`).
+
+## How this was checked
+
+Two passes, both read only.
+
+1. **Review.** Nine reviewers, each owning one subsystem or one lens (capture and worker, sheet
+   state, report output, collector, picker and component lookup, the prompt, security and privacy,
+   tooling and docs, panel usability). They produced 129 findings.
+2. **Verification.** Duplicates were merged into 113 groups and handed to nine skeptics whose brief
+   was to refute each one: confirm the quoted line, trace the path, look for the guard that prevents
+   it, check whether `docs/ARCHITECTURE.md` documents it as deliberate, and run it where that was
+   cheap. Outcome: 58 confirmed as reported, 53 confirmed with corrections (mostly lower severity or
+   a narrower trigger), 1 refuted, 1 that cannot be settled without a real side panel. The skeptics
+   reported 13 further defects of their own, 8 of them new. Those 8 were checked once, not twice,
+   and carry the prefix `M`.
+
+The lines behind the medium severity findings and the top recommendations were read again by hand
+before this document was written.
+
+**What "checked by" means in the tables.**
+
+* **browser run**: headless Chrome. Either Chrome 157 with the real content scripts injected into a
+  plain page, or Chrome for Testing 156 with a byte identical copy of the extension loaded unpacked,
+  or the repository's own stage (`tools/panel-stage.html`). No run used a visible side panel. Where
+  the panel was needed, `sidepanel/panel.html` was opened as a tab or on the stage.
+* **Node run**: the repository's real source executed in Node. The template was imported directly;
+  the content scripts and `panel.js` were evaluated in `node:vm` against fakes.
+* **reading**: followed in the code only.
+* **Chrome docs**: depends on documented Chrome behaviour, which was looked up and not recalled.
+
+**Severity.** High: wrong or lost output, exposed data, or a broken core flow in ordinary use.
+Medium: wrong in a realistic but less common situation, or silently degraded output. Low: cosmetic,
+rare, or cleanup. The assumed user is a developer walking through their own app in desktop Chrome
+with a mouse.
+
+**Finding ids.** `CW` capture and worker, `SS` sheet state, `RO` report output, `CO` collector, `PI`
+picker and component lookup, `PJ` prompt, `SP` security and privacy, `TR` tooling, release and docs,
+`UX` panel usability, `M` found during verification.
+
+## Feature inventory
+
+| Feature | Files | Status | Why |
+| :--- | :--- | :--- | :--- |
+| Region capture | `content/overlay.js`, `background.js`, `sidepanel/panel.js` | fragile | Mouse path, clamping and Retina or browser zoom scaling are correct (`sidepanel/panel.js:407`). Breaks under pinch zoom (CW2), under a modal dialog (CW3), and Esc does not cancel from the panel (CW5). |
+| Element picker | `content/picker.js`, `background.js` | fragile | Pointer events leak to the page (PI4), disabled controls cannot be picked (PI5), iframes and shadow roots are not handled (PI6, PI7), styles are read while hovered (PI10). |
+| Element payload (selector, markup, styles) | `content/picker.js`, `shared/prompt-template.js` | fragile | No redaction (PI1), uncapped opening tag (PI13), selector cut from the wrong end (PI8). |
+| Whole screen capture | `sidepanel/panel.js` | fragile | Needs no injection. Ignores an armed overlay and photographs it (CW1), and has no guard against a double click (CW12). |
+| Alt+Shift+C command | `manifest.json`, `background.js` | solid | `sidePanel.open` is called before any await (`background.js:191`). It is the only command (lead 7). |
+| Restricted page detection | `background.js`, `sidepanel/panel.js` | solid | Correct for every page class the README lists. One substring match is too loose (CW6). |
+| Sheet: rows, ticks, selection, New item | `sidepanel/panel.js`, `sidepanel/panel.html` | solid | Only small frictions (UX7, UX8, SS6). |
+| Bug or suggestion intent | `sidepanel/panel.js` | solid | Sticky as documented. Not shared between open panels (SS12). |
+| Persistence across panel sessions | `sidepanel/panel.js` | solid | Items are stored only once they have a path (`sidepanel/panel.js:1206`). `restore()` has no failure path (SS9). |
+| Cross window sync | `sidepanel/panel.js` | fragile | Whole sheet writes and whole sheet adoption lose edits and items when two windows are active (SS1, SS4, SS5). |
+| One week expiry | `sidepanel/panel.js` | fragile | An expiry in one window empties a panel left open in another (SS3). Files are left behind (RO10). |
+| FILE MISSING detection | `sidepanel/panel.js` | fragile | Checked once at startup, explained only in a banner that other events clear, and the flag is persisted (SS7, RO7). |
+| Discard one, discard all | `sidepanel/panel.js`, `sidepanel/panel.html` | fragile | No confirmation or undo (UX2). Deletes by a stored download id that Chrome can reissue (RO6). |
+| Saving to Downloads with a real path | `sidepanel/panel.js` | solid | Polling, `uniquify` and the "Save as" case all behave as documented (`sidepanel/panel.js:980`). |
+| Clipboard copy and reset | `sidepanel/panel.js` | solid | Focus wait, `execCommand` fallback and manual reveal work. The sheet is reset only after a real copy (`sidepanel/panel.js:1138`). |
+| Console capture | `content/collector-main.js` | fragile | Wrappers are safe for the page. They take over the source link in DevTools (CO6), and warnings share 30 slots with errors (M2). |
+| Uncaught errors and rejections | `content/collector-main.js` | solid | Own ring, so console noise cannot evict them. |
+| Failed fetch and XHR with caller | `content/collector-main.js` | fragile | Lists responses that did not fail (CO1) and requests the page aborted (CO2). The caller is lost behind a request library (CO4). |
+| Failed resource loads | `content/collector-main.js` | fragile | URL is missing for `srcset`, SVG images and objects (M3) and is never truncated (CO7). |
+| Attaching context at copy time | `sidepanel/panel.js`, `content/collector-bridge.js` | fragile | Lead 1. Also loses every URL when the read fails (RO4), can hang the copy (RO5) and can reuse another tab's read (RO1). |
+| React component lookup | `content/collector-main.js`, `shared/prompt-template.js` | fragile | Works on React 16 to 19. Prints a false "defined elsewhere" in the commonest case (PI2), unmapped positions on 19.1 and later (PI9), and props that can be one commit old (M5). |
+| Vue component lookup | `content/collector-main.js` | solid | Vue 3 development builds only, which is what the README claims. |
+| Handlers and props with redaction | `content/collector-main.js` | fragile | The secret test is an unanchored substring match (PI3) and three text heuristics misfire (PI16). |
+| Prompt: one bug | `shared/prompt-template.js` | solid | Structure held against hostile and degenerate input from an ordinary page (PJ15). |
+| Prompt: change, mixed, several pages | `shared/prompt-template.js` | fragile | Change closing gives the evidence no role (PJ17). Page counting and page lines disagree (PJ9). The caution vanishes with the page toggle off (RO3). |
+| Prompt: console and network sections | `shared/prompt-template.js` | fragile | Not in time order (PJ1), repeats not collapsed (PJ7), multi line messages print as frames (M8). |
+| Attach toggles and chips | `sidepanel/panel.js`, `sidepanel/panel.html` | fragile | Chips are a snapshot, not a live count, and can show another tab's numbers (RO11). |
+| Panel accessibility | `sidepanel/panel.html`, `sidepanel/panel.css` | fragile | No live region (UX3), three contrast failures (UX12), states not exposed (UX13). |
+| Keyboard shortcuts | `manifest.json`, `sidepanel/panel.js` | incomplete | One command, one undocumented panel shortcut (`sidepanel/panel.js:1526`), Esc bound only on the page. |
+| Release packaging | `tools/build.mjs` | fragile | Validates manifest paths only (TR2) and zips untracked files (TR6). |
+| Release workflow | `.github/workflows/release.yml` | incomplete | 0.3.0 and 0.4.0 were never published (TR1). Manual dispatch cannot succeed from a branch (TR4). |
+| Tests and CI | none | incomplete | No test of any kind (`CONTRIBUTING.md:61`). |
+| Prompt preview tool | `tools/preview-prompt.mjs` | solid | Renders the real template. 49 of 467 code lines never run in any of the four modes (PJ12). |
+| Panel stage and shim | `tools/panel-stage.html`, `tools/chrome-shim.js` | fragile | Useful and faithful for the panel. Download ids reset on reload (TR8); the docs understate what it cannot reproduce (TR9). |
+| Roadmap: reorder, annotate, full page, more frameworks, component on hover | `README.md` | incomplete | None is built (lead 8). |
+
+**Half built or unused.** No permission is unused: `scripting`, `downloads`, `storage` and
+`sidePanel` each have call sites. What is unused is data: `userAgent` and scroll position
+(`content/collector-bridge.js:62`), the picker's `tagName`, `classes` and `inlineStyle`
+(`content/picker.js:567`), an item's `title` and `tabId` (`sidepanel/panel.js:710`), and each entry's
+`t` plus the snapshot's `armedAt` (`content/collector-main.js:31`, `content/collector-main.js:1212`)
+are collected, sent and stored, and nothing reads them (TR12). `styleFile()` can never match
+(`shared/prompt-template.js:565`, PJ8) and `mainWorldSilent` can never be true when it is read
+(`content/picker.js:661`, PI14).
+
+## Verdict on each lead
+
+**1. Console and network are read once at copy time from the active tab; the buffer is 30 entries
+and resets on page load. Confirmed, with corrections.**
+`copyReport` awaits `refreshContext()` (`sidepanel/panel.js:1115`), which messages only `state.tab`
+(`sidepanel/panel.js:943`), and `assembleReport` reads that one snapshot
+(`sidepanel/panel.js:1070`). Items carry no evidence: `addItem` reads the context for the chips and
+keeps nothing (`sidepanel/panel.js:729`). What the lead gets wrong:
+
+* It is 30 per category in three rings (`content/collector-main.js:19`,
+  `content/collector-main.js:22`), so up to 90 entries, and uncaught errors cannot be evicted by
+  console noise.
+* The reset is per document, not per URL. A single page app that changes route keeps its buffer, so
+  there the problem is the opposite one: entries from earlier routes, and from before a hot reloaded
+  fix, print as current and undated (CO3).
+* The template does caution about a mismatch, but by URL only (`shared/prompt-template.js:888`). A
+  reload on the same URL passes silently (RO2), and the caution disappears when the page toggle is
+  off (RO3).
+* "From the active tab" is not always true. On a restricted tab nothing is read and the previous
+  read, possibly from another tab, is copied (`sidepanel/panel.js:936`, RO1).
+* A copy does not clear the buffers (`sidepanel/panel.js:850`), so the next prompt repeats entries
+  the previous one delivered.
+
+**2. The collector wraps only `console.error`, `console.warn`, `fetch` and XHR; iframes are not
+covered. Confirmed.**
+Wrapped at `content/collector-main.js:94`, `content/collector-main.js:275`,
+`content/collector-main.js:339` and `content/collector-main.js:353`; `all_frames` is false at
+`manifest.json:41` and `manifest.json:48`. The lead leaves out the two listeners
+(`content/collector-main.js:113`, `content/collector-main.js:140`) that bring in uncaught errors,
+rejections and failed element loads. Worth adding, cheapest first: a `securitypolicyviolation`
+listener (wraps nothing, confirmed to receive violations from a main world script), failing
+`console.assert`, and a `PerformanceObserver` for failed stylesheet images and fonts
+(`responseStatus` exists from Chrome 109). `WebSocket` and `EventSource` need a constructor
+replaced, which is the riskiest thing one can do under the "never break a host page" rule.
+`sendBeacon` exposes no outcome and is not worth wrapping. Browser generated messages (the CORS
+explanation, `net::ERR` codes) cannot be reached from a page script at all.
+
+**3. The picker uses `document.elementFromPoint` with no shadow DOM or iframe handling; component
+lookup covers React and Vue 3 only. Confirmed, and worse for iframes than stated.**
+The only hit test is `content/picker.js:547`. Inside a shadow root the pick is the outermost host
+with empty markup (PI7). Over an iframe the top frame receives no mouse events, so nothing is
+highlighted and the click is delivered to the framed page for real, same origin or not
+(`background.js:99`, PI6). "React" means 16 through 19; a call site exists on 16 to 18 with a
+development JSX transform and on 19.1 and later, where it is an unmapped stack frame (PI9). "Vue 3"
+means development builds. Svelte, Vue 2, Preact, Solid, Angular and web components get no component
+and no handlers (`content/collector-main.js:1182`).
+
+**4. The manifest says 0.4.0 but tags stop at v0.2.0, and the release workflow only runs on tags.
+Confirmed, with one correction.**
+`manifest.json:4` and `package.json:3` say 0.4.0. Local tags, remote tags and GitHub releases are
+v0.1.0 and v0.2.0 only. The workflow also declares `workflow_dispatch`
+(`.github/workflows/release.yml:15`), but its first step compares the ref name with the manifest
+version (`.github/workflows/release.yml:32`), so a manual run from `main` always fails (TR4). The
+lead leaves out the consequence: the v0.2.0 assets are named `claude-debug-reporter-v0.2.0.zip`, so
+the file name in `README.md:345` matches nothing, and what a user gets is the old product with no
+sheet and no component lookup (TR1). A `v0.4.0` tag at HEAD would pass the check; a clean export of
+HEAD hashes to the same checksum as the local `dist`.
+
+**5. There is no test suite; the stage and shim could host one. Confirmed, but the stage is the
+weaker half.**
+No test file, no test script, no push or pull request workflow (`CONTRIBUTING.md:61`,
+`package.json:11`). `node:test` needs no browser and no dependency: a scratch proof of concept ran
+24 tests in about 0.2 seconds covering golden files for the four previews, the collector in
+`node:vm` (return values, `this`, rejections passed through, ring size, `stackTraceLimit` restored),
+and the no top level `const` rule by compiling each injected file concatenated with itself. Goldens
+must pin the locale, because `stamp()` uses `toLocaleString()` (`shared/prompt-template.js:194`).
+The stage cannot test `background.js`, world isolation or `document_start`, and its download fake
+needs fixes first (TR8).
+
+**6. Screenshot paths only work when Claude Code runs on the same machine; files accumulate.
+Confirmed.**
+The prompt prints `DownloadItem.filename` verbatim (`sidepanel/panel.js:988`,
+`shared/prompt-template.js:853`) under an instruction to read it. Nothing is hard coded to
+`~/Downloads`, so a changed download folder works and Windows gets a correct path. What fails is any
+setup where Claude Code sees a different filesystem: a remote session, a devcontainer, WSL (where
+`C:\` needs `/mnt/c`). The prompt has no sentence for a path that cannot be opened. Only discards
+delete files (`sidepanel/panel.js:775`); a copy and the weekly expiry leave them
+(`sidepanel/panel.js:1350`, RO10). On this machine the folder held 13 files and 1.1 MB, the oldest
+three months old, so the cost is clutter and old screenshots of app screens, not disk space.
+
+**7. Only region capture has a keyboard shortcut. Confirmed.**
+One command (`manifest.json:52`, `background.js:184`). The panel also handles Cmd or Ctrl plus
+Enter for copy (`sidepanel/panel.js:1526`), which is shown nowhere. The lead leaves out that the one
+shortcut arms a tool that cannot be finished from the keyboard, while Screen, the only mode that
+needs no pointer and the only way to photograph a hover or an open menu, has no shortcut. A Screen
+command is not a one line change: the capture runs in the panel, which may not exist yet when the
+command fires. Chrome allows four suggested keys per extension, and `_execute_action` does not fire
+`onCommand` (both checked in the commands reference).
+
+**8. Roadmap items are not built. Confirmed for all five.**
+No drag or reorder code in `sidepanel/`; the only canvas use is crop and thumbnail
+(`sidepanel/panel.js:405`); capture is one `captureVisibleTab` call (`sidepanel/panel.js:379`); the
+hover tag shows tag, id, classes and size (`content/picker.js:339`). Groundwork differs:
+
+* **Reorder** is close. Order is already the persisted array order and the template numbers by
+  index (`shared/prompt-template.js:871`). `adoptStored` appends items still saving after stored
+  ones (`sidepanel/panel.js:1282`), which a reorder must respect.
+* **Annotate** is blocked by design. The full image is released once the download starts and the
+  panel keeps a thumbnail of at most 800 px (`sidepanel/panel.js:23`), so marking up has to happen
+  before the save or produce a second file.
+* **Full page** is called out of scope in `CONTRIBUTING.md:109` and roadmap in `README.md:559`.
+* **More frameworks**: the framework field is a two way switch in three places, so a third would
+  print as React unless all three change.
+* **Component on hover**: the README's stated cost (a round trip per mouse move) is overstated,
+  since `onMouseMove` returns early unless the element changed (`content/picker.js:548`). The real
+  cost is writing a `data-cdr-pick` attribute onto every hovered node.
+
+## Bugs and risks
+
+### Medium severity
+
+**Capture**
+
+* **CW1. Whole screen capture photographs the armed overlay.** `sidepanel/panel.js:916`. Click
+  Region or Element, then Screen. The saved PNG contains the dim layer and the hint pill,
+  `addItem` darkens the button (`sidepanel/panel.js:726`), and the overlay stays live on the page
+  while the worker still reports the tab as armed. Checked by browser run, including a real
+  `captureVisibleTab`. Fix S.
+* **CW2. Crops come from the wrong place under pinch zoom.** `sidepanel/panel.js:407`. The
+  rectangle is in layout viewport pixels (`content/overlay.js:192`) while `captureVisibleTab`
+  returns the magnified visual viewport. At 2x the crop was a different patch a quarter of the
+  size, saved as a normal item. Checked by browser run. Fix S.
+* **CW3. The region overlay is dead under a native modal dialog.** `content/overlay.js:227`. The
+  host is appended to `body`, below the top layer, and is inert while `dialog.showModal()` is open.
+  The button stays lit, nothing is selected, no error is shown. Checked by browser run. The
+  fullscreen case rests on the top layer rules and was not observed. Fix M.
+* **CW5. Esc does nothing after arming from the panel.** `sidepanel/panel.js:1526`. Both Escape
+  listeners are on the page window (`content/overlay.js:233`, `content/picker.js:672`), while the
+  panel holds focus and handles only the copy shortcut. The on page hints
+  (`content/overlay.js:85`, `content/picker.js:332`) and `README.md:87` say Esc cancels. For
+  Element the panel is the only way to arm, so the cancel is never reachable before the pick.
+  Checked on the stage; focus in a real side panel was not observed. Fix S.
+
+**Sheet**
+
+* **SS1. A background window overwrites the sentence typed in another.** `sidepanel/panel.js:1261`.
+  The typing guard tests `document.activeElement` without `document.hasFocus()`, and the field
+  keeps being the active element after its window loses focus. The background panel refuses the
+  other window's edit, and its next write stores its own older or empty sentence. Checked by
+  browser run with two panels over one storage. Fix S.
+
+**Context and saving**
+
+* **RO2. A reload between capture and copy drops the evidence without a word.**
+  `shared/prompt-template.js:888`. The only mismatch test compares URLs. `armedAt` would reveal the
+  reload; it is sent (`content/collector-main.js:1212`) and dropped in `assembleReport`
+  (`sidepanel/panel.js:1069`). Reading at copy time is documented (`README.md:415`); the blind spot
+  is not. Checked by Node run. Fix S for the caution; the full fix is feature 1 below.
+* **RO4. When the context read fails, the prompt loses every URL.** `sidepanel/panel.js:1084`. On
+  a tab opened before the extension was installed or reloaded, `state.context` is null
+  (`sidepanel/panel.js:956`), the template treats that as the page toggle being off, and the prompt
+  reads "on the captured page" although each item recorded its own URL (`sidepanel/panel.js:709`).
+  The receipt still says Copied. Checked with the extension copy loaded in Chrome. Fix S.
+* **RO5. Copy hangs on a page that is busy or paused.** `sidepanel/panel.js:1115`. The read is an
+  unbounded `tabs.sendMessage` awaited with the busy latch set (`sidepanel/panel.js:1108`). Against
+  an 8 second busy loop the button sat on "Copying…" for 7.6 seconds; at a breakpoint it never
+  returned. `arm()` already bounds the same kind of wait for the same reason
+  (`sidepanel/panel.js:869`). Checked by browser run. Fix S.
+* **RO6. Discarding an item can delete a different file.** `sidepanel/panel.js:1051`. `deleteFile`
+  trusts a download id persisted up to a week earlier. Chromium reissues ids as one more than the
+  highest remaining row after a restart, so removing the newest rows from the downloads list and
+  restarting hands the id to the next download, which a discard then deletes. Rare trigger,
+  permanent result. Checked in Chrome with a persistent profile. Fix S.
+
+**Collector**
+
+* **CO1. Responses that did not fail are listed as failed.** `content/collector-main.js:294`. The
+  test is `!response.ok`, so a successful `no-cors` fetch, a manual redirect and a 304 each print
+  under "Failed network requests" and take one of 30 slots. The XHR branch tests the status
+  (`content/collector-main.js:376`) and the README says 4xx or 5xx (`README.md:411`). Checked with
+  the extension copy in Chrome. Fix S.
+* **CO2. Requests the page cancelled print as FAILED.** `content/collector-main.js:312`,
+  `content/collector-main.js:382`. An `AbortController` cleanup, a typeahead that aborts per
+  keystroke and an XHR timeout all produce "FAILED Network failure". Thirty of them push every real
+  failure out. Checked in Chrome. Fix S. Note for the fix: `abort(reason)` rejects with the reason
+  itself, so test the signal and not `error.name`.
+* **CO3. Entries are never aged or dated.** `content/collector-main.js:31`. No route change, hot
+  reload or copy empties the buffers, and the `t` on each entry is never printed. On a single page
+  app the second prompt of a session repeats the first one's errors under a new page heading.
+  Collecting from load is documented; the missing age is not. Checked in Chrome and by reading.
+  Fix M.
+* **CO4. The caller of a failed request is lost behind a request library.**
+  `content/collector-main.js:168`. Six frames are captured, two of them the collector's own, which
+  cannot reach page code through axios. In a development build the "called from" line is absent;
+  in a bundle it names axios internals. This is a headline feature (`README.md:67`). Checked with
+  real axios in Chrome. Fix S for development builds; bundles also need known library frames
+  skipped.
+* **CO6. DevTools attributes the page's console output to the extension.**
+  `content/collector-main.js:105`. The wrapper is the top frame of every call, so the source link
+  beside each warning and error reads `collector-main.js:105`, and failed requests link to
+  `collector-main.js:291` and `collector-main.js:396`. This is the one finding every user meets on
+  every page, panel open or not. Observed by opening DevTools on a page with the extension copy
+  loaded. A static inline source map with an `ignoreList` restored the page's own file and line on
+  a scratch copy and needs no build step. Fix S.
+* **M2. Warnings share 30 slots with errors, and repeats are not folded.**
+  `content/collector-main.js:33`, `content/collector-main.js:98`. Thirty identical warnings evict
+  the one `console.error` that mattered. Checked by Node run on the real collector.
+
+**Picker**
+
+* **PI1 and SP1. Picked markup and attributes are printed and stored with no redaction.**
+  `content/picker.js:416`, `content/picker.js:443`. React mirrors a controlled input's live value
+  into the `value` attribute, so picking a password field or its form prints the typed password
+  directly under "Props … password=<redacted>". A server rendered hidden CSRF input prints too. The
+  payload is also written to `cdrReport` (`sidepanel/panel.js:1206`) for up to a week.
+  `README.md:428` calls props "the one thing here that is read out of a running application".
+  Rated medium, not high: it needs a secret in an attribute of the picked subtree, and the data
+  stays local until pasted. Checked in Chrome against React 18.3.1 and 19.1.0. Fix M.
+* **PI4. Pointer events reach the page while picking.** `content/picker.js:670`. Only `mousedown`,
+  `mouseup` and `click` are swallowed. A trigger that opens on `pointerdown` (the Radix pattern)
+  opens, and the payload then describes it as expanded. `stop()` also unhooks everything at once
+  (`content/picker.js:604`), so the second click of a double click reaches the page. Checked in
+  Chrome. Fix S.
+* **PI5. A disabled control cannot be picked.** `content/picker.js:669`. Chrome dispatches no
+  `click` on it, so the picker highlights it and never hears the click. The repository's own React
+  fixture has one (`tools/demo-react.html:252`). Checked on the stage. Fix M (commit the pick on
+  `pointerup`).
+* **PI6. Nothing inside an iframe can be picked, and the click goes through.** `background.js:99`.
+  See lead 3. Storybook style apps, where everything runs in a preview frame, are unusable with
+  Element. Checked in Chrome for same origin and cross origin frames. Fix M for a shield that picks
+  the frame as a whole.
+* **PI7. Inside a shadow root the pick is the outermost host.** `content/picker.js:547`. See lead
+  3. Checked in Chrome. Fix L.
+* **PI10. Styles and the screenshot are always taken in the hover state.** `content/picker.js:573`.
+  Nothing sits between the pointer and the page (a deliberate design, `content/picker.js:4`), so a
+  button reported for its resting colour prints its hover colour. The prompt does not say so.
+  Checked in Chrome. Fix S to disclose, M to wait until the element is no longer hovered.
+* **PI13. One long attribute defeats the markup cap.** `content/picker.js:420`. The opening tag is
+  exempt from `MAX_HTML` (`content/picker.js:92`), so an image with an inlined data URI enters the
+  prompt whole and is rewritten to storage on every keystroke, while the markup is labelled
+  truncated. Bundlers inline small images, so an ordinary pick can hit this. Keeping the opening
+  tag is a commented decision that assumes a short tag. Checked in Chrome. Fix S.
+
+**Component lookup**
+
+* **PI2. The call site line says "defined elsewhere" when it is not.**
+  `content/collector-main.js:758`, `shared/prompt-template.js:354`. When the picked element is
+  written inside the component that renders it, the commonest case, the collector drops the owner
+  and the template prints that the component is defined elsewhere while citing a line inside its
+  own definition. Reproduced on `tools/demo-react.html` and on React 19.2.0. Fix S.
+* **PI8. Long selectors are cut from the wrong end.** `shared/prompt-template.js:679`. The selector
+  goes through `flatten()`, whose 200 character cap (`shared/prompt-template.js:181`) removes the
+  picked element's own segment on utility class markup. A 228 character selector that matched one
+  element printed as 200 characters that matched none, with no sign of the cut. Checked in Chrome
+  and Node. Fix S.
+* **PI9. On React 19.1 and later the call site is an unmapped stack position.**
+  `content/collector-main.js:648`. The line and column are those of the module the browser
+  executed, printed with the same confidence as an exact `_debugSource` location. Observed on a
+  real React 19.2.0 development build; how large the drift is under Vite or Next was not measured.
+  Fix M.
+* **M5. Reported props can be one commit old.** `content/collector-main.js:767`. The DOM node can
+  point at the alternate fiber, which the comment at `content/collector-main.js:659` acknowledges.
+  On React 18.3.1 the printed props alternated between stale and fresh on each render, so a prop
+  that just changed, often the bug being reported, is wrong about half the time. Checked in
+  Chrome, single pass.
+
+**Prompt**
+
+* **PJ1. Console evidence prints out of order and undated.** `shared/prompt-template.js:200`.
+  Every uncaught error prints before every console line, and requests sit in another section. The
+  README's own run prints its three events in the reverse of the order the page produced them
+  (`README.md:200`). Checked by Node run. Fix M. Fixing it reorders the default preview, which the
+  byte for byte rule forbids unless decided on purpose.
+* **PJ6 and CO13. URLs and console objects print with their secrets.**
+  `shared/prompt-template.js:244`, `content/collector-main.js:297`. Page URLs keep query and
+  fragment values (a commented choice, `shared/prompt-template.js:700`). Request URLs and resource
+  error URLs skip even the credential strip in `safeUrl`, and a logged object prints its
+  `password` and `Authorization` keys intact. An OAuth code, an access token and `user:pass@` all
+  printed in a browser run. Fix M.
+* **PJ7. Repeats print once each and evictions are silent.** `shared/prompt-template.js:240`. A
+  poll that fails 30 times produced a 16,906 character prompt against 403 without it, and nothing
+  says earlier entries were dropped. Checked by Node and browser run. Fix M.
+* **M8. An error with a multi line message prints its message as frames.**
+  `shared/prompt-template.js:210`. Frames are taken as lines 1 to 3 of the stack, so a `ZodError`
+  or React's "Invalid hook call" prints message lines indented as frames and no real frame, and
+  drops the location the collector recorded in `where`. Checked in Chrome, single pass.
+
+**Release and docs**
+
+* **TR1. The README's release zip path leads to the old product.** `README.md:345`. See lead 4.
+  Rated medium because the first and recommended install path (clone) is unaffected. Fix S.
+* **SP3. The README recipe for restricting the extension breaks capture everywhere.**
+  `README.md:469`. It tells the reader to narrow `host_permissions` to an origin list.
+  `captureVisibleTab` requires `<all_urls>` or `activeTab` (Chrome tabs reference, and Chromium's
+  `CanCaptureVisiblePage`), so Region, Element and Screen then fail on every site, listed or not.
+  Only the two `content_scripts` matches should be narrowed. Not run with an edited manifest.
+  Fix S.
+
+**Panel**
+
+* **UX2. Discard all deletes every sentence and file on one click.** `sidepanel/panel.js:826`. No
+  confirmation, no undo, and it sits 12 px from the identically styled "Clear collected log"
+  (`sidepanel/panel.html:171`). Checked on the stage. Fix M.
+* **UX3. Errors appear off screen and are not announced.** `sidepanel/panel.html:23`. The banner
+  has no live region and sits in normal flow (`sidepanel/panel.css:165`). With three items the
+  panel document is about 955 px tall, and a failed save rendered its banner above the viewport.
+  Checked on the stage. Fix S.
+* **M12. Every capture scrolls the whole panel.** `sidepanel/panel.js:636`. `scrollIntoView` on
+  the selected row scrolls the document, not just the list, so after three captures in a 700 px
+  panel the top of the frame is cut off and Copy is below the fold. This is what makes UX3 bite
+  without the user scrolling. Checked on the stage, single pass.
+
+### Low severity
+
+| Id | Where | What | Checked by | Fix |
+| :--- | :--- | :--- | :--- | :--- |
+| CW4 | `content/overlay.js:183` | A region dragged while no panel is open is dropped silently; nothing disarms the page when the panel closes. | run and reading | M |
+| CW6 | `background.js:62` | Any URL that merely contains a Web Store host string is treated as the Web Store. | browser run | S |
+| CW7 | `content/overlay.js:230` | No `touch-action` and no `pointercancel` handler, so a touch drag pans the page and leaves dragging stuck on. | browser run | S |
+| CW9 | `sidepanel/panel.js:1550` | `ready` has no rejection handler, so a failed startup makes the panel ignore every broadcast; a late `cdr:check-tab` reply is applied to whichever tab is current. | Node run | S |
+| CW11 | `background.js:59` | The internal page regex branch is reached only on the extension's own pages, and a few message fields are never read. | browser run | S |
+| CW12 | `sidepanel/panel.js:917` | No in flight guard, so a double click on Screen files two identical items. | run and reading | S |
+| UX14 | `content/picker.js:668` | Region and Element are pointer only, and the picker cannot widen to a parent. | reading | M |
+| M1 | `content/overlay.js:227` | On a page whose `body` has a transform or filter, the selection box and hint render at document coordinates and vanish once scrolled. The crop itself is still right. | browser run, single pass | S |
+| SS3 | `sidepanel/panel.js:1481` | A storage removal has no `newValue`, so another panel's expiry is adopted as an empty sheet by a panel left open. | run and reading | S |
+| SS4 | `sidepanel/panel.js:1282` | Two writes that cross before either is adopted lose an item on both panels or bring a discarded one back. | Node run | M |
+| SS5 | `sidepanel/panel.js:851` | `resetAfterCopy` filters by object identity, so an adoption during the copy leaves the copied items on the sheet. | Node run | S |
+| SS6 | `shared/prompt-template.js:873` | The prompt numbers the ticked subset from 1 while the sheet numbers by position, so they disagree when an earlier row is unticked. | Node run | S |
+| SS7 | `sidepanel/panel.js:1183` | The FILE MISSING reason lives only in the shared banner, "capture it again" does not lift the block, and the flag is persisted and never rechecked. | run and reading | M |
+| SS8 | `sidepanel/panel.js:779` | A failed save for an item not in the frame moves the selection, so the next keystrokes land in another item. | Node run | S |
+| SS9 | `sidepanel/panel.js:1550` | `restore()` has no catch; a stored item with a mode this build does not know leaves the panel inert on every open. | Node run | S |
+| SS10 | `sidepanel/panel.js:1486` | Each keystroke in one window makes every other panel read both storage keys, rebuild its list and query its tab. | run and reading | M |
+| SS11 | `sidepanel/panel.js:710` | `title` and `tabId` are stored with every item and never read; `id="toggles"` is unreferenced. | reading | S |
+| SS12 | `sidepanel/panel.js:1240` | Intent and toggles are written together from one panel's memory and no panel listens, so a stale panel overwrites the other's settings. | run and reading | S |
+| RO1 | `sidepanel/panel.js:936` | On a restricted tab `refreshContext` returns without clearing `state.context`, so Copy attaches an earlier tab's read while the chips show dashes. | Node run | S |
+| RO3 | `sidepanel/panel.js:1084` | With the page toggle off the only mismatch caution is never printed while console and network still are. | Node run | S |
+| RO7 | `sidepanel/panel.js:1298` | File existence is checked once at startup, and an item whose download record was erased can never be flagged. | run and reading | S |
+| RO9 | `sidepanel/panel.js:1138` | After a blocked clipboard the only ways to clear the sheet delete the files the hand copied prompt names. | Node run | S |
+| RO10 | `sidepanel/panel.js:1350` | Screenshots are deleted only on discard; a copy, the weekly expiry and a panel closed mid save all leave the PNG. | reading | M |
+| RO11 | `README.md:126` | The chips are a snapshot, replies are not matched to the current tab, and the element chip shows the "reload" dash when there are simply no element items. | Node run | S |
+| SP6 | `sidepanel/panel.js:1016` | File names carry the page's host and last path segment, so the page toggle does not keep the host out of the prompt. | Node run | S |
+| CO7 | `content/collector-main.js:121` | The URL in a failed resource entry is never truncated, nor are the method or status text. | browser run | S |
+| CO8 | `content/collector-main.js:100` | Console text keeps raw printf specifiers, and an `Error` argument prints its header twice. | browser run | S |
+| CO9 | `content/collector-main.js:285` | Two wrappers do not pass a call through unchanged: `fetch` throws synchronously if the page replaced `window.performance`, and `open()` with one argument no longer throws. | browser run | S |
+| CO10 | `content/collector-main.js:373` | Every XHR, successful or not, formats its captured stack before the success return, contrary to the architecture note. | run and reading | S |
+| CO11 | `content/collector-bridge.js:74` | The bridge forwards whatever answers its snapshot request without checking shape or size, and a page script can substitute that reply. | browser run | M |
+| CO12 | `content/collector-main.js:74` | `serialize()` runs page getters and proxy traps, and its node budget does not bound wide values. | browser run | M |
+| CO14 | `content/collector-main.js:275` | Any page can tell the extension is installed (`fetch.name`, `__cdrCollector`), and every message listener receives the buffer each time the panel polls. | browser run | M |
+| M3 | `content/collector-main.js:122` | A failed resource loses its URL for `srcset` only images, SVG images and objects. | browser run, single pass | S |
+| M4 | `content/collector-main.js:291` | A fetch blocked by the page's CSP is reported, in the violation event and in the site's CSP reports, as coming from the extension. | browser run, single pass | M |
+| PI12 | `content/picker.js:562` | The click captures the last highlighted node, which can be gone if the page scrolled or rendered again under a still pointer. | browser run | S |
+| PI14 | `content/picker.js:661` | `mainWorldSilent` is cleared before the single `inspect()` of each arm, so every pick on a tab without a collector waits the full 300 ms. | run and reading | S |
+| PI15 | `content/picker.js:567` | The payload carries `tagName`, `classes` and an uncapped `inlineStyle` that nothing reads. | run and reading | S |
+| PI18 | `content/picker.js:379` | `cssPath` stops at six levels and never tests the result, so elements in repeated structures share one selector. | browser run | S |
+| PI20 | `content/picker.js:286` | The highlight is drawn under anything in the top layer, such as a modal dialog. | browser run | S |
+| SP8 | `content/picker.js:559` | The picker acts on untrusted events, so a page script can force a pick or a cancel while Element is armed. | browser run | S |
+| PI3 | `content/collector-main.js:464` | The secret test is an unanchored substring match: `className` (contains "ssn") is always redacted, while `pwd`, `pin` and `otp` pass. | Node run | S |
+| PI11 | `shared/prompt-template.js:532` | `generatedId()` knows only the older `useId` shape, so React 19.1 and 19.2 ids and dashed UUIDs are offered as search targets. | run and reading | S |
+| PI16 | `content/collector-main.js:898` | Three handler heuristics misfire: minified bodies pass the four letter test, string literals are cut at `//`, and "bound X" is offered as a search target. | run and reading | S |
+| PI17 | `README.md:253` | The README's React sample shows a class hint the picker cannot produce, and `tools/preview-prompt.mjs:214` says frames are resolved through a source map that nothing applies. | run and reading | S |
+| PI21 | `content/collector-main.js:680` | When "XProvider" is folded into "X", the inner provider's props are printed as the props of X. | Node run | S |
+| PJ8 | `shared/prompt-template.js:565` | `styleFile()` only matches backticked tokens and the one producer writes none, so the stylesheet never reaches the Search line. | Node run | S |
+| SP7 | `background.js:130` | The worker runs panel only messages for any sender, and the panel adopts any `cdrReport` written to `storage.local`, which content script contexts can write by default. | run and reading | S |
+| SP10 | `sidepanel/panel.js:709` | Nothing distinguishes an incognito tab, so with incognito access enabled a capture there is written to shared storage and Downloads. | run and reading | S |
+| SP11 | `docs/ARCHITECTURE.md:275` | The statement that `activeTab` is not granted to side panel contexts is absent from Chrome's documentation (Chromium's source supports it for the toolbar icon path only). | Chrome docs | S |
+| SP12 | `manifest.json:3` | A Web Store submission would need a standalone privacy policy, data use disclosures and a line saying the extension is not affiliated with Anthropic. Not a defect while distribution stays on GitHub (`README.md:324`). | Chrome docs | M |
+| PJ5 | `shared/prompt-template.js:648` | No sentence marks page content as data, and flattened page strings print on the template's own lines ("Search for", "Props of"). | run and reading | S |
+| PJ9 | `shared/prompt-template.js:776` | "across N pages" counts raw URLs while the Page lines compare printed URLs, so two that print identically are announced as 2 pages. | run and reading | S |
+| PJ10 | `shared/prompt-template.js:194` | Times print in the machine's locale, with no zone and an ambiguous day and month order. | Node run | S |
+| PJ13 | `shared/prompt-template.js:244` | An empty status text (every HTTP/2 response) leaves two spaces in the request line. | run and reading | S |
+| PJ15 | `shared/prompt-template.js:186` | Malformed report fields print "undefined" or throw; not reachable from an ordinary page, reachable through a forged bridge reply (CO11). | run and reading | S |
+| PJ17 | `shared/prompt-template.js:117` | The change closing gives the console and network evidence no role, and the bug closing names the console even when none is printed. | Node run | S |
+| PJ18 | `shared/prompt-template.js:824` | In a list the shared block is headed "## Page" at the level of the items and reads as one more item; its viewport is the tab's at copy time. | run and reading | M |
+| SP2 | `shared/prompt-template.js:785` | The page title and computed style values skip `flatten()`, so they keep backticks and unlimited length. | run and reading | S |
+| TR2 | `tools/build.mjs:185` | The build validates manifest paths only: a syntax error, a mistyped injected script path, a missing `panel.css` or a broken import all build clean. | Node run | M |
+| TR3 | `CONTRIBUTING.md:87` | The byte for byte rule has no stored baseline and no check, and the one item output already changed at `1d96cdb`. | Node run | M |
+| TR4 | `.github/workflows/release.yml:15` | A manual run from `main` always fails the tag check. | run and reading | S |
+| TR5 | `.github/workflows/release.yml:60` | The reproducible checksum holds only for a Node with bundled zlib and an LF checkout. | Node run | S |
+| TR6 | `tools/build.mjs:145` | The build zips whatever is on disk inside the included folders, so untracked files ship in a local build. | Node run | S |
+| TR7 | `.github/workflows/release.yml:33` | Nothing reads `package.json`'s version, and 0.4.0 already covers two trees that differ at runtime (`9ded3b5` and `dfe2c89`). | Node run | S |
+| TR8 | `tools/chrome-shim.js:27` | The shim's download ids reset when the panel frame reloads while stored items keep theirs (stage only). | browser run | S |
+| TR9 | `docs/ARCHITECTURE.md:297` | The list of what the stage does not reproduce is short by at least eight items. | run and reading | S |
+| TR10 | `tools/make-media.mjs:5` | Three setup notes in the media scripts are wrong. | run and reading | S |
+| TR11 | `README.md:330` | The GitHub repository's description and homepage still describe the project under its old name. | run and reading | S |
+| PJ12 | `tools/preview-prompt.mjs:137` | The four preview modes leave many template branches unrendered (Vue, two origins, FAILED requests, truncated markup, the single item caution). | Node run | M |
+| TR12 | `content/collector-bridge.js:62` | Fields collected and stored but never read (listed under the feature inventory). | reading | S |
+| TR13 | `background.js:10` | Small document mismatches; the protocol header in `background.js` omits `cdr:check-tab` and `cdr:armed`. | run and reading | S |
+| M11 | `tools/build.mjs:32` | The release zip contains no LICENSE and no shipped file carries the MIT notice. | run, single pass | S |
+| UX4 | `sidepanel/panel.js:360` | Every tab event clears the one shared banner, erasing the only explanation of a disabled Copy button. | run and reading | M |
+| UX7 | `sidepanel/panel.js:637` | Clicking a row leaves focus on the row, so typing a correction costs a second click. | browser run | S |
+| UX8 | `sidepanel/panel.js:851` | After a partial copy the leftover rows stay unticked while new captures arrive ticked. | browser run | S |
+| UX9 | `sidepanel/panel.js:1131` | The Copied receipt is hidden only by Discard all, so it sits under the next sheet. | browser run | S |
+| UX11 | `sidepanel/panel.html:36` | The shortcut hint is hardcoded and never asks `chrome.commands` what is bound; the copy shortcut is shown nowhere. | Chrome docs | S |
+| UX12 | `sidepanel/panel.css:29` | Three text contrast failures against WCAG AA: muted text on the sunken surface (4.39:1), the placeholder (3.38:1 light), unticked rows (2.96:1 light). | Node run | S |
+| UX13 | `sidepanel/panel.js:202` | Armed buttons and "Read prompt" expose no pressed or expanded state, and the row tooltip cannot be hovered or dismissed with Esc. | browser run | S |
+| UX15 | `sidepanel/panel.html:133` | Loose labels: the gauge reports device pixels while the page readouts report CSS pixels, and "collector" appears once in a UI that otherwise says "log". | run and reading | S |
+| UX16 | `sidepanel/panel.html:91` | Dead markup is limited to one unused id, one default text never shown and one empty count element. | Node run | S |
+
+### Refuted, and not settled
+
+* **CW8, refuted.** The claim was that an arm landing between navigation start and commit leaves
+  the armed state stale. Chrome reports `status: 'loading'` at commit, not at navigation start, so
+  the state is cleared with the outgoing document (`background.js:176`). Observed with the
+  extension copy in Chrome.
+* **UX5, not settled.** After a region or element capture the panel calls
+  `el.description.focus()` (`sidepanel/panel.js:731`). Whether that takes keyboard focus away from
+  the page the user just dragged on, in a panel that was already open, could not be run here: on
+  the stage both frames share one page, and scripted input bypasses real window focus. To settle
+  it: in current Chrome with the panel open, click Region, drag, and type at once. If the
+  characters do not land in the field, this is medium.
+
+## The prompt, read as the session that receives it
+
+All four previews were rendered (`npm run prompt`, `change`, `mixed`, `minified`) and read as a
+Claude Code session that must act in a codebase it has never seen.
+
+**What works.** Numbered items with a closing that asks for each change to be attributed. The
+"Search for" line, which is the most useful line in the element section. Caller frames under a
+failed request. The structure also held: `fence()` and `flatten()` stopped page text from opening a
+section in every hostile input tried.
+
+**What is missing.**
+
+* Which item an error belongs to, and when it happened. Nothing is dated (PJ1).
+* What the server said. A failed request prints a status line and no body
+  (`content/collector-main.js:295`), under a closing that asks for the root cause.
+* The origin and port. `pathOf` strips the origin everywhere (`shared/prompt-template.js:707`), a
+  documented choice. In the README's real run the origin survives only inside a stack frame
+  (`README.md:201`). A session with browser tools cannot open `/checkout`, and localhost against
+  staging is itself evidence.
+* Why a section is absent. Toggle off, no collector, and nothing logged all print the same nothing
+  (`shared/prompt-template.js:894`).
+* What to do when the screenshot path cannot be opened (lead 6).
+* The viewport at capture. The Page viewport is the tab's at copy time
+  (`content/collector-bridge.js:55`).
+
+**What costs characters for little gain** (measured on the real output).
+
+* One item bug preview, 2,059 characters: Selected element 903 (44 percent), Console 311, Network
+  265, Screenshot 168, closing 156, Page 118.
+* Mixed preview, 3,352 characters: closing 571 plus preamble 214, together 23 percent.
+* Minified preview, 2,013 characters: the two lines explaining the renamed component are 182 and
+  178 characters, 18 percent, and "React DevTools shows the same name" is addressed to a person.
+* The README's real run, 2,559 characters: the computed styles line is 364 characters (14 percent)
+  on an input in a request about validation (`README.md:185`).
+* The markup fence repeats the class, test id and label already printed on the Search, Classes and
+  Selector lines.
+
+The styles list is documented as tunable, so this is a cost argument and not a defect.
+
+**What could mislead.** The false "defined elsewhere" (PI2). A change request that ships a
+TypeError and a 500 with no instruction about them, so the model either fixes the bug unasked or
+ignores a defect in the field it is changing (PJ17). "## Page" at the level of the items (PJ18).
+Evidence from an earlier route under the current page's heading (CO3).
+
+## Improvements to current features
+
+Ranked by impact against effort. None of these adds a permission or changes the install warning.
+Where one breaks a project rule, the entry says so.
+
+| # | Improvement | Effort | Impact | Closes |
+| :--- | :--- | :--- | :--- | :--- |
+| 1 | Publish 0.4.0 and stop version bumps going untagged | S | high | TR1, TR4, TR7, TR11 |
+| 2 | Count only real failures as failed requests | S | high | CO1, CO2 |
+| 3 | Take the extension out of the DevTools console | S | high | CO6 |
+| 4 | Make cancel and Screen behave while armed | S | high | CW5, CW1, CW12 |
+| 5 | Keep the prompt honest when the context read fails or is stale | S | high | RO4, RO5, RO1, RO2, RO3 |
+| 6 | Tests and CI that enforce the project's own rules | M | high | TR3, TR2, PJ12, lead 5 |
+| 7 | Redact secrets where they are read | M | high | PI1, SP1, PJ6, CO13, PI3 |
+| 8 | Console and network sections in time order, folded and counted | M | high | PJ1, PJ7, CO3, M2, M8, CO8 |
+| 9 | Arm the collector on a tab that has none | M | high | cause of RO4 |
+| 10 | Picker: swallow pointer events, pick disabled controls | S to M | med | PI4, PI5, PI12 |
+| 11 | Element section correctness | S | med | PI2, PI8, PI13, PI9, PI11, PI16 |
+| 12 | Banner that stays visible, is announced, and explains a disabled Copy | S | med | UX3, UX4, M12, SS7 |
+| 13 | Correct the README restriction recipe and privacy text | S | med | SP3, SP11, TR9, TR13, PI17 |
+| 14 | Cross window: require real focus, then merge per item | S, then M | med | SS1, SS4, SS5, SS3, SS12 |
+| 15 | Check a download id still names the item's file | S | med | RO6, RO7 |
+| 16 | Crop through the visual viewport | S | med | CW2 |
+| 17 | Undo for discards, and move Discard all | M | med | UX2, RO9 |
+| 18 | Deeper stack capture that skips known library frames | S | med | CO4, CO10 |
+| 19 | Mount the overlay and picker above the top layer | M | med | CW3, PI20, M1 |
+| 20 | Shield iframes while picking | M | med | PI6 |
+| 21 | Say which lines are page data, and stop trusting the bridge reply | S | low to med | PJ5, SP2, CO11, SP7, PJ15 |
+| 22 | Disclose the hover state; read props from the current fiber | S to M | med | PI10, M5 |
+| 23 | Sheet frictions and accessibility | S | low to med | UX7, UX8, UX9, UX11, UX12, UX13, SS6 |
+| 24 | Cleanup | S | low | TR12, SS11, PI15, UX16, CW6, SS9, CW9, M11, TR6, M3, PJ10, CO7 |
+
+**1. Publish 0.4.0 and stop version bumps going untagged.**
+Tag HEAD as `v0.4.0` and push; the workflow's check passes and publishes
+`claude-punch-list-v0.4.0.zip`. Then make it self healing: a job on push to `main` that creates the
+release when no tag exists for the manifest version, which also replaces the dispatch path that
+cannot succeed. Update the repository description and homepage. Files:
+`.github/workflows/release.yml`. Risk: none.
+
+**2. Count only real failures as failed requests.**
+Test `response.status >= 400` in the fetch wrapper, matching the XHR branch and the README. Tag a
+rejection as aborted (the request's signal is aborted) or timeout (XHR `timeout` event) and have
+the template print ABORTED or TIMEOUT for tagged entries, listed after real failures. Files:
+`content/collector-main.js`, `shared/prompt-template.js`. Risk: this code runs on every page, so
+the additions stay inside the existing `try` blocks. Dropping aborts entirely would hide a request
+the page cancels by mistake, so label them. Rule: none, provided the template changes output only
+for entries that carry the new tag.
+
+**3. Take the extension out of the DevTools console.**
+Append one static line to `content/collector-main.js`: an inline `data:` source map with a single
+mapping and `ignoreList: [0]`. On a scratch copy DevTools then linked the page's own file and line.
+Document the manual "Add script to ignore list" fallback. Files: `content/collector-main.js`,
+`README.md`. Risk: observed in Chrome for Testing 156, so confirm on current stable. Rule: none;
+the line is static, so there is still no build step. It does not change what the page's CSP
+reports say (M4).
+
+**4. Make cancel and Screen behave while armed.**
+In the panel's `keydown` listener, Escape with a mode armed does what clicking the lit button does
+(`sidepanel/panel.js:882`). In `captureVisible`, disarm and wait two frames before capturing, and
+add an in flight guard. Files: `sidepanel/panel.js`, `background.js`. Risk: low.
+
+**5. Keep the prompt honest when the context read fails or is stale.**
+Fall back to the newest item's own URL and title when no context was read. Race the read in
+`copyReport` against about 1.5 seconds and copy without context if it loses, saying so in the
+receipt. Clear `state.context` in the early return at `sidepanel/panel.js:936` and ignore a reply
+whose tab is no longer current. Pass `armedAt` through and print a caution when it is later than an
+item's capture time. Files: `sidepanel/panel.js`, `shared/prompt-template.js`. Rule: one item
+output changes only in cases that today print no page at all, or after a reload.
+
+**6. Tests and CI that enforce the project's own rules.**
+A `test/` folder run by `node --test`: golden files for the four previews plus the branches no
+preview reaches; the collector in `node:vm`; a compile of `overlay.js` and `picker.js` concatenated
+with themselves, which fails on any top level `const`, `let` or `class`; parse checks; existence
+checks for the injected script paths, `panel.html` references and imports; manifest and package
+version agreement. Add a workflow on push and pull request, and run the tests before the release
+build. Files: `test/`, `package.json`, `tools/build.mjs`, `.github/workflows/ci.yml`,
+`CONTRIBUTING.md`. Risk: goldens need a pinned locale or a locale independent `stamp()` (PJ10).
+Rule: none. `node:test` ships with Node (experimental through the 18 line, stable from 20, and the
+workflow already uses Node 20), and nothing under `test/` is packaged. It also means rewording
+`CONTRIBUTING.md:87`, whose named baseline has been false since `1d96cdb`.
+
+**7. Redact secrets where they are read.**
+In `picker.js`, blank the value of password and hidden inputs and of any control or attribute
+whose name matches the secret list, in both `attributes()` and the serialised markup. Match secret
+words on word boundaries so `className` stops being redacted and `pwd`, `pin`, `otp` and `cvc` start
+being. One helper in the template that strips credentials and masks query and fragment values
+whose key matches, used wherever a URL prints. Test object keys inside `serialize()`. Files:
+`content/picker.js`, `content/collector-main.js`, `shared/prompt-template.js`, `README.md`. Risk: a
+false positive can hide an id that matters to the bug. Rule: none; the previews contain nothing
+that would be masked. It is a name match and not a guarantee, which the README should keep saying.
+
+**8. Console and network sections in time order, folded and counted.**
+Merge errors and console lines by `t` and prefix a clock derived from `armedAt`. Fold consecutive
+identical entries into one line with a count. Have `push()` count evictions and print "last 30, N
+earlier dropped". Give warnings their own ring. Take frames from the lines that start with "at",
+not from fixed positions. Files: `content/collector-main.js`, `shared/prompt-template.js`,
+`sidepanel/panel.js`, `tools/preview-prompt.mjs`. Rule: **breaks the byte for byte rule.** Lines
+19 to 23 of the default preview reorder and gain a clock. Worth doing once, on purpose, with the
+goldens from item 6 updated in the same commit.
+
+**9. Arm the collector on a tab that has none.**
+When `cdr:get-context` finds no receiver, inject `collector-main.js` (world MAIN) and
+`collector-bridge.js` with `chrome.scripting.executeScript`, and show "collecting from now". Today
+the only advice is to reload (`sidepanel/panel.js:953`), which destroys the state the user was
+about to capture. Files: `sidepanel/panel.js`, `background.js`, `content/collector-bridge.js`.
+Risk: a late wrap misses everything before injection and any request made through a reference the
+page saved earlier; after an extension reload the old bridge's guard may block the new one, which
+needs a check in Chrome. Permission: none new; `scripting` and `<all_urls>` are already declared.
+
+**10. Picker: swallow pointer events, pick disabled controls.**
+Add capture phase listeners for `pointerdown`, `pointerup`, `auxclick` and `contextmenu`; commit
+the pick from `pointerup`, which Chrome still dispatches on disabled controls; resolve the node at
+click time; keep swallowing briefly after the pick. Files: `content/picker.js`. Rule: additions
+must stay inside `createController`, since the file is injected repeatedly.
+
+**11. Element section correctness.**
+Keep the selector's own segment by bounding it in `cssPath` from the left. Send the owner even
+when it equals the component and print "inside X" in that case. Rebuild the opening tag from
+attributes with the 120 character cap `attributes()` already uses. Mark a call site that came from
+`_debugStack` and stop printing its line as exact. Teach `generatedId()` the React 19 shapes. Drop
+"bound " from handler names. Files: `content/picker.js`, `content/collector-main.js`,
+`shared/prompt-template.js`. Rule: the PI2 and PI9 changes alter one item output for React picks.
+That is a correction of a wrong sentence, and should land with updated goldens.
+
+**12. Banner that stays visible, is announced, and explains a disabled Copy.**
+`role="status"` on the banner and the receipt (`role="alert"` for errors), `position: sticky` on
+`.notice`, a one line reason under the Copy button computed in `updateSubmitState`, and
+`resolveTab` clearing only a banner it set. Scroll the list, not the document, when a row is
+selected. Files: `sidepanel/panel.html`, `sidepanel/panel.css`, `sidepanel/panel.js`.
+
+**13. Correct the README restriction recipe and privacy text.**
+Tell the reader to narrow only the two `content_scripts` matches and leave `host_permissions`
+alone. Replace the "one thing here" sentence with a list of what is and is not screened. Fix the
+`activeTab` wording in `docs/ARCHITECTURE.md:275`. Files: `README.md`, `docs/ARCHITECTURE.md`.
+
+**14. Cross window: require real focus, then merge per item.**
+First add `document.hasFocus()` to the guard at `sidepanel/panel.js:1261`. Then, if two windows
+matter, give each item an `editedAt` and the report a short list of removed ids, and merge in
+`adoptStored` instead of replacing. Files: `sidepanel/panel.js`, `docs/ARCHITECTURE.md`.
+
+**15. Check a download id still names the item's file.**
+Before `removeFile` or `erase`, and before trusting `exists`, search the id and require
+`record.filename === item.path`. Check files again at copy time. Files: `sidepanel/panel.js`.
+
+**16. Crop through the visual viewport.**
+Send `visualViewport` offset and scale with the rectangle and apply them in `cropCapture`.
+Identical to today at scale 1. Files: `content/overlay.js`, `content/picker.js`,
+`sidepanel/panel.js`.
+
+**17. Undo for discards, and move Discard all.**
+Hold discarded items in memory for a few seconds behind an Undo and call `deleteFile` when it
+lapses; flush on `pagehide`. Move Discard all out of the footer row it shares with "Clear
+collected log". Files: `sidepanel/panel.js`, `sidepanel/panel.html`, `sidepanel/panel.css`. Rule:
+the documented behaviour (a discarded item's file is deleted) still holds, a few seconds later.
+
+**18. Deeper stack capture that skips known library frames.**
+Raise `STACK_CAPTURE_DEPTH` from 6 to about 30, keep three reported frames, skip frames by well
+known library function names, and format the stack only when the request failed. Files:
+`content/collector-main.js`, `docs/ARCHITECTURE.md`. Risk: about a microsecond more per request.
+
+**19. Mount the overlay and picker above the top layer.**
+Append the host to the topmost `:modal` element when one exists; for popovers that are not modal,
+give the host `popover="manual"` and call `showPopover()`. Files: `content/overlay.js`,
+`content/picker.js`.
+
+**20. Shield iframes while picking.**
+Place a transparent rectangle over each visible iframe inside the picker's shadow root so the
+frame is picked as a whole and clicks cannot leak. Say so in the README. Files:
+`content/picker.js`. Full frame support is a separate, larger job: it needs `allFrames` injection,
+the parent's offset for the crop, and the collector in every frame.
+
+**21. Say which lines are page data, and stop trusting the bridge reply.**
+Rebuild the snapshot in the bridge from known fields (three arrays capped at 30, strings sliced),
+as `picker.js` already does for the inspect reply. Pass the title and style values through
+`flatten()`. Call `chrome.storage.local.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' })`.
+Optionally add one sentence above the evidence saying it was read from the page and is data, not
+instructions. Files: `content/collector-bridge.js`, `shared/prompt-template.js`, `background.js`.
+Rule: the optional sentence **breaks the byte for byte rule** (one added line in every report with
+evidence). The threat is real in principle, since page text flows into a prompt for a tool with
+shell access, but for a developer on their own app it is low. If it is done, do it in the same
+golden update as item 8.
+
+**22. Disclose the hover state; read props from the current fiber.**
+Cheapest: have the template say styles were read while hovered. Better: raise a transparent
+catcher after the click and wait until the element no longer matches `:hover`. For props, prefer
+the fiber on the current tree over its alternate. Files: `content/picker.js`,
+`content/collector-main.js`, `shared/prompt-template.js`.
+
+**23. Sheet frictions and accessibility.**
+Focus the field after a pointer click on a row. Tick what remains after a partial copy. Retire the
+receipt when the next item is added. Read the bound shortcut from `chrome.commands.getAll()`. Fix
+the three contrast values. Add `aria-pressed` and `aria-expanded`. Number the prompt as the sheet
+does. Files: `sidepanel/panel.js`, `sidepanel/panel.html`, `sidepanel/panel.css`.
+
+**24. Cleanup.**
+Remove the fields nothing reads, match the Web Store by hostname, give `restore()` a failure path,
+add LICENSE to the zip, build from tracked files, read `currentSrc` and `href.baseVal` for failed
+resources, truncate the uncapped strings.
+
+## New feature proposals
+
+Ranked the same way. Each comes from a gap found in the code. None adds a permission.
+
+| # | Feature | Effort | Impact | From |
+| :--- | :--- | :--- | :--- | :--- |
+| 1 | Evidence that belongs to each item and survives a reload | M to L | high | lead 1 |
+| 2 | The server's answer for a failed request | M | high | prompt review |
+| 3 | Commands for Element, Screen and opening the panel | M | high | lead 7 |
+| 4 | Review before copy, with size and a secret scan | M | med to high | PI1, PJ6 |
+| 5 | Path mapping for WSL, devcontainers and remote sessions | M | med | lead 6 |
+| 6 | Delayed whole screen capture | S | med | lead 7 |
+| 7 | Svelte, Vue 3 production handlers, Vue 2 | S each | med | leads 3 and 8 |
+| 8 | CSP violations, and failed stylesheet images and fonts | S each | med | lead 2 |
+| 9 | Clean up old screenshots | M | med | lead 6 |
+| 10 | Keep the last copied prompt across a panel close | S to M | med | UX9, RO9 |
+| 11 | Reorder the sheet | M | med | lead 8 |
+| 12 | Pick inside shadow roots | L | med | lead 3 |
+| 13 | Collector switch per site | L | med | CO6, CO14, SP3 |
+| 14 | Keyboard operable picker with parent and child stepping | M to L | med | UX14 |
+| 15 | Component name in the hover tag | M | low to med | lead 8 |
+| 16 | Annotate a capture | L | med | lead 8 |
+| 17 | Capture at full page width with the panel closed | L | low to med | CW4 |
+| 18 | Full page capture | L | low | lead 8 |
+
+**1. Evidence that belongs to each item and survives a reload.**
+`addItem` already reads the context right after each capture and keeps nothing
+(`sidepanel/panel.js:729`). Step one (M): store two numbers on the item from that read, `armedAt`
+and the highest `t` seen, and have the list layout print under each item the entries logged since
+the previous capture. If `armedAt` no longer matches at copy time, say that item's console was
+lost to a reload. Step two (L): keep a capped copy of each item's entries so they survive the
+reload. Files: `sidepanel/panel.js`, `shared/prompt-template.js`, later
+`content/collector-main.js` and `content/collector-bridge.js`. Risk: storage. One snapshot at
+every limit measured 101 KB against a 10 MB quota, and the limits do not actually bound it (a
+1 MB resource URL produced a 1 MB entry, CO7), so the stored copy needs its own cap and its own
+storage key; `cdrReport` is rewritten on every keystroke (`sidepanel/panel.js:1454`). Console text
+from pages the user has left would sit on disk for up to a week, which belongs in the README
+privacy section. Rule: none if the one item layout keeps its single console and network sections.
+
+**2. The server's answer for a failed request.**
+For a response with status 400 or above, read the first few hundred characters of a JSON or text
+body, and keep the start of a string request body, printed as indented lines inside the fence with
+the same secret redaction. A 500's body is usually the server's own statement of the cause. Files:
+`content/collector-main.js`, `shared/prompt-template.js`, `sidepanel/panel.js`,
+`sidepanel/panel.html`. Risk: this is the riskiest change one can make to the collector. In a
+browser run, `response.clone()` on a 48 MB error body the page never read made Chrome pull all
+48 MB into memory however the copy was consumed, so the size must be decided before cloning, from
+`Content-Length` and the content type. The body also arrives after the entry is recorded, so a
+copy pressed at once can miss it. Bodies can hold personal data, so it wants its own toggle, off
+by default. Rule: no request is made, so "no network requests" holds. "Never break a host page" is
+the rule to test hardest, which is a reason to do item 6 of the improvements first.
+
+**3. Commands for Element, Screen and opening the panel.**
+Declare `capture-element`, `capture-screen` and `_execute_action` (three more suggested keys,
+reaching Chrome's limit of four). Element arms like Region does. Screen needs a pending flag the
+panel collects from the `cdr:check-tab` reply, because the capture runs in the panel and the panel
+may not exist yet when the command fires. Files: `manifest.json`, `background.js`,
+`sidepanel/panel.js`, `README.md`. Risk: a suggested key that collides with another extension
+silently does not register, so the hint must come from `chrome.commands.getAll()`. That
+`_execute_action` opens the panel under `openPanelOnActionClick` is shown by Chrome's own sample
+but was not observed here, and it is a toggle: a second press closes the panel.
+
+**4. Review before copy, with size and a secret scan.**
+"Read prompt" lives inside the receipt, which stays hidden until a copy has happened
+(`sidepanel/panel.html:148`), so the first chance to read what was sent comes after it is on the
+clipboard. Show the assembled prompt before the first copy with its size and a count of token
+shaped strings, with a switch to mask them. Files: `sidepanel/panel.html`, `sidepanel/panel.js`,
+`sidepanel/panel.css`. Risk: a false positive masks an id that matters. Apply the mask after
+`buildPrompt` so an unmasked one item report is unchanged.
+
+**5. Path mapping for WSL, devcontainers and remote sessions.**
+One optional setting, "Claude Code sees this folder as", holding a from prefix and a to prefix,
+applied in `assembleReport` where `screenshotPath` is set. Files: `sidepanel/panel.js`,
+`sidepanel/panel.html`, `README.md`. Risk: the folder must really be mounted on the other side,
+which the extension cannot check. With the setting empty the output is unchanged. Also worth one
+sentence in the template for a path that cannot be opened.
+
+**6. Delayed whole screen capture.**
+A three second countdown on Screen. Clicking the button moves the pointer and focus off the page,
+so a hover state or an open menu cannot be photographed today. Files: `sidepanel/panel.js`,
+`sidepanel/panel.html`.
+
+**7. Svelte, Vue 3 production handlers, Vue 2.**
+Svelte development builds attach `__svelte_meta` with file, line and column in both Svelte 4 and 5
+(read from source; the shapes differ). Vue 3 stores its event invokers on the element under a
+`_vei` key (a symbol from 3.3) in production builds too, so handler names are readable where
+`content/collector-main.js:995` says a production build yields nothing. Vue 2 hangs its instance
+off `__vue__`. Files: `content/collector-main.js`, `content/picker.js`,
+`shared/prompt-template.js`. Risk: all are internals, so read them defensively and add a fixture
+each. The `framework` field is a two way switch in three places and must become a real value.
+Neither was run against a real build.
+
+**8. CSP violations, and failed stylesheet images and fonts.**
+A passive `securitypolicyviolation` listener (confirmed to receive violations from a main world
+script at `document_start`) and a `PerformanceObserver` for resource entries with a status of 400
+or more. Both observe and wrap nothing, so neither can break a page. Files:
+`content/collector-main.js`, `shared/prompt-template.js`. Risk: noisy policies could fill the ring
+without the folding from improvement 8; `responseStatus` is 0 for cross origin resources without
+CORS.
+
+**9. Clean up old screenshots.**
+A footer action that lists this extension's own downloads in the save folder, excludes anything on
+the sheet, shows a count, and removes files older than the report lifetime. Files:
+`sidepanel/panel.js`, `sidepanel/panel.html`. Risk: deleting a screenshot a Claude Code session
+still needs, hence the age threshold. Files whose history rows were cleared cannot be found.
+
+**10. Keep the last copied prompt across a panel close.**
+The prompt lives only in `state.lastPrompt` (`sidepanel/panel.js:1119`). An overwritten clipboard
+plus a closed panel loses every sentence. Persist it under its own key for a short time, and add
+"Put back on the sheet" to the receipt. Files: `sidepanel/panel.js`.
+
+**11. Reorder the sheet.**
+See lead 8. An array move plus `persist()`, with care for items still saving and for the three
+places that read "last" as "newest" (`sidepanel/panel.js:852`, `sidepanel/panel.js:1120`,
+`sidepanel/panel.js:1284`). A reorder would sync across windows for free and inherit SS4.
+
+**12. Pick inside shadow roots.**
+Descend through open roots with `shadowRoot.elementFromPoint`; `chrome.dom.openOrClosedShadowRoot`
+is callable from a content script with no extra permission, so closed roots are reachable too.
+Print the selector as host path plus inner path, and hand the node to the main world with a
+composed event, since `document.querySelector` cannot reach inside. Files: `content/picker.js`,
+`content/collector-main.js`.
+
+**13. Collector switch per site.**
+Replace the two static `content_scripts` entries with `chrome.scripting.registerContentScripts`
+driven by a stored origin list (default localhost) and a "collect on this site" switch. This
+shrinks every cost that scales with `<all_urls>`: the DevTools attribution, the per request
+overhead, the fingerprint, and the reach of any defect in a wrapper. Files: `manifest.json`,
+`background.js`, `sidepanel/panel.js`, `sidepanel/panel.html`, `README.md`. Cost: it gives up
+"collected from page load without being asked" (`README.md:74`) on the first visit to a new
+origin, which is a product decision more than a fix. The install warning does not shrink while
+`host_permissions` stays. Combine with improvement 9 so first use needs no reload.
+
+**14. Keyboard operable picker with parent and child stepping.**
+Arrow keys to widen to a parent or narrow to a child, Enter to pick. Useful with a mouse too, when
+the element wanted is covered by a child. Files: `content/picker.js`, `sidepanel/panel.js`.
+
+**15. Component name in the hover tag.**
+See lead 8. Use an event based handoff so hovering does not write attributes onto the page.
+
+**16. Annotate a capture.**
+See lead 8. It has to run before the save, while the full image still exists.
+
+**17. Capture at full page width with the panel closed.**
+Opening the panel narrows the page, so a layout bug that exists only at full width cannot be
+captured. Letting the worker capture goes against the stated decision that the worker stays thin
+(`docs/ARCHITECTURE.md:82`), and the worker would hold a large image it loses if evicted. Worth it
+only if full width capture turns out to matter.
+
+**18. Full page capture.**
+`CONTRIBUTING.md:109` calls it out of scope and `README.md:559` calls it roadmap. One of the two
+should change. The README's own list of obstacles is accurate.
+
+## Top 5 to do next
+
+1. **Tag and publish v0.4.0** (improvement 1). Ten minutes, and it repairs an install path that
+   today hands people a different product.
+2. **Add the test suite and CI** (improvement 6). Everything after this touches the template or
+   the collector, the two files the project's rules protect, and nothing enforces those rules
+   today.
+3. **Ship the small fixes that make ordinary output wrong** (improvements 2 to 5): real failures
+   only, the DevTools attribution, Esc and Screen while armed, and an honest prompt when the
+   context read fails. All small, all in ordinary use.
+4. **Redact secrets and correct the privacy and restriction text** (improvements 7 and 13). The
+   README currently promises more than the code does, and one of its recipes breaks capture.
+5. **Tie evidence to items and put it in time order** (feature 1, step one, with improvement 8).
+   This is the largest gain in what the pasted prompt is worth to Claude Code, and it is where the
+   byte for byte rule gets changed once, on purpose, with goldens to show exactly how.
+
+Items 2 and 3 can swap if visible fixes should come first: the `panel.js` parts of item 3 touch no
+file the rules cover.
+
+## Not verified in real Chrome
+
+Stated here so nothing above reads as more certain than it is.
+
+* No run used a visible side panel. Focus behaviour between the page and the panel (CW5, UX5)
+  rests on the stage and on reading.
+* The fullscreen half of CW3, and whether `_execute_action` opens the panel, come from
+  documentation and Chrome's samples.
+* The cross window races (SS4, SS5) reproduce with artificial delays of 5 to 40 ms; the real gap
+  in Chrome was not measured. SS3 was run against a fake storage.
+* SP3 was not run with an edited manifest; it rests on the tabs reference and Chromium's source.
+* PI9 was observed on React 19.2.0 from a CDN build; the size of the drift under Vite or Next was
+  not measured.
+* The Vue `_vei` and Svelte `__svelte_meta` claims were read from each project's source, not run.
+* Whether tamper or bot checks on real sites react to the wrapped natives (CO14) was not tested.
+* How a model actually behaves on the noisier prompts (PJ17, PJ18) is a reading of the output, not
+  an experiment. Settling it means running the previews through Claude Code against a fixture
+  repository.
+
+## Implemented after the review
+
+Items 2 and 3 of the top 5, on 2026-11-16, uncommitted on `main` at the time of writing. Line
+references from here on point at that working tree.
+
+**Tests and CI (improvement 6).** `npm test` runs `node:test` with no dependency: goldens for the
+prompt in `test/golden/` (the one item cases equal to the `a0c9335` output byte for byte), the real
+collector in a `node:vm` realm against a fake XMLHttpRequest that behaves as Chrome 156 was observed
+to, and static checks on every path the manifest, the worker and the panel name.
+`.github/workflows/ci.yml` runs it on Node 20 and 24, and `release.yml` runs it before building.
+
+**Small fixes (improvements 2 to 5).**
+
+* CO1, CO2: only a status of 400 or above, or no response at all, is recorded. A request the page
+  ended itself is labelled `ABORTED by the page` or `TIMEOUT set by the page` and printed after the
+  real failures.
+* CO6: an inline source map puts the collector on DevTools' ignore list, so console and network
+  entries link to the page's own code again.
+* CW1, CW5, CW12: Esc in the panel cancels an armed mode, Screen cancels it before photographing,
+  and a double click on Screen files one item.
+* RO1, RO2, RO4, RO5: the context read is bounded at 2 s and its failure is printed as such instead
+  of as a clean page; a read from an earlier tab is never reused; the reload caution names the items
+  it applies to.
+
+**Found and fixed while verifying those.**
+
+* The XHR wrapper keeps one record per `open()`, and credits late events to the request they
+  belong to when a page reopens or aborts the object from its own handlers (retries, long polls,
+  nested cases, synchronous retries). A synchronous network failure, which fires no event, is
+  recorded. A refused `open()` or `send()` leaves the bookkeeping and the request's clock alone,
+  `open('GET')` throws as it does natively, and the collector's timer and listeners are the ones
+  the page had at `document_start`, so zone.js does not see them.
+* Ordering an arm against the disarm that cancels it moved into the worker, under one rule: a
+  disarm cancels every arm asked for on that tab before it, and an arm asked for after it stands
+  (`docs/ARCHITECTURE.md`, "The worker orders an arm and the disarm that cancels it").
+* A Screen capture waits for the cancel on its own tab, including the one sent on leaving the tab,
+  and when a busy page outlasts the 3 s bound the item carries a notice that the overlay may show.
+* `resolveTab` ignores a reply that a newer call has overtaken.
+
+**How it was checked.** Six rounds in headless Chrome for Testing 156.0.8078.4, from the fourth on
+with the real unpacked extension (the panel run as a tab, the shortcut stood in for by a `cdr:arm`
+with no id), each followed by an adversarial review and skeptics on its findings. The last round
+passed 46 scenario checks and its review found nothing new to that round. A real side panel, the
+real Alt+Shift+C command and headed Chrome were never used.
+
+## Found while implementing, not fixed
+
+All of these also exist at `a0c9335`, in the same or a worse form. None is new in the working tree.
+
+| Id | Where | What | Fix |
+| :--- | :--- | :--- | :--- |
+| F1 | `sidepanel/panel.js:1679`, `background.js:252` | Chrome fires `tabs.onUpdated` with status `loading` for same document navigations (`pushState`, `replaceState`, a hash change). Panel and worker drop the armed state while the overlay stays live, so Esc in the panel is ignored and Screen photographs the overlay with no notice. Medium. | M: have the capture scripts report their own teardown on `pagehide` instead of inferring it from `loading`. |
+| F2 | `sidepanel/panel.js:750` | A mode click or the shortcut while Screen waits on its cancel: `addItem` turns the new arm's button off, and a stop the worker skipped (a later arm stands) reads as a repaint, so the shot can hold the overlay with no notice. Medium. | S: leave the armed state alone for a visible capture, have the worker say when it skipped the stop, and treat that as "may show". |
+| F3 | `sidepanel/panel.js:1679` | An arm whose injection lands as the tab navigates still broadcasts, and the button relights over the new page. | S: add the armed id to `cancelledArmIds` in the `loading` branch. |
+| F4 | `sidepanel/panel.js:384` | `resolveTab` clears any banner, so the "may show" notice disappears when a busy page finishes loading or changes its URL just after the capture. | S: clear it only on a tab change or when a restriction comes or goes. |
+| F5 | `background.js:175` | The stop waits in the worker's memory for arms still landing. If Chrome stops the worker during that wait, the overlay survives with the button dark. | S: also send the stop at once; it is idempotent. |
+| F6 | `sidepanel/panel.js:363` | CW9, still open: no catch around `cdr:check-tab`, so a failed startup call leaves `ready` rejected and every later broadcast dropped. | S |
+| F7 | `background.js:137` | Arm against arm is ordered by when each arm's awaits resolve, so an older arm whose `tabs.get` answers late beats a newer one. Seen only with an injected delay. | S: drop an arm before it injects if a newer one was asked for. |
+| F8 | `content/collector-main.js:499` | The XHR bookkeeping lives in enumerable own properties, visible to `Object.keys` and `JSON.stringify` (URL and method included), and is written even onto a non XHR `this`. | M: a `WeakMap` inside the collector. |
+| F9 | `content/collector-main.js:491` | An `open()` over a request still in flight replaces its record. Chrome cancels that request with no event, so it is never recorded, while an `abort()` of it is. | S |
+| F10 | `content/collector-main.js:589` | A page listener added before the first send that calls `stopImmediatePropagation()` silences the collector's; and a synchronous retry from `onreadystatechange` at readyState 4 after a timeout or abort is recorded as a network failure. | Not worth a heuristic. |
+| F11 | `sidepanel/panel.js:378` | A `cdr:check-tab` answer read before a disarm of the shortcut's arm and delivered after it relights the button. The window is under a millisecond. | S |
+| F12 | `background.js:175` | On a page that never reaches `document_idle`, an armed injection never lands, so every later Screen there waits the full 3 s and shows the notice. | S: bound the worker's wait. |
+
+The stage (`tools/panel-stage.html`) cannot model an arm that lands out of order because of the
+stage's own artificial delay; the real extension landed 75 of 75 back to back injections in order.
