@@ -111,6 +111,22 @@ const landingsByTab = new Map();
  */
 const disarmsByTab = new Map();
 
+/**
+ * How long a disarm waits for arms still landing before it answers anyway.
+ * An arm lands when the page reaches document_idle, which a page still
+ * streaming its HTML may not do for a long time, or at all, and a Screen
+ * capture waiting on the answer would otherwise sit out its own 3 s bound and
+ * warn about an overlay the page never drew. Well under that bound, so the
+ * stop that follows still has time to answer within it.
+ */
+const LANDING_WAIT_MS = 1000;
+
+/**
+ * Probes of the page per tab: { running, next }, the probe asking the page
+ * now and the one queued to start after it. See verifyArmed.
+ */
+const probesByTab = new Map();
+
 chrome.sidePanel
   .setPanelBehavior({ openPanelOnActionClick: true })
   .catch((error) => console.error('[cdr] setPanelBehavior failed', error));
@@ -124,11 +140,24 @@ function trackLanding(tabId, landing) {
   landing.finally(() => landings.delete(landing)).catch(() => {});
 }
 
+/** Whether every one of the promises settled within `ms`. Never rejects. */
+function settledWithin(promises, ms) {
+  let timer;
+  return Promise.race([
+    Promise.allSettled(promises).then(() => true),
+    new Promise((resolve) => {
+      timer = setTimeout(() => resolve(false), ms);
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
 async function arm(mode, tabId, armId) {
   const file = CAPTURE_SCRIPTS[mode];
   if (!file) throw new Error(`Unknown capture mode: ${mode}`);
   const disarms = disarmsByTab.get(tabId) || 0;
-  latestArmByTab.set(tabId, Symbol('arm'));
+  const request = Symbol('arm');
+  latestArmByTab.set(tabId, request);
+  const replaced = () => latestArmByTab.get(tabId) !== request;
 
   // Tracked from here, not from the injection. A verify that arrives while
   // this still looks the tab up would otherwise probe a page the overlay has
@@ -143,6 +172,13 @@ async function arm(mode, tabId, armId) {
     // there and nothing to take down.
     if (disarmedSince(tabId, disarms)) return false;
 
+    // Replaced before anything reached the page. Each arm's lookups above
+    // take as long as Chrome takes to answer them, so an older arm answered
+    // late would otherwise inject after the newer one and take the page back
+    // from it. The newer arm puts its own mode on the page, stopping the
+    // other one if need be, so dropping this one loses nothing.
+    if (replaced()) return false;
+
     // executeScript re-runs the file on every call. Both capture scripts are
     // written to be idempotent: they cache their controller on window and
     // only call start() again.
@@ -152,8 +188,22 @@ async function arm(mode, tabId, armId) {
   trackLanding(tabId, landing);
   if (!(await landing)) return { ok: true };
 
-  // Cancelled while landing. The disarm stops it now that it is there.
-  if (disarmedSince(tabId, disarms)) return { ok: true };
+  // Cancelled while landing. The disarm's stops are usually behind it, but a
+  // file Chrome took longer than the disarm's bounded wait to read from the
+  // package lands after all of them, and nothing else would take it down. So
+  // it stops itself: the page has run it, so it is past document_idle and
+  // runs the stop at once. Not when a newer arm was asked for, whose start()
+  // takes the page over and which this stop could otherwise end.
+  if (disarmedSince(tabId, disarms)) {
+    if (!replaced()) queueStop(tabId);
+    return { ok: true };
+  }
+
+  // Replaced while landing. The newer arm lands after this one and records
+  // itself; recording this one as well could only leave the older mode in
+  // armedByTab, and light it in the panel, if Chrome answered the two
+  // injections out of order.
+  if (replaced()) return { ok: true };
 
   armedByTab.set(tabId, { mode, armId });
 
@@ -168,6 +218,34 @@ async function arm(mode, tabId, armId) {
   return { ok: true };
 }
 
+/**
+ * Runs in the page, serialised by executeScript: takes down either capture
+ * controller there.
+ */
+function stopCapture() {
+  window.__cdrRegionOverlay?.stop();
+  window.__cdrElementPicker?.stop();
+  // Settles once the page has painted a frame without the overlay, so a
+  // Screen capture that waits on this reply cannot photograph it.
+  // executeScript waits for a returned promise. The timer is there for a
+  // tab in the background, which runs no animation frames; Chrome may
+  // stretch it to a second there, and a frozen tab runs neither. Nothing
+  // waits on that case: the overlay is already gone, removed above.
+  return new Promise((resolve) => {
+    requestAnimationFrame(() => requestAnimationFrame(() => resolve(true)));
+    setTimeout(() => resolve(true), 150);
+  });
+}
+
+/**
+ * Put a stop in the page's queue, where it runs at document_idle behind the
+ * injections already sent there, and expect no answer. A page that never
+ * gets there never answers, and one that navigates drops it.
+ */
+function queueStop(tabId) {
+  chrome.scripting.executeScript({ target: { tabId }, func: stopCapture }).catch(() => {});
+}
+
 /** Take down whatever is armed on a tab, and every arm asked for there so far. */
 async function disarm(tabId) {
   const latest = latestArmByTab.get(tabId);
@@ -178,7 +256,19 @@ async function disarm(tabId) {
   // before it is sent to the page and a function injection is not, so a stop
   // sent now could reach the page ahead of the overlay it is meant to remove.
   const landings = landingsByTab.get(tabId);
-  if (landings?.size) await Promise.allSettled([...landings]);
+  let landed = true;
+  if (landings?.size) {
+    // A stop goes now as well. The wait below lives in this worker's memory,
+    // which Chrome throws away if it stops the worker meanwhile, and nothing
+    // would then send the stop after it. This one is already in the page's
+    // queue, behind every arm whose injection has gone out, and the page runs
+    // it straight after that arm. Only an arm still being read from the
+    // package can overtake it, and that arm stops itself when it lands.
+    queueStop(tabId);
+    // Bounded, because a page that never reaches document_idle never lands
+    // an arm, and every Screen there would wait the panel's bound out.
+    landed = await settledWithin([...landings], LANDING_WAIT_MS);
+  }
 
   // An arm asked for while this waited came after the cancel. It lands after
   // the ones cancelled, and its start() takes the page over, stopping the
@@ -186,22 +276,21 @@ async function disarm(tabId) {
   // Screen capture waiting on it must not read it as a page without overlay.
   if (latestArmByTab.get(tabId) !== latest) return { ok: true, superseded: true };
 
+  // Not landed in time: the page has not run that arm yet, so its overlay is
+  // not drawn. Its file has almost always been read from the package by now,
+  // so a stop queued now is behind it, and the page runs the stop straight
+  // after it. One still being read stops itself when it lands (see arm).
+  if (!landed) queueStop(tabId);
+
+  // The answer waits for a stop the page runs now rather than at
+  // document_idle. Every arm cancelled here has either landed or has the
+  // queued stop behind it, and a page that has not reached document_idle,
+  // or is a new document that the cancelled arms never reached, still
+  // answers in a frame or two.
   await chrome.scripting.executeScript({
     target: { tabId },
-    func: () => {
-      window.__cdrRegionOverlay?.stop();
-      window.__cdrElementPicker?.stop();
-      // Settles once the page has painted a frame without the overlay, so a
-      // Screen capture that waits on this reply cannot photograph it.
-      // executeScript waits for a returned promise. The timer is there for a
-      // tab in the background, which runs no animation frames; Chrome may
-      // stretch it to a second there, and a frozen tab runs neither. Nothing
-      // waits on that case: the overlay is already gone, removed above.
-      return new Promise((resolve) => {
-        requestAnimationFrame(() => requestAnimationFrame(() => resolve(true)));
-        setTimeout(() => resolve(true), 150);
-      });
-    },
+    injectImmediately: true,
+    func: stopCapture,
   });
   // The stop ran, but an arm asked for since may be landing behind it.
   return { ok: true, superseded: latestArmByTab.get(tabId) !== latest };
@@ -220,9 +309,33 @@ async function disarm(tabId) {
  * Drops the tab's entry from armedByTab when nothing is live, unless an arm
  * has replaced it meanwhile.
  *
+ * One probe per tab at a time. A URL change brings a request from the worker
+ * and one from the panel, on 'loading' and again on 'complete', and a page
+ * that rewrites its URL often would otherwise get a stream of injections. A
+ * request that comes while a probe runs does not take that probe's answer,
+ * which may have been read before the change it asks about. It waits for the
+ * next one, which starts when the running one ends and answers every request
+ * that came meanwhile.
+ *
  * @returns {Promise<'region'|'element'|null>}
  */
-async function verifyArmed(tabId) {
+function verifyArmed(tabId) {
+  const probes = probesByTab.get(tabId);
+  if (probes) {
+    const again = () => verifyArmed(tabId);
+    probes.next ||= probes.running.then(again, again);
+    return probes.next;
+  }
+  const entry = { running: null, next: null };
+  probesByTab.set(tabId, entry);
+  entry.running = probeArmed(tabId).finally(() => {
+    if (probesByTab.get(tabId) === entry) probesByTab.delete(tabId);
+  });
+  return entry.running;
+}
+
+/** The probe behind verifyArmed. */
+async function probeArmed(tabId) {
   const landings = landingsByTab.get(tabId);
   if (landings?.size) await Promise.allSettled([...landings]);
   const entry = armedByTab.get(tabId);
@@ -290,18 +403,33 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   // A capture finishing or being cancelled ends the armed state. These are
   // broadcasts aimed at the panel; the worker only observes them to keep
-  // armedByTab honest for a panel that opens later.
+  // armedByTab honest for a panel that opens later. Only the arm of the mode
+  // that sent one has ended: a drag's comes two frames after the release, and
+  // the other mode armed in between is the user's newer action, live on the
+  // page.
   if (
     message.type === 'cdr:region-selected' ||
     message.type === 'cdr:element-picked' ||
     message.type === 'cdr:capture-cancelled'
   ) {
-    if (sender?.tab?.id != null) armedByTab.delete(sender.tab.id);
+    const tabId = sender?.tab?.id;
+    const mode = senderMode(message);
+    if (tabId != null && (!mode || armedByTab.get(tabId)?.mode === mode)) armedByTab.delete(tabId);
     return false;
   }
 
   return false;
 });
+
+/**
+ * The capture mode a content script's message comes from, by its type, or by
+ * the mode a cancel names. Null when it names none, which ends any arm.
+ */
+function senderMode(message) {
+  if (message.type === 'cdr:region-selected') return 'region';
+  if (message.type === 'cdr:element-picked') return 'element';
+  return message.mode === 'region' || message.mode === 'element' ? message.mode : null;
+}
 
 // Keep armedByTab from going stale or growing without bound. A navigation to
 // another document destroys the injected overlay, one within the document does
@@ -319,6 +447,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   disarmsByTab.delete(tabId);
   latestArmByTab.delete(tabId);
   landingsByTab.delete(tabId);
+  probesByTab.delete(tabId);
 });
 
 chrome.commands.onCommand.addListener((command, tab) => {

@@ -333,13 +333,153 @@ test('prompt: a frame keeps its position whatever its script is called, and runn
   }
 });
 
+test('prompt: a frame keeps its position past a path parameter, an error its location, a path its own @', () => {
+  const report = sampleReport('bug');
+  report.errors.push({ kind: 'error', text: 'Uncaught TypeError: boom', stack: 'TypeError: boom\n    at handler (https://shop.test/static/app.js;jsessionid=JSESS1:12:5)', t: 60 });
+  report.errors.push({ kind: 'error', text: 'Uncaught Error: thrown', stack: '', where: 'https://shop.test/thrower.js?sig=WHERESIG:1:1', t: 61 });
+  report.page.url = 'http://localhost:3000//@alice/profile';
+  const prompt = buildPrompt(report);
+  for (const kept of ['app.js;jsessionid=<redacted>:12:5)', 'thrower.js?sig=<redacted>:1:1', '//@alice/profile']) {
+    assert.ok(prompt.includes(kept), `${kept} is missing`);
+  }
+  for (const value of ['JSESS1', 'WHERESIG']) assert.ok(!prompt.includes(value), `${value} printed`);
+});
+
 test('prompt: text built to make the url scan backtrack costs one pass', () => {
   for (const text of [`/?a${')'.repeat(100000)}`, `http://x/?a${']'.repeat(100000)}`, '-/'.repeat(50000), '(/'.repeat(50000), 'a.'.repeat(50000)]) {
     const report = sampleReport('bug');
     report.errors.push({ kind: 'resource', text: `Failed to load <img>: ${text}`, stack: '', t: 50 });
+    const { took } = timedPrompt(report, 500);
+    assert.ok(took < 500, `${text.slice(0, 6)}… took ${Math.round(took)} ms`);
+  }
+});
+
+test('prompt: a bare query or fragment, credentials anywhere in a url, path parameters and JSON escapes are screened', () => {
+  const report = sampleReport('bug');
+  const said = (text, t) => report.consoleLines.push({ level: 'warn', text, t });
+  const lines = [
+    // A query or fragment with no url in front of it, or a path the scan
+    // does not take for one.
+    'search: ?code=F20A&state=1', 'hash changed: #access_token=F20B&x=1', 'GET api/x?token=F20C', 'GET ./api/x?token=F20D',
+    'v1.2/api/x?token=F20E', 'Failed./api/v1/session?token=F20F',
+    // Credentials in a second url, after letters, or with no scheme.
+    'https://cors.test/https://user:F20G@api.test/x?y=1', 'https://a.test/docsとhttps://user:F20H@b.test/',
+    'https://a.test/x|https://user:F20I@b.test/', 'foo_https://user:F20J@a.test/', '//user:F20K@host.test/x',
+    'proxy (//josé:F20X@host.test/x)',
+    // Path parameters, JSON's escapes, sid, and a redirect encoded twice.
+    'GET https://a.test/app;jsessionid=F20L?x=1', 'GET /app;jsessionid=F20M', 'sqlserver://db.test;user=a;password=F20N',
+    '{"db":"postgres:\\/\\/app:F20O@db.test\\/app"}', '{"u":"\\/\\/user:F20P@a.test\\/x"}', '{"url":"https://a.test/x?a=1\\u0026token=F20Q"}',
+    'GET https://a.test/x?sid=F20R&n=1', 'GET /login?r=https%253A%252F%252Fa.test%252Fcb%253Ftoken%253DF20S',
+  ];
+  lines.forEach((text, index) => said(text, 100 + index));
+  // The page and a request print through safeUrl and pathOf, not safeText.
+  report.page.url = 'http://localhost:3000/cart;jsessionid=F20T/https://user:F20U@api.test/x?step=2';
+  report.network.push({ method: 'GET', url: 'https://cors.test/https://user:F20V@api.test/x;jsessionid=F20W', status: 500, statusText: 'Internal Server Error', ms: 9, via: 'fetch', t: 200 });
+  const prompt = buildPrompt(report);
+  for (const line of lines) {
+    const marker = /F20[A-Z]/.exec(line)[0];
+    assert.ok(!prompt.includes(marker), `${marker} printed: ${line}`);
+  }
+  for (const marker of ['F20T', 'F20U', 'F20V', 'F20W']) assert.ok(!prompt.includes(marker), `${marker} printed`);
+  for (const kept of ['?code=<redacted>&state=1', 'https://cors.test/https://api.test/x?y=1', 'foo_https://a.test/', 'sqlserver://db.test;user=a;password=<redacted>', '\\u0026token=<redacted>', 'sid=<redacted>&n=1', 'step=2']) {
+    assert.ok(prompt.includes(kept), `${kept} is missing`);
+  }
+});
+
+test('prompt: ordinary text near those shapes prints as it was', () => {
+  const report = sampleReport('bug');
+  const plain = [
+    'Minified React error #418; visit https://react.dev/errors/418?args[]=text&args[]= for the full message', 'Use a/b#c or a#b',
+    'Hash #main, #sidebar > .item:nth-child(2n+1)', 'Matrix /users;id=42;role=admin/profile', 'https://example.com/x;https://example.org/y?z=1',
+    'mailto:admin@example.com?subject=Hello&body=Hi', 'see (//cdn.test/a@2x.png) and https://a.test//alice@b.test', '请访问https://example.com或联系admin@example.com',
+    'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==',
+    '{"url":"https:\\/\\/example.com\\/r?id=1"}', 'GET /graphql?operationName=GetCart&variables=%7B%22id%22%3A1%7D 400', 'Ratio 1/2, 3/4 and 16/9; about 50% done.',
+    // XPath with a namespace prefix reads like //user:pass@ up to its '['.
+    "Failed to evaluate //xs:element[@name='foo']", 'document.evaluate: //svg:path[@id=x] matched 0 nodes', 'locator(xpath=//android:id[@text=OK])',
+    '//w:p[@w:rsidR]',
+  ];
+  plain.forEach((text, index) => report.consoleLines.push({ level: 'warn', text, t: 100 + index }));
+  const prompt = buildPrompt(report);
+  for (const text of plain) assert.ok(prompt.includes(text), `changed: ${text}`);
+});
+
+test('prompt: a data: url prints with its content, whose colours and padding are no parameters', () => {
+  const report = sampleReport('bug');
+  // An svg with five colours, each a %23 that would read as one more url;
+  // base64 whose letters spell a secret word ahead of its '=' padding, alone
+  // and inside an svg, as a blurred placeholder puts it.
+  const svg = (colours) => {
+    const paths = Array.from({ length: colours }, (_, n) => `<path fill='#${n}${n}${n}' d='M${n}'/>`).join('');
+    return `data:image/svg+xml;charset=utf8,${encodeURIComponent(`<svg xmlns='http://www.w3.org/2000/svg'>${paths}</svg>`)}`;
+  };
+  const kept = [
+    svg(5),
+    'data:image/png;charset=x;base64,iVBORw0KGgoTokenAAAANSUhEUg==',
+    `data:image/svg+xml;charset=utf-8,%3Csvg%3E%3Cimage href='data:image/jpeg;base64,/9j/4AAQSecretAAQ=='/%3E%3C/svg%3E`,
+  ];
+  kept.forEach((url, index) => report.network.push({ method: 'GET', url, status: 500, ms: 1, via: 'fetch', t: 200 + index }));
+  report.page.url = svg(7);
+  // The parameters before the comma are still read.
+  report.network.push({ method: 'GET', url: 'data:text/plain;token=F20Y,hello', status: 500, ms: 1, via: 'fetch', t: 210 });
+  const prompt = buildPrompt(report);
+  for (const url of kept) assert.ok(prompt.includes(url), `changed: ${url.slice(0, 60)}`);
+  assert.ok(prompt.includes(`- URL: ${svg(7)}\n`), 'the page url changed');
+  assert.ok(prompt.includes('data:text/plain;token=<redacted>,hello'));
+});
+
+/**
+ * How long building the prompt for a report takes, and the prompt. A run
+ * over the limit is timed once more and the quicker run counts, so that a
+ * pause of the machine's own (a collection, a busy core) does not fail a
+ * test, while work that grows out of bounds is over the limit both times.
+ */
+function timedPrompt(report, limit) {
+  const once = () => {
     const started = performance.now();
-    buildPrompt(report);
-    assert.ok(performance.now() - started < 500, `${text.slice(0, 6)}… took ${Math.round(performance.now() - started)} ms`);
+    const prompt = buildPrompt(report);
+    return { prompt, took: performance.now() - started };
+  };
+  const first = once();
+  if (first.took < limit) return first;
+  const second = once();
+  return second.took < first.took ? second : first;
+}
+
+test('prompt: a parameter name of a million characters is judged by its ends, in bounded time', () => {
+  const long = 'aB'.repeat(500000);
+  for (const [text, secret] of [[`GET /x?${long}=KEPT 500`, null], [`GET /x?${long}Token=F23A 500`, 'F23A'], [`GET /x?a_${'a_'.repeat(500000)}=KEPT 500`, null]]) {
+    const report = sampleReport('bug');
+    report.consoleLines.push({ level: 'warn', text, t: 100 });
+    report.network.push({ method: 'GET', url: text.split(' ')[1], status: 500, ms: 1, via: 'fetch', t: 101 });
+    // About 20 ms judged by its ends, and over 500 ms judged whole.
+    const { prompt, took } = timedPrompt(report, 250);
+    assert.ok(took < 250, `${text.slice(0, 12)}… took ${Math.round(took)} ms`);
+    if (secret) assert.ok(!prompt.includes(secret), `${secret} printed`);
+    else assert.ok(prompt.includes('=KEPT'), 'an ordinary long name lost its value');
+  }
+});
+
+test('prompt: text built against the new screening costs one pass', () => {
+  // Half a megabyte tells one pass from a pass per character, which would
+  // take seconds here, and leaves room for a busy machine: a megabyte of
+  // name=value pairs alone costs about 150 ms to judge. A message and a
+  // request url are timed apart, as each prints apart.
+  const rep = (s) => s.repeat(Math.ceil(500_000 / s.length)).slice(0, 500_000);
+  const places = {
+    message: (report, text) => report.errors.push({ kind: 'resource', text: `Failed to load <img>: ${text}`, stack: '', t: 50 }),
+    'request url': (report, text) => report.network.push({ method: 'GET', url: text, status: 500, ms: 1, via: 'fetch', t: 51 }),
+  };
+  for (const text of [
+    '@' + rep('a://b'), rep('a://x@'), rep('(//x:y@'), 'a://' + rep('@'), rep(':\\/\\/a@'), rep('//') + '@', 'a://' + rep('/') + '@',
+    rep(';'), rep('/;'), '/x;' + rep('a=1;'), '?' + rep('a=1&'), rep('#?'), '/x?' + rep('a=1\\u0026'), '/x?u=' + rep('%25') + '3F', '/x?u=' + rep('%253Fa%253D'),
+    rep('data:,;a=1;'), 'data:x;' + rep('a=1;'),
+  ]) {
+    for (const [place, put] of Object.entries(places)) {
+      const report = sampleReport('bug');
+      put(report, text);
+      const { took } = timedPrompt(report, 500);
+      assert.ok(took < 500, `${place} ${text.slice(0, 8)}… took ${Math.round(took)} ms`);
+    }
   }
 });
 

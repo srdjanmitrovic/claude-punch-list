@@ -168,6 +168,7 @@ const state = {
   armedMode: null, // 'region' | 'element' | null
   armedTabId: null, // which tab that arm was issued against
   armedId: null, // the armId behind that arm, when it has one (the shortcut's has none)
+  armedChanges: 0, // bumped by every change to the three above, so a reply can tell it is older
   cancelledArmIds: new Set(), // arms this panel cancelled or replaced, whose late cdr:armed is ignored
   cancels: new Map(), // tabId -> a disarm on its way there, so a capture on that tab can wait
   resolving: 0, // bumped by each resolveTab(), so an older one that answers late gives way
@@ -233,9 +234,13 @@ function setCount(node, value) {
  * mode armed on tab A must not read as armed once the user switches to tab B.
  */
 function setArmed(mode, tabId = null, armId = null) {
+  const before = [state.armedMode, state.armedTabId, state.armedId];
   state.armedMode = mode;
   state.armedTabId = mode ? tabId : null;
   state.armedId = mode ? armId : null;
+  if ([state.armedMode, state.armedTabId, state.armedId].some((value, i) => value !== before[i])) {
+    state.armedChanges += 1;
+  }
   for (const [name, node] of [
     ['region', el.modeRegion],
     ['element', el.modeElement],
@@ -383,7 +388,19 @@ async function resolveTab() {
   el.targetUrl.textContent = tab.url || tab.pendingUrl || '(no url)';
   el.targetUrl.title = tab.url || '';
 
-  const response = await chrome.runtime.sendMessage({ type: 'cdr:check-tab', tabId: tab.id });
+  // What the panel knew of the arm when it asked, so an answer the worker read
+  // before a change the panel has seen since (see the adoption below) is not
+  // taken for news.
+  const armedChanges = state.armedChanges;
+  let response = null;
+  try {
+    response = await chrome.runtime.sendMessage({ type: 'cdr:check-tab', tabId: tab.id });
+  } catch {
+    // The worker did not answer, as when the extension is reloaded under the
+    // panel. Read as a tab nothing is known about rather than thrown on: at
+    // startup the throw would leave `ready` rejected, and every broadcast for
+    // the life of the panel dropped. The next call asks again.
+  }
   // A newer call, for the tab now in view, owns the panel. This answer is
   // about a tab the user has left, and would light its mode or carry its
   // restriction over.
@@ -405,9 +422,13 @@ async function resolveTab() {
   // the panel together, so the cdr:armed message can be sent before this
   // document exists to hear it. Not an arm this panel has cancelled, though:
   // the worker records an arm when it lands, which can be after the cancel.
+  // Nor one whose end the panel has seen since it asked, such as Esc on the
+  // shortcut's arm, which has no armId to refuse it by: the worker may have
+  // read the answer before that disarm reached it.
   if (
     response?.armedMode &&
     !state.armedMode &&
+    state.armedChanges === armedChanges &&
     !(response.armId && state.cancelledArmIds.has(response.armId))
   ) {
     setArmed(response.armedMode, tab.id, response.armId || null);
@@ -1082,27 +1103,15 @@ const OVERLAY_TOO_BUSY =
   'The page was too busy to take the capture overlay down in time, so it may show in this screenshot.';
 
 /**
- * Screen was clicked, and while it waited for the page to take the overlay
- * down, a capture mode was armed on the same tab again: Region or Element
- * clicked, or Alt+Shift+C pressed. That arm is the user's newer action and
- * stays armed whatever this returns, so its overlay may already be drawn on
- * the page the screenshot is about to be taken of.
- *
- * @param {'region'|'element'|null} mode  the mode now lit in this panel, or
- *   null when only the worker knows of the arm so far (the shortcut, whose
- *   broadcast has not arrived yet)
- * @returns {{ capture: boolean, notice: string|null }}  whether to take the
- *   screenshot anyway, and what the banner says either way (null for nothing)
+ * Said when a capture mode was armed on the same tab while Screen was under
+ * way: Region or Element clicked, or Alt+Shift+C pressed. That arm is the
+ * user's newer action and stays armed, so its overlay may be drawn on the page
+ * being photographed. Screen photographs it all the same, because the page as
+ * it was is often the point, and says so, because the notice covers the
+ * overlay that may be in it.
  */
-function screenAfterRearm(mode) {
-  // Photographed anyway, and said: the page as it was is often the point, and
-  // the notice covers the overlay that may be in it. Skipping the shot, or
-  // deciding by mode, are the other choices (docs/REVIEW.md, F2).
-  return {
-    capture: true,
-    notice: 'A capture mode was armed while this screenshot waited, so its overlay may show in it.',
-  };
-}
+const ARMED_DURING_SCREEN =
+  'A capture mode was armed while this screenshot waited, so its overlay may show in it.';
 
 async function captureVisible() {
   // One capture in flight at a time. This covers the capture itself, which
@@ -1132,17 +1141,14 @@ async function captureVisible() {
     }
     // A mode armed on this tab while Screen waited: Region or Element clicked,
     // or the shortcut, which the worker reports before this panel has heard of
-    // it. That arm is the newer action and stands, and its overlay may be on
-    // the page by now.
-    if (reply?.superseded || armedHere()) {
-      const decision = screenAfterRearm(armedHere() ? state.armedMode : null);
-      if (!decision.capture) {
-        showBanner(decision.notice);
-        return;
-      }
-      notice = decision.notice || notice;
-    }
+    // it. Photographed with a notice; see ARMED_DURING_SCREEN.
+    let armedSince = Boolean(reply?.superseded) || armedHere();
     const { dataUrl, takenAt } = await captureViewport();
+    // Asked again once the pixels are in. captureViewport waits out Chrome's
+    // capture quota, up to 1.2 s, and a mode armed during that wait may be in
+    // them too.
+    armedSince ||= armedHere();
+    if (armedSince) notice = ARMED_DURING_SCREEN;
     const image = await loadImage(dataUrl);
     addItem({
       dataUrl,
@@ -1686,9 +1692,11 @@ function handleBroadcast(message) {
 
   // The page has ended its arm by finishing it. The button goes dark now
   // rather than once the screenshot is in: a mode clicked in between is a new
-  // arm, and must stay lit.
+  // arm, and must stay lit. So must the other mode clicked before this came,
+  // since a drag's message comes two frames after the release: only the arm
+  // of the mode that sent it has ended.
   if (message.type === 'cdr:region-selected' || message.type === 'cdr:element-picked') {
-    setArmed(null);
+    endArm(message);
   }
 
   if (message.type === 'cdr:region-selected') {
@@ -1720,8 +1728,25 @@ function handleBroadcast(message) {
   }
 
   if (message.type === 'cdr:capture-cancelled') {
-    setArmed(null);
+    endArm(message);
   }
+}
+
+/**
+ * Go dark for a content script's message that ends its arm, unless the mode
+ * lit is not the one it comes from, which the worker judges the same way.
+ * A cancel that names no mode ends whatever is lit.
+ */
+function endArm(message) {
+  const mode =
+    message.type === 'cdr:region-selected'
+      ? 'region'
+      : message.type === 'cdr:element-picked'
+        ? 'element'
+        : message.mode === 'region' || message.mode === 'element'
+          ? message.mode
+          : null;
+  if (!mode || state.armedMode === mode) setArmed(null);
 }
 
 chrome.runtime.onMessage.addListener((message, sender) => {
@@ -1896,5 +1921,9 @@ el.version.textContent = `v${chrome.runtime.getManifest().version}`;
 
 // Startup. Declared last so it runs after every listener is wired, but consumed
 // by the onMessage handler above, which defers until this settles rather than
-// comparing against a tab id that has not been resolved yet.
-const ready = restore().then(resolveTab);
+// comparing against a tab id that has not been resolved yet. It must settle as
+// fulfilled whatever fails on the way, or every broadcast after it is dropped.
+const ready = restore()
+  .catch((error) => console.error('[cdr] could not restore the report', error))
+  .then(resolveTab)
+  .catch((error) => console.error('[cdr] could not read the tab in view', error));

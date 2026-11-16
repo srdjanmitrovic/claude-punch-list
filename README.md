@@ -430,7 +430,7 @@ page. For local files, turn on "Allow access to file URLs" on the extension's ca
 | Toggle | What it adds |
 | :--- | :--- |
 | **console** | `console.error` and `console.warn` calls, uncaught exceptions with stack frames, unhandled promise rejections, and failed resource loads |
-| **network** | Requests that returned 4xx or 5xx or failed outright, with method, URL, status, timing, and the function that sent them with its file and line. Requests the page ended itself, by aborting them or through a timeout it set, are labelled as such, and in a single report they come after the real failures |
+| **network** | Requests that returned 4xx or 5xx or failed outright, with method, URL, status, timing, and the function that sent them with its file and line. Requests the page ended itself, by aborting them, reopening them before they finished, or through a timeout it set, are labelled as such, leave the buffer before a real failure does, and in a single report they come after the real failures |
 | **element** | For each item picked with the element tool: the component behind it on a React or Vue page, the handlers bound to it and the first line of their source, a line of search targets, any file its class names imply, the node's markup, a CSS selector that finds it again, and a curated set of computed styles |
 | **page** | URL, title, viewport size and device pixel ratio, plus each item's own URL when the sheet spans more than one page. URLs print as paths (`/checkout?step=2`) while the sheet stays on one origin, and in full once it spans two |
 
@@ -481,12 +481,17 @@ What is screened:
 * **Logged objects.** In an object passed to `console.error` or `console.warn`, the value under
   any secret looking key, at any depth (`headers.Authorization`, `user.password`).
 * **Every URL the prompt prints.** Page addresses, request URLs, stack frames, and any URL inside
-  a console or error message (absolute, or a path with a query such as `GET /api/me?token=…`)
-  lose embedded credentials (`user:pass@`) and the values of secret looking query and fragment
-  parameters, plus `code`, `key`, `sig` and `ticket`, which carry an OAuth code, an API key, a
-  signature or a single sign on ticket. A URL inside a parameter (`?next=/verify?token=…`) is
-  screened the same way, up to four levels deep, past which the parameter is hidden whole. One
-  that is percent encoded is hidden whole if it holds a secret.
+  a console or error message (absolute, a path with a query or a path parameter such as
+  `GET /api/me?token=…` or `/app;jsessionid=…`, or a query or fragment with nothing in front of it
+  such as `?code=…` or `#access_token=…`) lose embedded credentials (`user:pass@`) and the values
+  of secret looking query, fragment and path parameters, plus `code`, `key`, `sig`, `ticket` and
+  `sid`, which carry an OAuth code, an API key, a signature, a single sign on ticket or a session
+  id. Credentials go wherever in a message a URL starts: in a second URL run into the first
+  (`https://proxy.test/https://user:pass@…`), after letters of another script, or written the way
+  JSON escapes it (`https:\/\/…`), where `\u0026` ends a parameter too. A URL inside a parameter
+  (`?next=/verify?token=…`) is screened the same way, up to four levels deep, past which the
+  parameter is hidden whole. One that is percent encoded, once or twice, is hidden whole if it
+  holds a secret. A `data:` URL keeps its content; only its parameters before the comma are read.
 
 What is not screened:
 
@@ -494,15 +499,18 @@ What is not screened:
   element's text (its `textContent`, which takes in hidden text too) print as they are.
 * A secret under an innocent name: a prop called `data`, an object key called `value`, the text
   of a textarea with an ordinary name.
-* URLs in any other attribute, such as `content` or a custom `data-` name, and markup whose
-  attribute names hold a quote or start with `=`, which the masking cannot parse.
-* A URL in text that the scan does not take for one: a path that does not start with `/` after a
-  space or a bracket (`GET api/me?token=…`, `./api`, `v1.2/api`, `Failed./api`), a bare query or
-  fragment (`#access_token=…`), credentials in a second URL run together with the first
-  (`https://proxy.test/https://user:pass@…`), and a URL written the way JSON escapes it
-  (`https:\/\/…`, `\u0026token=`). Path parameters (`;jsessionid=…`) are not masked either.
-* The middle of a logged key longer than 400 characters (a URL or a `data:` URL used as a key),
-  which is judged by its first and last 200 characters.
+* URLs in any other attribute, such as `content` or a custom `data-` name.
+* A URL the scan does not read: a `data:` URL whose percent encoded content holds a link, and a
+  parameter holding percent encoded JSON (`state=%7B%22token%22…`). Path parameters on a path the
+  scan does not take for one, with no `/` before them or a `/` that follows a letter, a digit, a
+  dot or another `/` (`app;jsessionid=…`, `GET api/app;jsessionid=…`). Credentials after a bare
+  `//` that follows a letter, a digit, a dot, a slash or a backslash (`x//user:pass@host`), and
+  after any bare `//` when they hold no `:` or a character no URL puts there. A user name with
+  letters outside ASCII and no password (`https://josé@host`), which reads like a run of another
+  script up to an address further on.
+* The middle of a name longer than 400 characters, which is judged by its first and last 200
+  characters: a logged key (a URL or a `data:` URL used as a key), the name of a URL parameter or
+  of an attribute, and a form field's name or id.
 * The page title, which prints and is stored as it is (`Inbox (3) | you@example.com`).
 * The screenshot, which shows whatever was on the screen.
 * The page address stored with each item, which is kept as it was and masked only when the

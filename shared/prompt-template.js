@@ -298,7 +298,9 @@ function errorEntry(error) {
   // A frame names the script's url, and a script loaded as maps/api/js?key=
   // carries its key into every frame.
   let frames = error.stack ? stackFrames(error.stack).map(safeText) : [];
-  if (!frames.length && error.where) frames = [`at ${safeText(error.where)}`];
+  // Screened as the frame it prints as, so that its :line:col is kept out of
+  // a masked value at the end of its url, as any frame's is.
+  if (!frames.length && error.where) frames = [safeText(`at ${error.where}`)];
   const more = frames.map((text) => ({ indent: 10, text }));
   return { t: error.t, seq: error.seq, head, more, key: [head, ...frames].join('\n') };
 }
@@ -889,7 +891,13 @@ function pathOf(url) {
     return safeUrl(url);
   }
   if (!['http:', 'https:', 'file:'].includes(parsed.protocol)) return safeUrl(url);
-  const path = `${parsed.pathname}${maskParams(parsed.search)}${maskParams(parsed.hash)}`;
+  // Screened, since a path holds secrets too: a ;jsessionid=, or a second url
+  // with credentials (/https://u:p@host/). Not as a url of its own, whose
+  // start credentialsAt would read a path's leading '//' as an authority:
+  // new URL() has taken the real one out, so an '@' left in the path is the
+  // path's own (http://host//@alice/profile).
+  const path =
+    maskPath(withoutCredentials(parsed.pathname), 0) + maskParams(parsed.search) + maskParams(parsed.hash);
   // A landing page has no path to speak of, and "Fix this issue on /" names
   // nothing at all. The host is the only identifying thing left, so keep it.
   return path === '/' ? safeUrl(url) : path;
@@ -937,17 +945,44 @@ function isSecretName(name) {
 
 // Whole names that carry a secret in a url, though as words they are too
 // common to treat as secret anywhere (errorCode, sortKey): an OAuth code, an
-// API key, a signed url's signature, a single sign on ticket.
-const SECRET_PARAMS = ['code', 'key', 'sig', 'ticket'];
+// API key, a signed url's signature, a single sign on ticket, a session id
+// in the form PHP and forum software put in a url when cookies are off.
+const SECRET_PARAMS = ['code', 'key', 'sig', 'ticket', 'sid'];
 
 // Embedded credentials: up to the last '@' before the path, since a password
 // can hold one. A scheme relative url (//user:pass@host) carries them too.
 const CREDENTIALS = /^((?:[a-z][a-z0-9+.-]*:)?\/\/)([^/?#\s]*)@/i;
 
+// Where the host of a url ends, and so where its credentials must have ended.
+const HOST_END = /[/?#\s]/g;
+
+// What a userinfo may be made of: anything but a control character or one
+// of "<>[\]^`{|}, none of which RFC 3986 lets one hold. It has stopped at
+// '/', '?', '#' and white space already, and runs to the last '@', since a
+// password can hold one. Letters of any script count, as in an IRI.
+const USERINFO = /^[^\x00-\x1f\x7f"<>[\\\]^`{|}]+$/;
+
 // How many urls deep a value is followed (a return address holding a return
 // address). Past that the value is masked whole: a page that nests further is
 // either broken or built to run this out of stack.
 const MAX_NESTING = 4;
+
+/**
+ * isSecretName with a bound on its cost. A name too long to be a field's (a
+ * url or a blob used as a key or an id) is judged by its first and last 200
+ * characters, where a field name sits, so that a name of a million
+ * characters costs no more than a short one; the collector judges a long key
+ * the same way.
+ */
+function isSecretNameBounded(name) {
+  if (name.length <= 400) return isSecretName(name);
+  return isSecretName(name.slice(0, 200)) || isSecretName(name.slice(-200));
+}
+
+/** Whether a parameter's name marks its value as secret. */
+function isSecretParam(name) {
+  return SECRET_PARAMS.includes(name.toLowerCase()) || isSecretNameBounded(name);
+}
 
 /**
  * A query (`?a=1&token=x`) or fragment (`#access_token=x`) with the value of
@@ -961,8 +996,9 @@ function maskParams(part, depth = 0) {
   // Pairs end at '&', and at a ';' that a name and '=' follow. Some servers
   // separate pairs with ';', and serialised markup writes '&' as '&amp;',
   // whose ';' would otherwise leave the next name as 'amp;token'. A ';' with
-  // no '=' after it is part of the value, and goes with it.
-  const pieces = part.slice(1).split(/(&|;(?=[^&;=]*=))/);
+  // no '=' after it is part of the value, and goes with it. JSON may write
+  // '&' as \u0026, which ends a pair too.
+  const pieces = part.slice(1).split(/(&|\\u0026|;(?=[^&;=]*=))/i);
   for (let index = 0; index < pieces.length; index += 2) {
     const pair = pieces[index];
     const eq = pair.indexOf('=');
@@ -976,10 +1012,7 @@ function maskParams(part, depth = 0) {
     // A hash router's fragment carries a route before its query.
     name = name.slice(name.lastIndexOf('?') + 1);
     const value = pair.slice(eq + 1);
-    const masked =
-      SECRET_PARAMS.includes(name.toLowerCase()) || isSecretName(name)
-        ? REDACTED
-        : nestedUrl(value, depth);
+    const masked = isSecretParam(name) ? REDACTED : nestedUrl(value, depth);
     if (masked === value) continue;
     pieces[index] = pair.slice(0, eq + 1) + masked;
     changed = true;
@@ -995,15 +1028,20 @@ function maskParams(part, depth = 0) {
 function nestedUrl(value, depth) {
   const holdsUrl = (text) => /[?#]/.test(text) || credentialsAt(text) !== null;
   if (holdsUrl(value)) return depth < MAX_NESTING ? screenUrl(value, depth + 1) : REDACTED;
-  if (!/%3F|%23|%40/i.test(value)) return value;
+  // %253F is a '?' encoded twice, as a return address inside a return
+  // address's own encoding arrives.
+  if (!/%(?:25)*(?:3F|23|40)/i.test(value)) return value;
   let decoded;
   try {
     decoded = decodeURIComponent(value);
   } catch {
     return value;
   }
-  if (!holdsUrl(decoded)) return value;
-  return depth < MAX_NESTING && screenUrl(decoded, depth + 1) === decoded ? value : REDACTED;
+  if (holdsUrl(decoded)) {
+    return depth < MAX_NESTING && screenUrl(decoded, depth + 1) === decoded ? value : REDACTED;
+  }
+  // Still encoded once more: decoded again, one level deeper.
+  return depth < MAX_NESTING && nestedUrl(decoded, depth + 1) === decoded ? value : REDACTED;
 }
 
 /**
@@ -1029,15 +1067,76 @@ function credentialsAt(url) {
   return found && (found[2].includes(':') || !/[^\x00-\x7f]/.test(found[2])) ? found : null;
 }
 
+/**
+ * The text with the credentials of every url in it removed, wherever the url
+ * starts: a second url run into the first (https://cors.test/https://u:p@…),
+ * one after letters of another script, or one written in JSON, whose ':\/\/'
+ * is a '://'. After a scheme, a userinfo goes as credentialsAt would take it.
+ * After a bare '//', which a comment or a path can hold too, only one with a
+ * ':' in it, and only characters a userinfo may hold, does: XPath writes
+ * //xs:element[@name='x'], whose '[' no userinfo has. Each stretch between
+ * two '/' is read once, so the cost is one pass whatever the text.
+ */
+function withoutCredentials(text) {
+  if (!text.includes('@')) return text;
+  let out = '';
+  let kept = 0;
+  let slash = text.indexOf('/');
+  while (slash !== -1) {
+    const json = text[slash - 1] === '\\' && text.startsWith('\\/', slash + 1);
+    if (text[slash + 1] !== '/' && !json) {
+      slash = text.indexOf('/', slash + 1);
+      continue;
+    }
+    const lead = json ? text[slash - 2] : text[slash - 1];
+    const from = slash + (json ? 3 : 2);
+    HOST_END.lastIndex = from;
+    const end = HOST_END.exec(text)?.index ?? text.length;
+    const host = text.slice(from, end);
+    const userinfo = host.slice(0, Math.max(host.lastIndexOf('@'), 0));
+    const at = from + userinfo.length;
+    const scheme = lead === ':';
+    const loose =
+      !scheme && (lead === undefined || !/[\w/.:\\]/.test(lead)) && USERINFO.test(userinfo);
+    if (
+      userinfo &&
+      (userinfo.includes(':') || (scheme && !/[^\x00-\x7f]/.test(userinfo))) &&
+      (scheme || loose)
+    ) {
+      out += text.slice(kept, from);
+      kept = at + 1;
+    }
+    slash = end < text.length ? text.indexOf('/', end) : -1;
+  }
+  return kept ? out + text.slice(kept) : text;
+}
+
+/**
+ * The part of a url before its query with the secret values of any path
+ * parameters masked: Java's ;jsessionid=, a connection string's
+ * ;password=. A ';' with no '=' after it changes nothing. A data: url's
+ * parameters (;charset=utf8) end at its comma. What follows is its content,
+ * not more parameters: an svg, each of whose %23 colours would read as one
+ * more nested url, or base64, whose '=' padding would end a name made of
+ * random letters.
+ */
+function maskPath(path, depth) {
+  const comma = /^\s*data:/i.test(path) ? path.indexOf(',') : -1;
+  const end = comma === -1 ? path.length : comma;
+  const semi = path.indexOf(';');
+  if (semi === -1 || semi > end) return path;
+  return path.slice(0, semi) + maskParams(path.slice(semi, end), depth) + path.slice(end);
+}
+
 function screenUrl(url, depth) {
   const credentials = credentialsAt(url);
-  const bare = credentials ? credentials[1] + url.slice(credentials[0].length) : url;
+  const bare = withoutCredentials(credentials ? credentials[1] + url.slice(credentials[0].length) : url);
   const cut = bare.search(/[?#]/);
-  if (cut === -1) return bare;
+  if (cut === -1) return maskPath(bare, depth);
   const hashAt = bare.indexOf('#', cut);
   const search = hashAt === -1 ? bare.slice(cut) : bare.slice(cut, hashAt);
   const hash = hashAt === -1 ? '' : bare.slice(hashAt);
-  return bare.slice(0, cut) + maskParams(search, depth) + maskParams(hash, depth);
+  return maskPath(bare.slice(0, cut), depth) + maskParams(search, depth) + maskParams(hash, depth);
 }
 // SECRET URLS END
 
@@ -1058,10 +1157,15 @@ const URL_RUN = new RegExp(`${URL_CHAR}+`, 'g');
 const SCHEME = /\b[a-z][a-z0-9+.-]{0,31}:\/\//i;
 
 /**
- * Where the url in a run starts, or -1 for none: an absolute url, or a path
- * with a query or fragment (GET /api/session?token=x), which is how a log
- * line names a request. A path starts at a '/' that does not follow a word
+ * Where the url in a run starts, or -1 for none: an absolute url; a path
+ * with a query, fragment or path parameter (GET /api/session?token=x,
+ * /app;jsessionid=x), which is how a log line names a request; or a query or
+ * fragment that nothing before it in the run starts a url for (search:
+ * ?code=x, hash changed: #access_token=x, GET api/x?token=x), which is then
+ * screened on its own. A path starts at a '/' that does not follow a word
  * character, '/' or '.', so a file path or a fraction is not taken for one.
+ * Credentials are not looked for here: safeText strips them wherever a url
+ * starts.
  *
  * @param {string} run
  * @param {string} before  the character before the run, '' at the start
@@ -1069,24 +1173,26 @@ const SCHEME = /\b[a-z][a-z0-9+.-]{0,31}:\/\//i;
 function urlStart(run, before) {
   const scheme = SCHEME.exec(run);
   let start = scheme ? scheme.index : -1;
-  // A query or fragment mark with something after it, the last one in the run.
+  // The first query or fragment mark with something after it, and the last
+  // such mark or ';', which a path must come before.
+  let first = -1;
   let mark = -1;
-  for (let index = run.length - 2; index >= 0; index -= 1) {
-    if (run[index] === '?' || run[index] === '#') {
+  for (let index = 0; index < run.length - 1; index += 1) {
+    const char = run[index];
+    if (char === '?' || char === '#') {
+      if (first === -1) first = index;
       mark = index;
-      break;
+    } else if (char === ';') {
+      mark = index;
     }
   }
   for (let index = 0; index < mark && (start === -1 || index < start); index += 1) {
     if (run[index] === '/' && !/[\w/.]/.test(index ? run[index - 1] : before)) {
-      // A path with no query of its own only leads up to an absolute url
-      // (/proxy/https://user:pass@host/x?y=1). The url is the absolute one,
-      // and its credentials are only looked for at its start.
-      if (start !== -1 && !/[?#]/.test(run.slice(index, start))) return start;
-      return index;
+      start = index;
+      break;
     }
   }
-  return start;
+  return first !== -1 && (start === -1 || first < start) ? first : start;
 }
 
 // A stack frame's line up to the url it names: V8's "    at f (" and
@@ -1110,13 +1216,15 @@ function inFrame(text, at) {
  * Every url in a line of page text or a stack frame, through safeUrl. What
  * the scan took in that belongs to the text is kept out of the url first:
  * closing punctuation, a bracket the url did not open, and a frame's
- * :line:col, which would otherwise vanish into a masked value.
+ * :line:col, which would otherwise vanish into a masked value. Credentials
+ * go from the whole run, wherever a url in it starts, since a url glued to
+ * a word (foo_https://u:p@…) or run into another holds them too.
  */
 function safeText(text) {
   const whole = String(text);
   return whole.replace(URL_RUN, (run, offset) => {
     const start = urlStart(run, offset ? whole[offset - 1] : '');
-    if (start === -1) return run;
+    if (start === -1) return withoutCredentials(run);
     const found = run.slice(start);
     // Counted once and kept up to date as the end moves back, so a long run
     // of closing brackets costs one pass rather than one per bracket.
@@ -1138,11 +1246,11 @@ function safeText(text) {
     // the column, so a single number, or any number outside a frame, is taken
     // to be part of the last value (auth=admin:1234, alice@url?auth=admin:1234).
     const position = /:\d+:\d+$/.exec(url);
-    if (position && /[?#]/.test(url.slice(0, position.index)) && inFrame(whole, offset + start)) {
+    if (position && /[?#;]/.test(url.slice(0, position.index)) && inFrame(whole, offset + start)) {
       end = position.index;
       url = found.slice(0, end);
     }
-    return run.slice(0, start) + safeUrl(url) + found.slice(end);
+    return withoutCredentials(run.slice(0, start) + safeUrl(url) + found.slice(end));
   });
 }
 

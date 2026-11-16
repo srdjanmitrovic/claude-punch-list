@@ -138,7 +138,13 @@ test('static: the picker masks what it sends, and nothing rewrites the secret wo
     assert.ok(from !== -1, `content/picker.js has lost ${name}()`);
     return source.slice(from, source.indexOf('\n    }\n', from));
   };
-  assert.match(body('markup'), /maskMarkup\(raw\)/);
+  // markup() prints only from the masked start of outerHTML, so reading
+  // innerHTML again would be a way round the masking.
+  assert.match(body('markup'), /maskedStart\(raw, /);
+  assert.doesNotMatch(body('markup'), /innerHTML/);
+  const returns = [...body('maskedStart').matchAll(/return ([^;]+);/g)].map((match) => match[1]);
+  assert.ok(returns.length > 0 && returns.every((value) => /^maskMarkup\(|^masked$/.test(value)), returns.join(', '));
+  assert.match(body('maskedStart'), /const masked = maskMarkup\(/);
   assert.match(body('attributes'), /maskAttribute\(/);
   assert.match(source, /inlineStyle: maskAttribute\('style'/);
   assert.match(source, /text: visibleText\(element\)/);

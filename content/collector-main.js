@@ -18,6 +18,7 @@
 
   const LIMIT = 30; // ring buffer size, per category
   const MAX_STRING = 600; // truncation budget for any single serialized value
+  const CHAR_BUDGET = MAX_STRING * 10; // characters printed before serialize() leaves members out
 
   // Warnings have a ring of their own. A development build of a framework can
   // warn dozens of times per render, and sharing one ring with console.error
@@ -52,7 +53,18 @@
     const list = buffers[ring];
     list.push(entry);
     if (list.length > LIMIT) {
-      list.shift();
+      // A request the page ended itself (an abort, a timeout it set, an
+      // open() over it) goes before any real failure, the newest included: a
+      // type-ahead that cancels a request per keystroke would otherwise push
+      // the failures the report is for out of the ring.
+      let drop = 0;
+      for (let i = 0; i < list.length; i += 1) {
+        if (list[i].outcome) {
+          drop = i;
+          break;
+        }
+      }
+      list.splice(drop, 1);
       dropped[ring] += 1;
     }
   }
@@ -94,6 +106,134 @@
   }
   // SECRET NAMES END
 
+  // The redaction below runs in the page's own world, so any method it calls
+  // on a string, a regular expression, an array or a Map is one the page can
+  // replace after document_start. A polyfill's String.prototype.split, or a
+  // RegExp.prototype.test that answers true for everything, would make every
+  // key read as harmless and print its value. So what it needs is taken now,
+  // as the clocks are, and called uncurried rather than looked up on a value.
+  const call = Function.prototype.call;
+  const uncurry = (method) => call.bind(method);
+  const NativeMap = Map;
+  const NativeString = String;
+  const mapGet = uncurry(Map.prototype.get);
+  const mapSet = uncurry(Map.prototype.set);
+  const sliceString = uncurry(String.prototype.slice);
+  const lowerCase = uncurry(String.prototype.toLowerCase);
+  // Only exec. split, replace and test hand a regular expression on to
+  // RegExp.prototype[Symbol.split], exec, flags and constructor, all of which
+  // the page can replace, while exec itself reads nothing but the expression's
+  // own state.
+  const execRegExp = uncurry(RegExp.prototype.exec);
+  const stringify = JSON.stringify;
+  const isArray = Array.isArray;
+
+  // isSecretName, written again so that nothing the page can replace takes
+  // part: no method at all, only indexes, lengths and comparisons. The block
+  // above stays the definition the picker and the template share, and
+  // test/collector.test.mjs runs this copy against it over the same names, so
+  // a change made there and not here fails the tests. It reads name[from, to)
+  // as though that were the whole string, which judges a long key's two ends
+  // without slicing it.
+  const LOWER = 1;
+  const UPPER = 2;
+  const DIGIT = 3;
+
+  // A copy, read by index. test/static.test.mjs fails on any use of
+  // SECRET_WORDS after the block that could rewrite it, indexing included.
+  const WORDS = [...SECRET_WORDS];
+
+  // Built from literals, with no prototype, so that no lookup leaves it.
+  const LOWERCASE = { __proto__: null };
+  for (let i = 0; i < 26; i += 1) {
+    LOWERCASE['ABCDEFGHIJKLMNOPQRSTUVWXYZ'[i]] = 'abcdefghijklmnopqrstuvwxyz'[i];
+  }
+
+  /** LOWER, UPPER or DIGIT for an ASCII letter or digit, 0 for anything else. */
+  function charKind(char) {
+    if (char >= 'a' && char <= 'z') return LOWER;
+    if (char >= 'A' && char <= 'Z') return UPPER;
+    if (char >= '0' && char <= '9') return DIGIT;
+    return 0;
+  }
+
+  /** Whether name[at, at + length), lowercased, reads secret[from, from + length). */
+  function spells(name, at, secret, from, length) {
+    for (let i = 0; i < length; i += 1) {
+      const char = name[at + i];
+      if ((LOWERCASE[char] || char) !== secret[from + i]) return false;
+    }
+    return true;
+  }
+
+  function isSecretNameIn(name, from, to) {
+    // The word before this one, for a name run across two (pass_word).
+    let before = -1;
+    let beforeSize = 0;
+    let i = from;
+    while (i < to) {
+      if (!charKind(name[i])) {
+        i += 1;
+        continue;
+      }
+      const start = i;
+      i += 1;
+      while (i < to) {
+        const kind = charKind(name[i]);
+        if (!kind) break;
+        if (kind === UPPER) {
+          // fooBar and foo2Bar turn at the capital, and HTTPServer at the
+          // last capital of the run, the one a small letter follows.
+          if (charKind(name[i - 1]) !== UPPER) break;
+          if (i + 1 < to && charKind(name[i + 1]) === LOWER) break;
+        }
+        i += 1;
+      }
+      // otp1, cvv2: digits after a letter are not part of the word, though
+      // a word of digits alone is kept whole.
+      let end = i;
+      while (end > start && charKind(name[end - 1]) === DIGIT) end -= 1;
+      if (end === start) end = i;
+      const size = end - start;
+      for (let n = 0; n < WORDS.length; n += 1) {
+        const secret = WORDS[n];
+        const length = secret.length;
+        if (
+          (size === length && spells(name, start, secret, 0, length)) ||
+          (size === length + 1 &&
+            spells(name, start, secret, 0, length) &&
+            spells(name, end - 1, 's', 0, 1)) ||
+          (before >= 0 &&
+            beforeSize + size === length &&
+            spells(name, before, secret, 0, beforeSize) &&
+            spells(name, start, secret, beforeSize, size)) ||
+          (length >= 5 &&
+            size >= length &&
+            (spells(name, start, secret, 0, length) || spells(name, end - length, secret, 0, length)))
+        ) {
+          return true;
+        }
+      }
+      before = start;
+      beforeSize = size;
+    }
+    return false;
+  }
+
+  /** The name test for a value that should be a string, whatever it is. */
+  function isSecretText(value) {
+    const name = typeof value === 'string' ? value : NativeString(value);
+    return isSecretNameIn(name, 0, name.length);
+  }
+
+  /** Array.prototype.includes, for a list of this file's own. */
+  function listed(list, value) {
+    for (let i = 0; i < list.length; i += 1) {
+      if (list[i] === value) return true;
+    }
+    return false;
+  }
+
   function truncate(str) {
     if (typeof str !== 'string') str = String(str);
     return str.length > MAX_STRING ? str.slice(0, MAX_STRING) + ' …[truncated]' : str;
@@ -113,22 +253,68 @@
   // that its cost has a bound whatever its length. It is kept only in
   // longKeys, which lasts for one serialize call, so that the page's long
   // strings are not held after it.
-  const secretKeys = new Map();
+  const secretKeys = new NativeMap();
+  // Counted here rather than read from secretKeys.size, a getter the page
+  // can replace like any other.
+  let cachedKeys = 0;
+
+  /** Whether name[from, to) is made of digits alone. */
+  function digitsIn(name, from, to) {
+    for (let i = from; i < to; i += 1) {
+      if (name[i] < '0' || name[i] > '9') return false;
+    }
+    return true;
+  }
+
+  /**
+   * Whether what the name test reads of a key, all of it or a long key's two
+   * ends, is digits alone. The test finds no word in digits, so such a key is
+   * never secret, and this reads no further than the test itself would. A
+   * loop over the whole key would cost the page more for a long one than the
+   * regular expression it replaces.
+   */
+  function isNumeric(key) {
+    const length = key.length;
+    if (length <= 400) return length > 0 && digitsIn(key, 0, length);
+    return digitsIn(key, 0, 200) && digitsIn(key, length - 200, length);
+  }
 
   function isSecretKey(key, longKeys) {
     // An array's index, the most common key of all, is never a field name,
-    // and is kept out of the cache, which one long array would fill.
-    if (/^\d+$/.test(key)) return false;
-    const known = secretKeys.get(key) ?? longKeys.get(key);
+    // and is kept out of the cache, which one long array would fill. Nor is
+    // any other key of digits, which is kept out of longKeys as well: V8
+    // hashes a string of more than 16 383 characters by its length alone, so
+    // many long keys of one length make every lookup there walk them all.
+    if (isNumeric(key)) return false;
+    const known = mapGet(secretKeys, key) ?? mapGet(longKeys, key);
     if (known !== undefined) return known;
     if (key.length <= 400) {
-      const secret = isSecretName(key);
-      if (secretKeys.size < 2000) secretKeys.set(key, secret);
+      const secret = isSecretNameIn(key, 0, key.length);
+      if (cachedKeys < 2000) {
+        mapSet(secretKeys, key, secret);
+        cachedKeys += 1;
+      }
       return secret;
     }
-    const secret = isSecretName(key.slice(0, 200)) || isSecretName(key.slice(-200));
-    longKeys.set(key, secret);
+    const secret =
+      isSecretNameIn(key, 0, 200) || isSecretNameIn(key, key.length - 200, key.length);
+    mapSet(longKeys, key, secret);
     return secret;
+  }
+
+  /**
+   * Whether JSON.stringify prints this holder's members with no name in
+   * front, as it does an array's elements. It tells the two apart as
+   * Array.isArray does, seeing through a proxy, so this asks the same. Only a
+   * proxy the page revoked during the walk makes that throw, and it is then
+   * taken as an array: a name left uncounted lets more be printed, never less.
+   */
+  function printsNoNames(holder) {
+    try {
+      return isArray(holder);
+    } catch {
+      return true;
+    }
   }
 
   function serialize(value) {
@@ -156,24 +342,59 @@
       // entire string in memory before truncate() discards all but 600 chars.
       // On a page logging a large interlinked object graph that would hang the
       // page itself, since this runs in the page's own world.
+      //
+      // Nor does the node budget bound characters. Two hundred rows of ten
+      // keys 100 000 characters long are 2 200 nodes and a string of 200
+      // million characters, built in the page's time to keep 600. So
+      // the replacer also counts what is certain to be printed ahead of the
+      // value in hand: the names of the members it has let through and their
+      // string values. An array's element prints with no name, so its index
+      // is not counted, while an object's key is, digits or not. Past
+      // CHAR_BUDGET it leaves every further member out, its name with it,
+      // which a replaced value would not do, and an array element prints as
+      // null. More than MAX_STRING characters precede whatever is left out,
+      // so truncate() returns what it did before, character for character.
+      // JSON.stringify still reads every member it leaves out, and its
+      // toJSON, in the object where the budget ran out and in each one
+      // around it as it climbs back out, so a getter or toJSON that throws
+      // there still makes the value [unserializable]. It never descends into
+      // a member left out, so one that throws inside it no longer does, nor
+      // does a BigInt left out or inside one, as neither did past the node
+      // budget.
       const ancestors = [];
-      const longKeys = new Map();
+      const longKeys = new NativeMap();
       let budget = 4000;
-      return truncate(
-        JSON.stringify(value, function (key, current) {
-          if (budget <= 0) return '[…budget exceeded]';
-          budget -= 1;
-          // A logged request or user object carries its Authorization header
-          // or password under a name that says so (see isSecretName).
-          if (key && isSecretKey(key, longKeys) && withheld(current)) return REDACTED;
-          if (typeof current === 'object' && current !== null) {
-            while (ancestors.length && ancestors[ancestors.length - 1] !== this) {
-              ancestors.pop();
-            }
-            if (ancestors.includes(current)) return '[Circular]';
-            ancestors.push(current);
+      let printed = 0;
+      const visit = (holder, key, current) => {
+        if (budget <= 0) return '[…budget exceeded]';
+        budget -= 1;
+        // A logged request or user object carries its Authorization header
+        // or password under a name that says so (see isSecretName).
+        if (key && isSecretKey(key, longKeys) && withheld(current)) return REDACTED;
+        if (typeof current === 'object' && current !== null) {
+          while (ancestors.length && ancestors[ancestors.length - 1] !== holder) {
+            ancestors.pop();
           }
-          return current;
+          if (ancestors.includes(current)) return '[Circular]';
+          ancestors.push(current);
+        }
+        return current;
+      };
+      return truncate(
+        stringify(value, function (key, current) {
+          if (printed > CHAR_BUDGET) return undefined;
+          let result = visit(this, key, current);
+          // A string past the budget is printed only as far as the budget,
+          // which is still far more than truncate() keeps.
+          if (typeof result === 'string' && result.length > CHAR_BUDGET) {
+            result = sliceString(result, 0, CHAR_BUDGET);
+          }
+          // undefined, a function and a symbol print nothing, name included.
+          if (result !== undefined && typeof result !== 'function' && typeof result !== 'symbol') {
+            if (!printsNoNames(this)) printed += key.length;
+            if (typeof result === 'string') printed += result.length;
+          }
+          return result;
         })
       );
     } catch {
@@ -458,7 +679,12 @@
   }
 
   // ------------------------------------------------------------------- XHR --
-  // Each open() starts a record of its own, kept on the object as __cdrReq.
+  // Each open() starts a record of its own, kept in a WeakMap of the
+  // collector's rather than on the object. An own property would show in the
+  // page's own Object.keys and JSON.stringify of the object, the url and
+  // method with it, and assigning one writes onto whatever `this` the page
+  // called the method with, XMLHttpRequest or not. The WeakMap keeps nothing
+  // alive: an object's entry goes when the object does.
   //
   // One object can carry two requests at once. A page may reopen it from
   // inside a handler of the request that is just finishing: a retry in
@@ -481,6 +707,30 @@
   const nativeSetTimeout = window.setTimeout;
   const nativeAddEventListener = EventTarget.prototype.addEventListener;
 
+  const xhrs = new WeakMap();
+  const weakGet = uncurry(WeakMap.prototype.get);
+  const weakSet = uncurry(WeakMap.prototype.set);
+
+  /**
+   * One object's bookkeeping, made on first use: req is the request its last
+   * open() started, parked a finished one whose late events are still due
+   * (see park()), and hooked whether the listeners are on.
+   */
+  function stateOf(xhr) {
+    let state = weakGet(xhrs, xhr);
+    if (!state) {
+      state = { req: null, parked: null, hooked: false };
+      weakSet(xhrs, xhr, state);
+    }
+    return state;
+  }
+
+  /** The request this object's last open() started, if any. */
+  function currentOf(xhr) {
+    const state = weakGet(xhrs, xhr);
+    return state ? state.req : null;
+  }
+
   /**
    * The record an abort, timeout or loadend event belongs to. A finishing
    * request's own events arrive while the object is DONE (readyState 4). Late
@@ -489,9 +739,11 @@
    * then: a settled record gets no more events of its own.
    */
   function recordFor(xhr) {
-    const current = xhr.__cdrReq;
+    const state = weakGet(xhrs, xhr);
+    if (!state) return null;
+    const current = state.req;
     if (xhr.readyState === 4 && current && !current.settled) return current;
-    return xhr.__cdrParked || current;
+    return state.parked || current;
   }
 
   /**
@@ -502,27 +754,42 @@
    * A record is parked once at most, which keeps the chain below acyclic.
    */
   function finishing(xhr) {
-    const record = xhr.__cdrReq;
+    const record = currentOf(xhr);
     if (!record || !record.sent || record.settled || record.ended || xhr.readyState !== 4) {
       return null;
     }
     return { record, status: xhr.status, statusText: xhr.statusText };
   }
 
+  /**
+   * The request on this object if it is still in flight: sent, not yet DONE,
+   * and not settled. Read before an open() that cancels it or an abort() that
+   * ends it, since afterwards nothing on the object says it was running.
+   */
+  function inFlight(xhr) {
+    const record = currentOf(xhr);
+    if (!record || !record.sent || record.settled || record.ended) return null;
+    const readyState = xhr.readyState;
+    return readyState >= 1 && readyState <= 3 ? record : null;
+  }
+
   /** Credit a finished request's late events to its own record. */
   function park(xhr, { record, status, statusText }) {
-    record.ended = { status, statusText };
+    const state = stateOf(xhr);
+    // The time too, for a record its fallback below settles a task later.
+    record.ended = { status, statusText, at: elapsed() };
     // Parks can nest. A handler of a parked request can finish a second one
     // synchronously, with an abort() or a synchronous send(), and that one is
     // parked in turn when the handler reopens. Chrome then delivers the inner
     // request's late events first and the outer's after, so the slot is a
     // stack: settle() hands it back to the record underneath.
-    record.under = xhr.__cdrParked || null;
-    xhr.__cdrParked = record;
+    record.under = state.parked || null;
+    state.parked = record;
     try {
       // In case no further event arrives for it. settle() ignores a record its
       // loadend has already recorded.
       nativeSetTimeout.call(window, () => settle(xhr, record), 0);
+      record.fallback = true;
     } catch {
       /* ignore */
     }
@@ -533,10 +800,11 @@
     try {
       if (!record || !record.sent || record.settled) return;
       record.settled = true;
-      if (xhr.__cdrParked === record) {
+      const state = weakGet(xhrs, xhr);
+      if (state && state.parked === record) {
         let below = record.under;
         while (below && below.settled) below = below.under;
-        xhr.__cdrParked = below || null;
+        state.parked = below || null;
       }
       record.under = null;
 
@@ -544,6 +812,7 @@
       // status now belongs to the request that replaced it.
       const status = record.ended ? record.ended.status : xhr.status;
       const statusText = record.ended ? record.ended.statusText : xhr.statusText;
+      const end = record.ended ? record.ended.at : elapsed();
 
       // Released before the success early return below. An unformatted V8
       // Error holds a strong reference to every recorded frame's function and
@@ -563,7 +832,7 @@
         url: truncate(record.url || xhr.responseURL || ''),
         status,
         statusText: status === 0 ? (outcome ? '' : 'Network failure') : statusText,
-        ms: Math.round(elapsed() - (record.started || elapsed())),
+        ms: Math.round(end - (record.started || end)),
         via: 'xhr',
       };
       if (outcome) entry.outcome = outcome;
@@ -575,20 +844,70 @@
     }
   }
 
+  /**
+   * The abort, timeout and loadend listeners, put on once per object rather
+   * than once per send. A page that long-polls by reusing a single
+   * XMLHttpRequest would otherwise accumulate one listener per send and
+   * record the same failure N times, flushing every other entry out of the
+   * ring buffer. They go on at the first open() rather than the first send(),
+   * so that a listener the page adds between the two cannot stop an event
+   * (stopImmediatePropagation) before it reaches them. One added before the
+   * first open() still can, and nothing short of replacing the constructor
+   * would go on earlier.
+   */
+  function hook(xhr, state) {
+    if (state.hooked) return;
+    state.hooked = true;
+    // Both fire before loadend, which is how a request the page ended
+    // itself is told apart from one that failed.
+    const mark = (event) => {
+      try {
+        const target = recordFor(xhr);
+        if (target && !target.settled) {
+          target.outcome = event.type === 'timeout' ? 'timeout' : 'aborted';
+        }
+      } catch {
+        /* ignore */
+      }
+    };
+    nativeAddEventListener.call(xhr, 'abort', mark);
+    nativeAddEventListener.call(xhr, 'timeout', mark);
+    nativeAddEventListener.call(xhr, 'loadend', () => {
+      try {
+        const record = recordFor(xhr);
+        // A request that ended with no response and was parked waits for its
+        // fallback, a task from now, rather than being settled here unlabelled.
+        // When a handler of its readystatechange runs a synchronous request
+        // to the end, Chrome dispatches that request's load and loadend once
+        // more before this request's own timeout or abort event, so this
+        // loadend can come first. A plain network failure is only recorded a
+        // task later for it.
+        if (record && record.fallback && !record.outcome && record.ended.status === 0) return;
+        settle(xhr, record);
+      } catch {
+        /* ignore */
+      }
+    });
+  }
+
   // Named so that callerFrames() can drop this frame from a capture.
   // Declared with (method, url) so that open.length stays 2, as native, but
   // forwarded with `arguments` (unmapped, in strict mode) so the browser sees
   // exactly what the page passed. open('GET') must still throw for a missing
   // url, not quietly request one called "undefined".
   XMLHttpRequest.prototype.open = function cdrXhrOpen(method, url) {
+    let state = null;
     let ended = null;
+    let cancelled = null;
     let previous = null;
     try {
+      state = stateOf(this);
       ended = finishing(this);
-      previous = { req: this.__cdrReq, parked: this.__cdrParked };
+      cancelled = inFlight(this);
+      previous = { req: state.req, parked: state.parked };
       // In place before the native open() runs, because that call fires a
       // readystatechange of its own, and a page may send() from it.
-      this.__cdrReq = {
+      state.req = {
         method,
         url,
         // Captured in open() rather than send(), because open() is where the
@@ -600,6 +919,12 @@
         outcome: '',
         settled: false,
         ended: null,
+        // Every field read later is an own one from the start. One left for
+        // park() to add would be looked up on Object.prototype until then,
+        // where a page can put anything: a fallback that read as true there
+        // would stop the loadend listener from settling any request at all.
+        under: null,
+        fallback: false,
       };
     } catch {
       /* ignore */
@@ -613,8 +938,8 @@
       // the bookkeeping goes back to match.
       try {
         if (previous) {
-          this.__cdrReq = previous.req;
-          this.__cdrParked = previous.parked;
+          state.req = previous.req;
+          state.parked = previous.parked;
         }
       } catch {
         /* ignore */
@@ -623,6 +948,18 @@
     }
     try {
       if (ended) park(this, ended);
+      if (cancelled) {
+        // Chrome cancels a request still in flight here and dispatches no
+        // event for it, not even loadend, so nothing else would ever record
+        // it. It is the page ending its own request, as abort() is, and an
+        // abort() of it is recorded as aborted.
+        cancelled.outcome = 'aborted';
+        cancelled.ended = { status: 0, statusText: '', at: elapsed() };
+        settle(this, cancelled);
+      }
+      // Only now, once the native open() has accepted `this`, which no object
+      // but an XMLHttpRequest does.
+      hook(this, state);
     } catch {
       /* ignore */
     }
@@ -631,14 +968,24 @@
 
   XMLHttpRequest.prototype.abort = function cdrXhrAbort(...args) {
     let ended = null;
+    let running = null;
     try {
       ended = finishing(this);
+      running = inFlight(this);
+      // Labelled before the native abort() dispatches anything, rather than
+      // left to the abort listener. Chrome can deliver a loadend ahead of the
+      // abort event (see the loadend listener), and a listener the page added
+      // before ours can stop the event from reaching it.
+      if (running) running.outcome = 'aborted';
     } catch {
       /* ignore */
     }
     const result = nativeAbort.apply(this, args);
     try {
       if (ended) park(this, ended);
+      // The native abort() has dispatched its loadend by now, so if no
+      // listener of ours got to settle the request, nothing else will.
+      if (running) settle(this, running);
     } catch {
       /* ignore */
     }
@@ -650,42 +997,16 @@
     let before = null;
     let opened = false;
     try {
-      record = this.__cdrReq;
+      record = currentOf(this);
       opened = this.readyState === 1;
       if (record) {
         before = { started: record.started, sent: record.sent };
         record.started = elapsed();
         record.sent = true;
       }
-
-      // The listeners are attached once per object, not per send. A page that
-      // long-polls by reusing a single XMLHttpRequest would otherwise
-      // accumulate one listener per send and record the same failure N times,
-      // flushing every other entry out of the ring buffer.
-      if (!this.__cdrHooked) {
-        this.__cdrHooked = true;
-        // Both fire before loadend, which is how a request the page ended
-        // itself is told apart from one that failed.
-        const mark = (event) => {
-          try {
-            const target = recordFor(this);
-            if (target && !target.settled) {
-              target.outcome = event.type === 'timeout' ? 'timeout' : 'aborted';
-            }
-          } catch {
-            /* ignore */
-          }
-        };
-        nativeAddEventListener.call(this, 'abort', mark);
-        nativeAddEventListener.call(this, 'timeout', mark);
-        nativeAddEventListener.call(this, 'loadend', () => {
-          try {
-            settle(this, recordFor(this));
-          } catch {
-            /* ignore */
-          }
-        });
-      }
+      // On since open() as a rule, but a page can send() from the
+      // readystatechange that open() fires, before open() returns.
+      if (opened) hook(this, stateOf(this));
     } catch {
       /* ignore */
     }
@@ -776,12 +1097,18 @@
   // <PasswordField type="password" value={pw}>, or a Vue v-model.
   const VALUE_PROPS = ['value', 'defaultValue', 'modelValue'];
 
-  /** Whether the props describe a field that holds a password, code or card. */
+  /**
+   * Whether the props describe a field that holds a password, code or card.
+   * Asked through the natives taken at the top, as the name test is.
+   */
   function secretField(props) {
     try {
-      const type = String(props.type || '').toLowerCase();
-      const fill = String(props.autoComplete || props.autocomplete || '');
-      return type === 'password' || /password|one-time-code|cc-(?:number|csc|exp)/i.test(fill);
+      const type = lowerCase(NativeString(props.type || ''));
+      const fill = NativeString(props.autoComplete || props.autocomplete || '');
+      return (
+        type === 'password' ||
+        execRegExp(/password|one-time-code|cc-(?:number|csc|exp)/i, fill) !== null
+      );
     } catch {
       return false;
     }
@@ -813,7 +1140,7 @@
         const secret =
           withheld(value) &&
           typeof value !== 'object' &&
-          (isSecretName(key) || (field && VALUE_PROPS.includes(key)));
+          (isSecretText(key) || (field && listed(VALUE_PROPS, key)));
         out.push(key + '=' + (secret ? REDACTED : summariseValue(value)));
       }
     } catch {
@@ -1231,7 +1558,9 @@
       // perfectly readable handler was dropped) and too loose (a production
       // build with keepNames has real names over a minified body).
       if (!/[A-Za-z_$]{4,}/.test(text)) return '';
-      if (isSecretName(text)) return '';
+      // Both privacy tests go through the natives taken at the top, as the
+      // props' do, so a page that has replaced a method cannot pass a secret.
+      if (isSecretText(text)) return '';
       // The keyword test above only catches a secret that happens to sit next
       // to a telling word. A bearer token pasted into a headers object has no
       // such word near it, so this second test is on the shape of the value:
@@ -1239,7 +1568,7 @@
       // characters in it. Anything that long is either a credential or a
       // string too unwieldy to be a useful grep target, so dropping it costs
       // the reader nothing in either case.
-      if (/(['"`])[A-Za-z0-9_\-.]{20,}\1/.test(text)) return '';
+      if (execRegExp(/(['"`])[A-Za-z0-9_\-.]{20,}\1/, text) !== null) return '';
       return text.length > STARTS_MAX ? text.slice(0, STARTS_MAX) + '…' : text;
     } catch {
       return '';

@@ -133,17 +133,44 @@
 
   // Whole names that carry a secret in a url, though as words they are too
   // common to treat as secret anywhere (errorCode, sortKey): an OAuth code, an
-  // API key, a signed url's signature, a single sign on ticket.
-  const SECRET_PARAMS = ['code', 'key', 'sig', 'ticket'];
+  // API key, a signed url's signature, a single sign on ticket, a session id
+  // in the form PHP and forum software put in a url when cookies are off.
+  const SECRET_PARAMS = ['code', 'key', 'sig', 'ticket', 'sid'];
 
   // Embedded credentials: up to the last '@' before the path, since a password
   // can hold one. A scheme relative url (//user:pass@host) carries them too.
   const CREDENTIALS = /^((?:[a-z][a-z0-9+.-]*:)?\/\/)([^/?#\s]*)@/i;
 
+  // Where the host of a url ends, and so where its credentials must have ended.
+  const HOST_END = /[/?#\s]/g;
+
+  // What a userinfo may be made of: anything but a control character or one
+  // of "<>[\]^`{|}, none of which RFC 3986 lets one hold. It has stopped at
+  // '/', '?', '#' and white space already, and runs to the last '@', since a
+  // password can hold one. Letters of any script count, as in an IRI.
+  const USERINFO = /^[^\x00-\x1f\x7f"<>[\\\]^`{|}]+$/;
+
   // How many urls deep a value is followed (a return address holding a return
   // address). Past that the value is masked whole: a page that nests further is
   // either broken or built to run this out of stack.
   const MAX_NESTING = 4;
+
+  /**
+   * isSecretName with a bound on its cost. A name too long to be a field's (a
+   * url or a blob used as a key or an id) is judged by its first and last 200
+   * characters, where a field name sits, so that a name of a million
+   * characters costs no more than a short one; the collector judges a long key
+   * the same way.
+   */
+  function isSecretNameBounded(name) {
+    if (name.length <= 400) return isSecretName(name);
+    return isSecretName(name.slice(0, 200)) || isSecretName(name.slice(-200));
+  }
+
+  /** Whether a parameter's name marks its value as secret. */
+  function isSecretParam(name) {
+    return SECRET_PARAMS.includes(name.toLowerCase()) || isSecretNameBounded(name);
+  }
 
   /**
    * A query (`?a=1&token=x`) or fragment (`#access_token=x`) with the value of
@@ -157,8 +184,9 @@
     // Pairs end at '&', and at a ';' that a name and '=' follow. Some servers
     // separate pairs with ';', and serialised markup writes '&' as '&amp;',
     // whose ';' would otherwise leave the next name as 'amp;token'. A ';' with
-    // no '=' after it is part of the value, and goes with it.
-    const pieces = part.slice(1).split(/(&|;(?=[^&;=]*=))/);
+    // no '=' after it is part of the value, and goes with it. JSON may write
+    // '&' as \u0026, which ends a pair too.
+    const pieces = part.slice(1).split(/(&|\\u0026|;(?=[^&;=]*=))/i);
     for (let index = 0; index < pieces.length; index += 2) {
       const pair = pieces[index];
       const eq = pair.indexOf('=');
@@ -172,10 +200,7 @@
       // A hash router's fragment carries a route before its query.
       name = name.slice(name.lastIndexOf('?') + 1);
       const value = pair.slice(eq + 1);
-      const masked =
-        SECRET_PARAMS.includes(name.toLowerCase()) || isSecretName(name)
-          ? REDACTED
-          : nestedUrl(value, depth);
+      const masked = isSecretParam(name) ? REDACTED : nestedUrl(value, depth);
       if (masked === value) continue;
       pieces[index] = pair.slice(0, eq + 1) + masked;
       changed = true;
@@ -191,15 +216,20 @@
   function nestedUrl(value, depth) {
     const holdsUrl = (text) => /[?#]/.test(text) || credentialsAt(text) !== null;
     if (holdsUrl(value)) return depth < MAX_NESTING ? screenUrl(value, depth + 1) : REDACTED;
-    if (!/%3F|%23|%40/i.test(value)) return value;
+    // %253F is a '?' encoded twice, as a return address inside a return
+    // address's own encoding arrives.
+    if (!/%(?:25)*(?:3F|23|40)/i.test(value)) return value;
     let decoded;
     try {
       decoded = decodeURIComponent(value);
     } catch {
       return value;
     }
-    if (!holdsUrl(decoded)) return value;
-    return depth < MAX_NESTING && screenUrl(decoded, depth + 1) === decoded ? value : REDACTED;
+    if (holdsUrl(decoded)) {
+      return depth < MAX_NESTING && screenUrl(decoded, depth + 1) === decoded ? value : REDACTED;
+    }
+    // Still encoded once more: decoded again, one level deeper.
+    return depth < MAX_NESTING && nestedUrl(decoded, depth + 1) === decoded ? value : REDACTED;
   }
 
   /**
@@ -225,15 +255,76 @@
     return found && (found[2].includes(':') || !/[^\x00-\x7f]/.test(found[2])) ? found : null;
   }
 
+  /**
+   * The text with the credentials of every url in it removed, wherever the url
+   * starts: a second url run into the first (https://cors.test/https://u:p@…),
+   * one after letters of another script, or one written in JSON, whose ':\/\/'
+   * is a '://'. After a scheme, a userinfo goes as credentialsAt would take it.
+   * After a bare '//', which a comment or a path can hold too, only one with a
+   * ':' in it, and only characters a userinfo may hold, does: XPath writes
+   * //xs:element[@name='x'], whose '[' no userinfo has. Each stretch between
+   * two '/' is read once, so the cost is one pass whatever the text.
+   */
+  function withoutCredentials(text) {
+    if (!text.includes('@')) return text;
+    let out = '';
+    let kept = 0;
+    let slash = text.indexOf('/');
+    while (slash !== -1) {
+      const json = text[slash - 1] === '\\' && text.startsWith('\\/', slash + 1);
+      if (text[slash + 1] !== '/' && !json) {
+        slash = text.indexOf('/', slash + 1);
+        continue;
+      }
+      const lead = json ? text[slash - 2] : text[slash - 1];
+      const from = slash + (json ? 3 : 2);
+      HOST_END.lastIndex = from;
+      const end = HOST_END.exec(text)?.index ?? text.length;
+      const host = text.slice(from, end);
+      const userinfo = host.slice(0, Math.max(host.lastIndexOf('@'), 0));
+      const at = from + userinfo.length;
+      const scheme = lead === ':';
+      const loose =
+        !scheme && (lead === undefined || !/[\w/.:\\]/.test(lead)) && USERINFO.test(userinfo);
+      if (
+        userinfo &&
+        (userinfo.includes(':') || (scheme && !/[^\x00-\x7f]/.test(userinfo))) &&
+        (scheme || loose)
+      ) {
+        out += text.slice(kept, from);
+        kept = at + 1;
+      }
+      slash = end < text.length ? text.indexOf('/', end) : -1;
+    }
+    return kept ? out + text.slice(kept) : text;
+  }
+
+  /**
+   * The part of a url before its query with the secret values of any path
+   * parameters masked: Java's ;jsessionid=, a connection string's
+   * ;password=. A ';' with no '=' after it changes nothing. A data: url's
+   * parameters (;charset=utf8) end at its comma. What follows is its content,
+   * not more parameters: an svg, each of whose %23 colours would read as one
+   * more nested url, or base64, whose '=' padding would end a name made of
+   * random letters.
+   */
+  function maskPath(path, depth) {
+    const comma = /^\s*data:/i.test(path) ? path.indexOf(',') : -1;
+    const end = comma === -1 ? path.length : comma;
+    const semi = path.indexOf(';');
+    if (semi === -1 || semi > end) return path;
+    return path.slice(0, semi) + maskParams(path.slice(semi, end), depth) + path.slice(end);
+  }
+
   function screenUrl(url, depth) {
     const credentials = credentialsAt(url);
-    const bare = credentials ? credentials[1] + url.slice(credentials[0].length) : url;
+    const bare = withoutCredentials(credentials ? credentials[1] + url.slice(credentials[0].length) : url);
     const cut = bare.search(/[?#]/);
-    if (cut === -1) return bare;
+    if (cut === -1) return maskPath(bare, depth);
     const hashAt = bare.indexOf('#', cut);
     const search = hashAt === -1 ? bare.slice(cut) : bare.slice(cut, hashAt);
     const hash = hashAt === -1 ? '' : bare.slice(hashAt);
-    return bare.slice(0, cut) + maskParams(search, depth) + maskParams(hash, depth);
+    return maskPath(bare.slice(0, cut), depth) + maskParams(search, depth) + maskParams(hash, depth);
   }
   // SECRET URLS END
 
@@ -575,33 +666,54 @@
       return text.trim().replace(/\s+/g, ' ').slice(0, 200);
     }
 
-    // The opening tag at the start of outerHTML. It always writes a value in
-    // double quotes and escapes any '"' inside it, but Chrome before 138
-    // leaves a '>' in a value as it is, so the first '>' is not always the end.
-    const LEADING_TAG = /^<[A-Za-z][^\s/>]*(?:\s+[^\s"'>/=]+="[^"]*")*\s*\/?>/;
+    /**
+     * A masked opening tag cut to fit in `room` characters. Every attribute
+     * stays, with a value over 120 characters cut as the attribute list cuts
+     * it (a data: url in a src, a long inline style), and a tag still too
+     * long after that is cut itself. Cut after masking, so nothing hidden can
+     * come back.
+     */
+    function shortTag(tag, room) {
+      if (tag.length <= room) return tag;
+      const cut = tag.replace(ATTRIBUTE, (whole, space, name, value) =>
+        value.length > 120 ? `${space}${name}="${value.slice(0, 120)}…"` : whole
+      );
+      return cut.length <= room ? cut : `${cut.slice(0, room - 2)}…>`;
+    }
 
     /**
      * A deeply nested element's outerHTML can be hundreds of kilobytes. The
      * opening tag carries most of the debugging value (that is where classes,
-     * data attributes and inline styles live), so it is always preserved and
-     * only the children are cut.
+     * data attributes and inline styles live), so it is kept, cut only when
+     * it alone would not fit, and the children are cut.
      */
     function markup(element) {
-      // Masked before anything is cut, so a cut cannot fall inside a tag and
-      // leave half a secret that no longer looks like one.
+      // The opening tag is found before masking, since the marker holds a
+      // '>' of its own; masked, it is where the masked whole starts.
       const raw = element.outerHTML || '';
-      const full = maskMarkup(raw);
+      const leading = LEADING_TAG.exec(raw);
+      const openTag = leading ? maskMarkup(leading[0]) : '';
+      // Masked before anything is cut, so a cut cannot fall inside a tag and
+      // leave half a secret that no longer looks like one. Only as much is
+      // masked as can be kept: the opening tag and a full budget after it.
+      const full = maskedStart(raw, openTag.length + MAX_HTML);
       if (full.length <= MAX_HTML) return { html: full, truncated: false };
 
-      // The opening tag is found before masking, since the marker holds a
-      // '>' of its own. A tag the pattern cannot read (an attribute name with
-      // a quote in it) is cut from the masked whole instead.
-      const leading = LEADING_TAG.exec(raw);
-      const openTag = leading ? maskMarkup(leading[0]) : full.slice(0, 200);
-      const budget = MAX_HTML - openTag.length - 60;
-      const inner = maskMarkup(element.innerHTML || '').slice(0, Math.max(budget, 0));
+      const readable = leading !== null && full.startsWith(openTag);
+      const shown = readable ? shortTag(openTag, MAX_HTML - 60) : full.slice(0, 200);
+      // A void element (img, input) is its opening tag and nothing else: it
+      // has no children to count and no closing tag.
+      if (readable && leading[0].length === raw.length) return { html: shown, truncated: true };
+
+      // The closing tag as outerHTML wrote it, which keeps an SVG name's case.
+      const closing = /<\/[^\s<>"]+>$/.exec(raw)?.[0] ?? `</${element.tagName.toLowerCase()}>`;
+      // The children run up to the closing tag when the masking read to the
+      // end, and are printed only up to their share of MAX_HTML.
+      const from = readable ? openTag.length : shown.length;
+      const to = full.endsWith(closing) ? full.length - closing.length : full.length;
+      const inner = full.slice(from, Math.min(to, from + Math.max(MAX_HTML - shown.length - 60, 0)));
       return {
-        html: `${openTag}\n${inner}\n  <!-- …${element.children.length} child element(s), truncated -->\n</${element.tagName.toLowerCase()}>`,
+        html: `${shown}\n${inner}\n  <!-- …${element.children.length} child element(s), truncated -->\n${closing}`,
         truncated: true,
       };
     }
@@ -679,7 +791,7 @@
       if (/password|one-time-code|cc-(?:number|csc|exp)/i.test(get('autocomplete') || '')) {
         return true;
       }
-      return isSecretName(get('name') || '') || isSecretName(get('id') || '');
+      return isSecretNameBounded(get('name') || '') || isSecretNameBounded(get('id') || '');
     }
 
     /** One attribute's value as the payload may carry it. */
@@ -687,7 +799,7 @@
       if (!value) return value;
       const lower = name.toLowerCase();
       // HTML's accesskey is a keyboard shortcut, one character, not a key.
-      if (lower !== 'accesskey' && ((control && lower === 'value') || isSecretName(lower))) {
+      if (lower !== 'accesskey' && ((control && lower === 'value') || isSecretNameBounded(lower))) {
         return REDACTED;
       }
       if (URL_ATTRIBUTES.includes(lower)) return safeUrl(value);
@@ -709,14 +821,39 @@
       return value;
     }
 
+    // An attribute's name as outerHTML writes it back. The parser lets a name
+    // hold a quote or a '<' and start with an '=' (<div =x="1" a"b="2">), so
+    // only whitespace, '/', '>' and a later '=' end one. A tag the pattern
+    // could not read was left as written, every value in it unmasked.
+    const ATTRIBUTE_NAME = '(?:=[^\\s/>=]*|[^\\s/>=]+)';
+
     // An opening tag as outerHTML writes it, which always puts a value in
-    // double quotes; the value can still hold a '>' in older Chrome.
-    const OPEN_TAG = /<([A-Za-z][^\s/>]*)((?:\s+[^\s"'>/=]+="[^"]*")*)(\s*\/?)>/g;
-    const ATTRIBUTE = /(\s+)([^\s"'>/=]+)="([^"]*)"/g;
+    // double quotes; the value can still hold a '>' in older Chrome. A tag
+    // name stops at a '<': script text is written out raw, and a name that
+    // ran on through <a<a<a… was read again from every '<' in it, which
+    // took seconds. A name the parser made with a '<' in it (<div<x …>,
+    // <div<1 …>, <div< …>) is read from its last '<' instead, attributes and
+    // all. There a '<' sits inside a name, so what follows it need not be a
+    // letter, nor be there at all; a letter is left to the first branch, so
+    // that no '<' is read from twice.
+    const ATTRIBUTES = `(?:\\s+${ATTRIBUTE_NAME}="[^"]*")*`;
+    const OPEN_TAG = new RegExp(
+      `<([A-Za-z][^\\s/<>]*|(?<=[^\\s/>]<)(?![A-Za-z])[^\\s/<>]*)(${ATTRIBUTES})(\\s*\\/?)>`,
+      'g'
+    );
+    const ATTRIBUTE = new RegExp(`(\\s+)(${ATTRIBUTE_NAME})="([^"]*)"`, 'g');
+
+    // The tag outerHTML opens with, the picked element's own, its name read
+    // whole even when it holds a '<'. Anchored, it is read from one place
+    // only, so that costs one pass. Since a value may hold a '>' in older
+    // Chrome, the first '>' is not always its end.
+    const LEADING_TAG = new RegExp(`^<[A-Za-z][^\\s/>]*${ATTRIBUTES}\\s*\\/?>`);
 
     // A textarea's value is its text, not an attribute. Serialisation
     // escapes every '<' in that text, so it runs to the closing tag.
-    const TEXTAREA = /(<textarea((?:\s+[^\s"'>/=]+="[^"]*")*)\s*>)([^<]+)(?=<\/textarea>)/gi;
+    const TEXTAREA = new RegExp(`(<textarea(${ATTRIBUTES})\\s*>)([^<]+)(?=<\\/textarea>)`, 'gi');
+    const TEXTAREA_START = /<textarea/gi;
+    const TEXTAREA_END = /<\/textarea>/gi;
 
     /** Whether a textarea, given its attributes, holds a secret. */
     function secretTextarea(get) {
@@ -746,6 +883,60 @@
         const get = (wanted) => list.find((match) => match[2].toLowerCase() === wanted)?.[3] ?? null;
         return secretTextarea(get) ? open + REDACTED : whole;
       });
+    }
+
+    /**
+     * The start of maskMarkup(html): all of it, or at least its first `keep`
+     * characters, read from masking only as much of html as that takes. A
+     * subtree of megabytes is cut to MAX_HTML characters, and masking all of
+     * it cost more than serialising it did.
+     */
+    function maskedStart(html, keep) {
+      for (let size = keep * 2; size < html.length; ) {
+        const cut = safeCut(html, size);
+        if (cut >= html.length) break;
+        const masked = maskMarkup(html.slice(0, cut));
+        if (masked.length > keep) return masked;
+        // Masking took more out than it left (a long secret value), so the
+        // next try reads further.
+        size = cut * 4;
+      }
+      return maskMarkup(html);
+    }
+
+    /**
+     * The first place at or after `at` where html can be cut and its start
+     * masked as it would be masked in the whole: not inside an opening tag,
+     * whose later attributes would go unread, and not inside a textarea's
+     * text, which is masked only once its closing tag is seen. Each search
+     * goes on from where the last stopped, so this reads html once up to
+     * the cut.
+     */
+    function safeCut(html, at) {
+      let cut = at;
+      OPEN_TAG.lastIndex = 0;
+      TEXTAREA_START.lastIndex = 0;
+      let tag = OPEN_TAG.exec(html);
+      let area = TEXTAREA_START.exec(html);
+      for (;;) {
+        while (tag && tag.index < cut) {
+          cut = Math.max(cut, tag.index + tag[0].length);
+          tag = OPEN_TAG.exec(html);
+        }
+        // Only the last textarea opened before the cut can still be open
+        // at it: an earlier one's text ends at the next '<'.
+        let open = -1;
+        while (area && area.index < cut) {
+          open = area.index;
+          area = TEXTAREA_START.exec(html);
+        }
+        if (open === -1) return cut;
+        TEXTAREA_END.lastIndex = open;
+        const close = TEXTAREA_END.exec(html);
+        const end = close ? close.index + close[0].length : html.length;
+        if (end <= cut) return cut;
+        cut = end;
+      }
     }
     // MASKING END
 

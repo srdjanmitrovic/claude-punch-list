@@ -146,7 +146,7 @@ could see.
 | Message | From | To | Purpose |
 | :--- | :--- | :--- | :--- |
 | `cdr:arm` | panel | worker | Inject overlay or picker into a tab, under a fresh `armId` |
-| `cdr:disarm` | panel | worker | Tear down whatever is armed there, and every arm asked for there so far, replying once the page has repainted without it. The reply says `superseded` when an arm was asked for there meanwhile, whose overlay may be on the page |
+| `cdr:disarm` | panel | worker | Tear down whatever is armed there, and every arm asked for there so far, replying once the page has repainted without it, within about a second on a page that has not reached `document_idle` (the cancelled arms then come down as they land). The reply says `superseded` when an arm was asked for there meanwhile, whose overlay may be on the page |
 | `cdr:verify` | panel | worker | After a navigation, ask the page which mode, if any, is still live on it |
 | `cdr:check-tab` | panel | worker | Ask whether a tab is usable, and what is armed on it |
 | `cdr:armed` | worker | panel | A capture mode is now waiting on a tab. Carries the `armId` of the `cdr:arm` behind it, or none for the shortcut, so a panel can ignore the echo of an arm it cancelled in flight |
@@ -186,7 +186,9 @@ present the result as a valid capture, with no error anywhere.
 worker keeps a map so a panel that opens later can learn about it. The one shot `cdr:armed`
 broadcast is not enough by itself, because `Alt+Shift+C` opens the panel and arms the page in
 the same breath: the message can be sent before the panel document exists to hear it. The
-panel picks the state up from the `cdr:check-tab` reply instead.
+panel picks the state up from the `cdr:check-tab` reply instead. A capture message ends the arm
+in both places only when the mode armed is the one that sent it: a drag's message comes two
+frames after the release, and the other mode armed in between is live on the page.
 
 **The worker orders an arm and the disarm that cancels it.** A cancel can come while its arm is
 still on the way (Esc straight after a mode button, on a cold worker or a busy page), and the
@@ -199,16 +201,33 @@ tab before it, and an arm asked for after it stands. In practice the worker:
 * counts disarms per tab, and each arm takes the count when it is asked for. An arm whose count
   has moved before it injects drops out with nothing put on the page, and one whose count moves
   while it lands does not record itself as live;
-* waits for every arm still landing before sending the stop, because a file injection is read
-  from the package first and a function injection is not, so a stop sent second could reach the
-  page first;
+* drops an arm before it injects when a newer arm was asked for on that tab, because each arm's
+  lookups answer in their own time and an older one answered late would take the page back. An
+  arm replaced while it lands neither records nor announces itself;
+* puts a stop in the page's queue at once, where the page runs it at `document_idle` straight
+  after every arm already sent there, so the cancel holds if Chrome stops the worker during the
+  wait below;
+* waits for every arm still landing before the stop it answers on, because a file injection is
+  read from the package first and a function injection is not, so a stop sent second could reach
+  the page first. The wait is bounded at a second, since a page that never reaches
+  `document_idle` never lands an arm; when it runs out, the worker queues a second stop, which is
+  behind every cancelled arm by then;
 * skips the stop if an arm was asked for while it waited. That arm came after the cancel, lands
   after the ones cancelled, and its `start()` takes the page over, stopping the other mode if
-  need be.
+  need be;
+* otherwise answers once a stop that the page runs at once, rather than at `document_idle`, has
+  run and the page has painted without the overlay.
+
+An arm that finds, once it has landed, that a disarm came while it did queues a stop of its own,
+unless a newer arm was asked for. The disarm's stops are usually behind it already, but a file
+Chrome took longer than the bounded wait to read lands after all of them, and nothing else would
+take it down.
 
 Every arm from the panel carries an `armId`. The panel remembers the ids of the arms it
 cancelled or replaced and refuses both their `cdr:armed` broadcast and a `cdr:check-tab` answer
-that names one. The shortcut's arm has no id, so it is always news.
+that names one. The shortcut's arm has no id, so it is news unless the panel's armed state
+changed while the `cdr:check-tab` that names it was asking, in which case the worker may have
+read that answer before the change.
 
 **A navigation is checked, not assumed.** Chrome reports `pushState`, `replaceState` and a hash
 change as status `loading`, exactly as it does a real navigation, and only the real one takes
@@ -217,7 +236,10 @@ which controller is active (each exposes `isActive()`), after any arm still land
 and worker go dark only if neither is. An arm counts as landing from the moment it is asked for,
 not from its injection: a check that arrived while the worker still looked the tab up would
 otherwise ask a page the overlay had not reached, and turn the button dark over the overlay that
-landed a moment later. The overlay and the picker also stop themselves on
+landed a moment later. One probe runs per tab at a time. A request that comes while one runs
+waits for the next probe, which starts when that one ends and answers every request that came
+meanwhile, so a URL change costs two injections rather than four, and no request takes an answer
+read before the change it asks about. The overlay and the picker also stop themselves on
 `pagehide`, so a page restored from the back/forward cache cannot come back with a live overlay
 nothing outside it knows of.
 
@@ -258,10 +280,21 @@ again, and Chrome then delivers the inner request's late events before the outer
 parked slot is a stack. A handler can also run a synchronous request to the end without
 reopening, leaving the object DONE for a request that has already settled; a settled record
 gets no more events of its own, so what arrives next goes to the parked one. If no late event
-ever comes, a zero delay timer settles the parked
-record. That timer, and the collector's own listeners, go through the `setTimeout` and
+ever comes, a zero delay timer settles the parked record. Chrome can also deliver a `loadend`
+before the abort or timeout event, when a handler runs a synchronous request to the end, so a
+parked request that ended with no response and has no label yet is left to that timer and
+recorded a task later. That timer, and the collector's own listeners, go through the `setTimeout` and
 `addEventListener` the page had at `document_start`, not whatever zone.js or a fake clock has
 put in their place since, so an Angular page does not run change detection for them.
+
+The bookkeeping lives in a `WeakMap` inside the collector, not on the object, so the page never
+sees it in `Object.keys` or `JSON.stringify`, and nothing is written onto a `this` that is not an
+`XMLHttpRequest`. An `open()` over a request still in flight records that request as aborted,
+because Chrome cancels it without dispatching any event, `loadend` included. An `abort()` labels
+its request before the native call and settles it after, so a page listener that stops the abort
+or `loadend` event cannot hide it. The listeners go on at the first `open()` rather than the first
+`send()`, so a listener the page adds between the two cannot stop an event before it reaches
+them; one added before the first `open()` still can.
 
 A synchronous request that fails at the network level is the one case with no event at all:
 Chrome throws `NetworkError` out of `send()` and fires nothing, `loadend` included. The send
@@ -279,7 +312,10 @@ to `react-dom`'s internals while the page's own caller sat just below the cut.
 The collector keeps four rings of `LIMIT` entries: console errors, warnings, uncaught errors and
 failed loads, and failed requests. Warnings have their own because a development build can warn
 dozens of times per render, and in a shared ring that pushed out the error the report was about.
-Each ring counts what it drops, and the snapshot carries the counts, so the prompt can say the
+For the same reason, a full ring of failed requests drops a request the page ended itself (an
+abort, a timeout it set, an `open()` over it) before any real failure, so a type-ahead that
+cancels a request per keystroke cannot push out the failure the report is for. Each ring counts
+what it drops, and the snapshot carries the counts, so the prompt can say the
 log is the tail of a longer one. Every entry gets `t`, milliseconds since the collector started
 (`armedAt` in the snapshot), and `seq`, one count across all four rings: a failed request, the
 warning it causes and the throw after it routinely share a millisecond, and only the count keeps

@@ -60,7 +60,7 @@ npm run prompt minified # the same, for a production build with no real componen
 ```
 
 The tests use `node:test`, which ships with Node, so there is nothing to install. They live in
-`test/` and come in four kinds:
+`test/` and come in six kinds:
 
 * `test/prompt.test.mjs` renders the template against the samples in `tools/preview-prompt.mjs`,
   plus a few variations no preview shows, and compares each prompt byte for byte with a file in
@@ -70,12 +70,21 @@ The tests use `node:test`, which ships with Node, so there is nothing to install
   every wrapper to the rules below.
 * `test/picker.test.mjs` runs the picker's masking block, lifted out of `content/picker.js`
   between its `MASKING BEGIN` and `MASKING END` markers, against markup a picked form produces.
+* `test/worker.test.mjs` runs `background.js` in a `node:vm` realm against a model of the pages
+  it injects into (`test/support/worker-realm.mjs`), and holds the worker to its ordering rules:
+  an arm against the disarm that cancels it and against an older arm, a capture message against
+  the arm after it, and a probe against the change it asks about.
+* `test/panel.test.mjs` runs `sidepanel/panel.js` against a stub of the DOM
+  (`test/support/panel-realm.mjs`), with each test playing the worker, and checks which mode is
+  lit and what a Screen capture says when replies and broadcasts arrive in an unlucky order.
 * `test/static.test.mjs` checks what would otherwise only fail in Chrome: every file the manifest,
   the worker and the panel name exists, every file parses, the re-injected capture scripts
   declare nothing at the top level, and the copies of the secret name blocks agree.
 
-None of this runs Chrome. The stage and a real install are still the check for anything visual,
-for the worker, and for how the panel and the page hand focus back and forth. Keep any new test
+None of this runs Chrome. The worker and panel realms model the order in which Chrome was seen to
+run injections and deliver messages, so they catch a broken rule but not a change in Chrome. The
+stage and a real install are still the check for anything visual, for timing, and for how the
+panel and the page hand focus back and forth. Keep any new test
 dependency free, or make the dependency a dev only one that `npm run build` does not need.
 
 ## Things worth knowing before you change code
@@ -100,8 +109,10 @@ reading a single file, and breaking them tends to fail silently rather than loud
   `SECRET NAMES END` in `content/collector-main.js`, `content/picker.js` and
   `shared/prompt-template.js`, because two of those are injected into the page and cannot import
   the third. Change all three together (the url block likewise, in the picker and the template);
-  `npm test` fails if they differ. The README's privacy section lists what is screened and what
-  is not, and should change with them.
+  `npm test` fails if they differ. The collector judges names with `isSecretNameIn`, a copy of
+  `isSecretName` written without any method the page can replace, so a change to the rules of
+  `isSecretName` must be made there too; `test/collector.test.mjs` fails until the two agree. The
+  README's privacy section lists what is screened and what is not, and should change with them.
 * The picker reads a React fiber or a Vue instance by asking `content/collector-main.js`, because
   those live on the node as properties only the page's own JavaScript world can see. The node
   crosses the boundary as a temporary `data-cdr-pick` attribute, since the DOM is shared and the
