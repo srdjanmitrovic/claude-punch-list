@@ -69,11 +69,37 @@ const EXTRA = {
     return report;
   },
 
-  // A list where item 1 predates a reload of /checkout and item 3 was taken on
-  // /cart: one caution has to name both reasons.
+  // A list where /checkout reloaded between items 1 and 2, and item 3 was
+  // taken on /cart. Each item says where its entries went; item 2, the first
+  // capture on the new load, carries everything that load logged before it.
   'list-reloaded': () => {
     const report = sampleReport('mixed');
-    report.armedAt = report.items[1].capturedAt - 10 * 1000;
+    const reload = report.items[1].capturedAt - 10 * 1000;
+    // The same moments on the clock, measured from the new load.
+    for (const list of [report.consoleLines, report.errors, report.network]) {
+      for (const entry of list) entry.t -= reload - report.armedAt;
+    }
+    report.armedAt = reload;
+    report.items[1].armedAt = reload;
+    return report;
+  },
+
+  // Every item captured somewhere else, and the copy made from a page none of
+  // them were taken on: nothing to split by, so the log prints whole under a
+  // caution, as it did before items carried their load.
+  'list-all-elsewhere': () => {
+    const report = sampleReport('mixed');
+    // The account page loads after the last capture, and its entries follow.
+    report.armedAt = report.items[2].capturedAt + 20 * 1000;
+    report.page.url = 'http://localhost:3000/account';
+    return report;
+  },
+
+  // The walkthrough with the page toggle off: no url to tell the cart page
+  // from an earlier load, so item 3 says only that its log was not read.
+  'list-no-page': () => {
+    const report = sampleReport('mixed');
+    report.page = null;
     return report;
   },
 
@@ -155,7 +181,47 @@ const EXTRA = {
   },
 };
 
-const SECRET_VALUES = ['s3cr3t', 't0k3n', 'hunter2', 'oauthc0de', 'k3y', 'abc.def', 'f00d'];
+// The log in time order, as an unattended page produces it: a poll failing
+// over and over (folded into one line), a message that runs over several
+// lines before its stack, warnings the collector had to drop, and entries
+// that carry no time because an older collector logged them.
+EXTRA.timeline = () => {
+  const report = sampleReport('bug');
+  const poll = (t) => ({ method: 'GET', url: '/api/stock', status: 503, statusText: 'Service Unavailable', ms: 30 + (t % 7), via: 'fetch', t });
+  report.network.push(poll(2000), poll(4000), poll(6000), poll(8000));
+  report.errors.push({
+    kind: 'exception',
+    text: 'ZodError: [\n  { "path": ["total"], "message": "Expected number" }\n]',
+    stack:
+      'ZodError: [\n  {\n    "path": ["total"],\n    "message": "Expected number"\n  }\n]\n' +
+      '    at parse (/src/lib/schema.ts:12:9)\n    at loadCart (/src/lib/cart.ts:40:3)',
+    t: 2500,
+  });
+  report.consoleLines.push({ level: 'warn', text: 'from before the update' });
+  // One millisecond, two entries: the warning was pushed first, and the
+  // collector's count keeps it first although errors are merged in first.
+  report.consoleLines.push({ level: 'warn', text: 'stock fell back to cache', t: 9000, seq: 41 });
+  report.errors.push({ kind: 'exception', text: 'Error: cache empty', stack: '', t: 9000, seq: 42 });
+  report.dropped = { console: 0, warnings: 20, errors: 0, network: 1 };
+  return report;
+};
+
+// The walkthrough as a panel that never recorded load times would send it
+// (items kept from before this existed, or a page too busy to answer when
+// they were captured): the checkout items are judged by their page and time
+// instead. Also an entry logged after the last capture on /checkout.
+EXTRA['timeline-list'] = () => {
+  const report = sampleReport('mixed');
+  for (const item of report.items) delete item.armedAt;
+  report.consoleLines.push({
+    level: 'error',
+    text: 'late failure',
+    t: report.items[1].capturedAt - report.armedAt + 9000,
+  });
+  return report;
+};
+
+const SECRET_VALUES =['s3cr3t', 't0k3n', 'hunter2', 'oauthc0de', 'k3y', 'abc.def', 'f00d'];
 
 test('prompt: no secret value from a url survives into the prompt', () => {
   const prompt = buildPrompt(EXTRA.secrets());

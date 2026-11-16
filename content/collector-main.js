@@ -19,18 +19,36 @@
   const LIMIT = 30; // ring buffer size, per category
   const MAX_STRING = 600; // truncation budget for any single serialized value
 
+  // Warnings have a ring of their own. A development build of a framework can
+  // warn dozens of times per render, and sharing one ring with console.error
+  // let that flood push out the one error that mattered.
   const buffers = {
     console: [],
+    warnings: [],
     errors: [],
     network: [],
   };
 
-  const startedAt = Date.now();
+  // How many entries each ring has pushed out, so the prompt can say the log
+  // is the newest LIMIT of a longer one rather than all there was.
+  const dropped = { console: 0, warnings: 0, errors: 0, network: 0 };
 
-  function push(list, entry) {
+  const startedAt = Date.now();
+  // One count across every ring. A failed request, the warning it causes and
+  // the throw after it routinely land in the same millisecond, and the prompt
+  // prints them in the order they happened, which t alone cannot tell.
+  let pushed = 0;
+
+  function push(ring, entry) {
     entry.t = Date.now() - startedAt; // ms since collector armed
+    pushed += 1;
+    entry.seq = pushed;
+    const list = buffers[ring];
     list.push(entry);
-    if (list.length > LIMIT) list.shift();
+    if (list.length > LIMIT) {
+      list.shift();
+      dropped[ring] += 1;
+    }
   }
 
   // SECRET NAMES BEGIN. The same block sits in content/collector-main.js,
@@ -134,7 +152,7 @@
     nativeConsole[level] = console[level];
     console[level] = function (...args) {
       try {
-        push(buffers.console, {
+        push(level === 'warn' ? 'warnings' : 'console', {
           level,
           text: args.map(serialize).join(' '),
         });
@@ -155,7 +173,7 @@
       try {
         const target = event.target;
         if (target && target !== window && target.tagName) {
-          push(buffers.errors, {
+          push('errors', {
             kind: 'resource',
             text: `Failed to load <${target.tagName.toLowerCase()}>: ${
               target.src || target.href || '(unknown source)'
@@ -163,7 +181,7 @@
           });
           return;
         }
-        push(buffers.errors, {
+        push('errors', {
           kind: 'exception',
           text: truncate(event.message || String(event.error || 'Unknown error')),
           where: event.filename ? `${event.filename}:${event.lineno}:${event.colno}` : '',
@@ -185,7 +203,7 @@
       // "Name: message", so reusing serialize() would print the message twice
       // and the whole trace twice over.
       const isError = reason instanceof Error;
-      push(buffers.errors, {
+      push('errors', {
         kind: 'unhandled-rejection',
         text: isError ? truncate(`${reason.name}: ${reason.message}`) : serialize(reason),
         stack: isError && reason.stack ? truncate(reason.stack) : '',
@@ -371,7 +389,7 @@
               };
               const caller = callerFrames(stack);
               if (caller.length) entry.caller = caller;
-              push(buffers.network, entry);
+              push('network', entry);
             }
           } catch {
             /* ignore */
@@ -394,7 +412,7 @@
             if (outcome) entry.outcome = outcome;
             const caller = callerFrames(stack);
             if (caller.length) entry.caller = caller;
-            push(buffers.network, entry);
+            push('network', entry);
           } catch {
             /* ignore */
           }
@@ -516,7 +534,7 @@
       if (outcome) entry.outcome = outcome;
       const caller = callerFrames(stack);
       if (caller.length) entry.caller = caller;
-      push(buffers.network, entry);
+      push('network', entry);
     } catch {
       /* ignore */
     }
@@ -1470,8 +1488,10 @@
   function snapshot() {
     return {
       console: buffers.console.slice(),
+      warnings: buffers.warnings.slice(),
       errors: buffers.errors.slice(),
       network: buffers.network.slice(),
+      dropped: { ...dropped },
       armedAt: startedAt,
     };
   }
@@ -1493,9 +1513,11 @@
     if (data.action === 'snapshot') {
       payload = snapshot();
     } else if (data.action === 'clear') {
-      buffers.console.length = 0;
-      buffers.errors.length = 0;
-      buffers.network.length = 0;
+      // A cleared log has dropped nothing the user has not chosen to drop.
+      for (const ring of Object.keys(buffers)) {
+        buffers[ring].length = 0;
+        dropped[ring] = 0;
+      }
     } else if (data.action === 'inspect') {
       payload = inspect(data.marker);
     }

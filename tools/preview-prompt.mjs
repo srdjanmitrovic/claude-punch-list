@@ -198,15 +198,30 @@ export function sampleReport(mode = 'bug') {
           },
         ];
 
+  // The page loaded a moment before the capture, and its log is that moment:
+  // the request fails, the app warns, and then it throws. The walkthrough's
+  // page loaded before its first capture, and the same three entries land
+  // between its first and second, so the list prints them under the item
+  // that reports the bug.
+  const walk = mode === 'mixed';
+  const armedAt = walk ? at('20:48:40') : at('20:51:30');
+  const shift = walk ? at('20:50:10') - armedAt : 0;
+  const later = (entry) => ({ ...entry, t: entry.t + shift });
+
   return structuredClone({
-    items,
+    items: walk ? items.map((item) => ({ ...item, armedAt: item.url === PAGE.url ? armedAt : CART_LOAD })) : items,
     builtAt: at('20:51:33'),
+    armedAt,
     page: PAGE,
-    consoleLines: CONSOLE_LINES,
-    errors: ERRORS,
-    network: NETWORK,
+    consoleLines: CONSOLE_LINES.map(later),
+    errors: ERRORS.map(later),
+    network: NETWORK.map(later),
   });
 }
+
+// The cart page in the walkthrough is another load with its own collector,
+// whose log this report did not read.
+const CART_LOAD = at('20:51:25');
 
 const CONSOLE_LINES = [
   { level: 'warn', text: 'Coupon SUMMER25 missing from catalog, falling back to null', t: 1840 },
@@ -234,6 +249,7 @@ const NETWORK = [
     statusText: 'Internal Server Error',
     ms: 243,
     via: 'fetch',
+    t: 1650,
     // Nearest frame first, as V8 reports them. Nothing applies a source map:
     // these read as src paths because Vite's dev server serves each module at
     // its source path. A bundled build gives bundle urls and offsets.

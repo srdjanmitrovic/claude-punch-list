@@ -170,12 +170,22 @@ Each item has a screenshot on disk. Read that image before working on the item. 
 ## 1. What's wrong
 The total shows NaN after applying a coupon. It should show the discounted price.
 
-Screenshot: /Users/you/Downloads/claude-punch-list/2026-08-21_18-54-56_localhost-demo-page.png
+Screenshot: /Users/you/Downloads/claude-punch-list/2026-11-16_15-19-22_localhost-demo-page.png
+
+Logged on this page load before this capture:
+```
+15:19:21.605 POST /api/coupons/validate -> 501 Unsupported method ('POST') (25ms)
+                 called from applyCoupon (/tools/demo-page.html:171:32)
+                             HTMLButtonElement.<anonymous> (/tools/demo-page.html:195:9)
+15:19:21.605 [warn] Coupon SUMMER25 not found in catalog, falling back to local lookup
+15:19:21.605 [unhandled] TypeError: Cannot read properties of undefined (reading 'rate')
+                       at applyCoupon (http://localhost:8000/tools/demo-page.html:184:38)
+```
 
 ## 2. What should change
 Validate the coupon as you type instead of only on Apply.
 
-Screenshot: /Users/you/Downloads/claude-punch-list/2026-08-21_18-54-57_localhost-demo-page.png
+Screenshot: /Users/you/Downloads/claude-punch-list/2026-11-16_15-19-23_localhost-demo-page.png
 
 Search for: `coupon`, "Coupon code"
 Selected element: `#coupon`
@@ -187,41 +197,38 @@ Computed styles: display: block; width: 242.188px; height: 40.9219px; padding: 9
 ## 3. What should change
 Move the Pay button above the coupon field. Most people never use a coupon.
 
-Screenshot: /Users/you/Downloads/claude-punch-list/2026-08-21_18-54-58_localhost-demo-page.png
+Screenshot: /Users/you/Downloads/claude-punch-list/2026-11-16_15-19-24_localhost-demo-page.png
 
 ## Page
 - URL: /tools/demo-page.html
 - Title: Checkout | Northbeam Supply
-- Viewport: 1100 x 860 @2x
-- Captured: 8/21/2026, 6:54:56 PM
-
-## Console output
-```
-[unhandled] TypeError: Cannot read properties of undefined (reading 'rate')
-          at applyCoupon (http://localhost:8000/tools/demo-page.html:184:38)
-[warn] Coupon SUMMER25 not found in catalog, falling back to local lookup
-```
-
-## Failed network requests
-```
-POST /api/coupons/validate -> 501 Unsupported method ('POST') (24ms)
-    called from applyCoupon (/tools/demo-page.html:171:32)
-                HTMLButtonElement.<anonymous> (/tools/demo-page.html:195:9)
-```
+- Viewport: 1220 x 1000 @2x
+- Captured: 11/16/2026, 3:19:22 PM
 
 ---
 For each bug, find the root cause in this codebase before changing anything, and if the screenshot and the console point at different things, say so rather than guessing. For each change, find where it is implemented before writing anything and follow the patterns already in this codebase rather than introducing new ones; if it is larger than it looks, say so and propose the smallest version that delivers it. Cover every item, and say which item each change belongs to. If several items turn out to share a cause or a fix, say so rather than treating them separately.
 ````
 
-About 2,559 characters, roughly 650 tokens, for three screenshots, a DOM node, a stack trace and
+About 2,631 characters, roughly 660 tokens, for three screenshots, a DOM node, a stack trace and
 the function that sent the failed request.
 
 **Why that beats three messages.** Each item is numbered, so Claude Code can account for all
 of them and you can check that it did. The opening line says how much of each kind of work
 there is, and the closing line gives the bug instruction and the change instruction side by
-side, because neither alone is right for the other. The console section sits once, at the
-bottom, next to the items it explains: the file and line that threw, the request that failed
-first, and the warning naming the missing coupon. Nobody has to open DevTools.
+side, because neither alone is right for the other. The log is split by capture: each item
+carries what the page logged since the capture before it, in the order it happened, so the
+request that failed, the warning naming the missing coupon and the line that threw sit under
+the screenshot of the broken total, and the two suggestions carry nothing they did not cause.
+Anything logged after the last capture gets a section of its own at the end. Nobody has to
+open DevTools.
+
+**The log reads as a timeline.** Every line starts with the time it was logged, to the
+millisecond, and console lines, uncaught errors and failed requests are merged into one order
+(the collector numbers what it records, so three entries from the same millisecond still come
+out in the order they happened). A run of identical entries, such as a poll failing every two
+seconds, prints once with a count and the time of the last. The collector keeps the newest 30
+of each kind, warnings in a ring of their own so that a flood of them cannot push out the one
+error that mattered, and the prompt says how many it had to drop.
 
 **A single ticked item** reads as a single report rather than a list, in the same shape this
 extension has produced since its first version: a heading, a screenshot section with its own
@@ -231,7 +238,9 @@ only appears once more than one item is going.
 **Items from different pages** are handled too. Capture on the cart, click through to the
 checkout, capture again: the opening line says "across 2 pages", each item names its own
 page, and the page section names the page the console was read on (the tab you are looking at
-when you copy) and flags any item that was captured somewhere else.
+when you copy). The log only covers that page since it last loaded, so an item captured on
+another page, or before a reload, says that its entries were not read rather than borrowing
+someone else's.
 
 That computed styles line is thirteen properties out of the roughly 340 `getComputedStyle`
 returns. Properties still sitting at their initial value are dropped automatically, so nothing
@@ -311,9 +320,9 @@ matches nothing is worse than none. A body that looks like it holds a credential
 made, so the frames are the page's own:
 
 ```markdown
-POST http://localhost:3000/api/coupons/validate -> 500 Internal Server Error (243ms)
-    called from applyCoupon (/src/components/cart/CartSummary.tsx:70:36)
-                handleApply (/src/components/cart/CartSummary.tsx:84:13)
+20:51:31.650 POST http://localhost:3000/api/coupons/validate -> 500 Internal Server Error (243ms)
+                 called from applyCoupon (/src/components/cart/CartSummary.tsx:70:36)
+                             handleApply (/src/components/cart/CartSummary.tsx:84:13)
 ```
 
 The prompt wording lives in one file and is likewise meant to be edited. See
@@ -540,8 +549,8 @@ to your Downloads directory.
 **How long an uncopied sheet is kept.** `REPORT_TTL_MS` in the same file, currently a week.
 
 **How much history the collector keeps.** `LIMIT` in
-[`content/collector-main.js`](content/collector-main.js), currently the last 30 entries per
-category.
+[`content/collector-main.js`](content/collector-main.js), currently the newest 30 entries of
+each kind: console errors, warnings, uncaught errors and failed loads, and failed requests.
 
 ## Development
 

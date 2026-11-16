@@ -218,7 +218,40 @@ test('collector: a value that cannot be serialized still reaches the real consol
   };
   assert.equal(page.page.console.warn(hostile), 'native-warn');
   assert.equal(page.nativeCalls[0].args[0], hostile);
-  assert.equal(page.snapshot().console[0].text, '[unserializable]');
+  assert.equal(page.snapshot().warnings[0].text, '[unserializable]');
+});
+
+test('collector: warnings have a ring of their own, so a flood of them cannot push out an error', () => {
+  const page = arm();
+  page.page.console.error('the one that matters');
+  for (let i = 1; i <= 50; i += 1) page.page.console.warn(`noise ${i}`);
+  const snap = page.snapshot();
+  assert.deepEqual(plain(snap.console.map((entry) => entry.text)), ['the one that matters']);
+  assert.equal(snap.warnings.length, 30);
+  assert.equal(snap.warnings[0].text, 'noise 21');
+  assert.deepEqual(plain(snap.dropped), { console: 0, warnings: 20, errors: 0, network: 0 });
+});
+
+test('collector: entries carry one count across every ring, so a single millisecond keeps its order', () => {
+  const page = arm();
+  page.page.console.warn('first');
+  page.page.console.error('second');
+  page.page.console.warn('third');
+  const snap = page.snapshot();
+  const order = [...snap.warnings, ...snap.console]
+    .sort((a, b) => a.seq - b.seq)
+    .map((entry) => entry.text);
+  assert.deepEqual(plain(order), ['first', 'second', 'third']);
+});
+
+test('collector: clear empties every ring and forgets what was dropped', async () => {
+  const page = arm();
+  for (let i = 1; i <= 35; i += 1) page.page.console.warn(`w ${i}`);
+  assert.equal(page.snapshot().dropped.warnings, 5);
+  await page.request('clear');
+  const snap = page.snapshot();
+  assert.equal(snap.warnings.length, 0);
+  assert.equal(snap.dropped.warnings, 0);
 });
 
 test('collector: a logged object keeps its shape and loses the values of secret looking keys', () => {
@@ -244,6 +277,7 @@ test('collector: each ring keeps the last 30 entries', () => {
   assert.equal(texts.length, 30);
   assert.equal(texts[0], 'error 6');
   assert.equal(texts.at(-1), 'error 35');
+  assert.equal(page.snapshot().dropped.console, 5);
 });
 
 // ------------------------------------------------------------------ fetch --

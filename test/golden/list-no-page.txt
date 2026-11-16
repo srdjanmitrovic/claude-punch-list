@@ -1,0 +1,49 @@
+Fix 1 issue and make 2 changes across 2 pages
+
+Each item has a screenshot on disk. Read that image before working on the item. For a bug it shows the problem as rendered; for a change it shows the current behaviour, which is what the change is measured against.
+
+## 1. What should change
+The coupon field should validate as you type instead of only on submit, so the discounted total updates inline.
+
+Screenshot: /Users/you/Downloads/claude-punch-list/2026-08-07_20-49-02_localhost-checkout.png
+
+Component: `Total` (React, development build)
+Call site: /src/components/cart/CartSummary.tsx:42:9 (where CartSummary writes this JSX; Total is defined elsewhere)
+Inside CartSummary > CheckoutPage
+Search for: `cart-total`, "Order total", `handleApply`, `handleSave`, `Total`
+Handlers on `form.coupon`, 2 elements up the DOM, not on the picked element: onSubmit=ƒ handleApply, onChange
+`onSubmit` body starts: setPending(true); applyCoupon(inputRef.current ? ...
+Props of `Total`: amount=NaN, currency="EUR", onRetry=ƒ handleSave
+Classes: _total_1f3k9_12 is a Vite CSS Module: local .total declared on line 12 of its module file, whose name the class does not carry
+Selected element: `form.coupon > div.cart-summary > span.total`
+```html
+<span class="total price price--emphasis _total_1f3k9_12" data-testid="cart-total" aria-label="Order total">NaN</span>
+```
+Computed styles: display: inline; color: rgb(220, 38, 38); font-size: 18px; font-weight: 700
+
+## 2. What's wrong
+The order total shows NaN after applying a coupon. Expected the discounted price.
+
+Screenshot: /Users/you/Downloads/claude-punch-list/2026-08-07_20-50-17_localhost-checkout.png
+
+Logged since item 1:
+```
+20:50:11.650 POST http://localhost:3000/api/coupons/validate -> 500 Internal Server Error (243ms)
+                 called from applyCoupon (/src/components/cart/CartSummary.tsx:70:36)
+                             handleApply (/src/components/cart/CartSummary.tsx:84:13)
+20:50:11.840 [warn] Coupon SUMMER25 missing from catalog, falling back to null
+20:50:11.902 [error] TypeError: Cannot read properties of undefined (reading 'price')
+                       at applyCoupon (cart.js:142:18)
+                       at handleSubmit (checkout.js:88:5)
+                       at HTMLFormElement.<anonymous> (checkout.js:31:9)
+```
+
+## 3. What should change
+The cart page should show the same shipping estimate the checkout uses. Right now it says "calculated at checkout", which is the step people abandon on.
+
+Screenshot: /Users/you/Downloads/claude-punch-list/2026-08-07_20-51-33_localhost-cart.png
+
+Console and network: recorded on another page or an earlier load, which this report did not read.
+
+---
+For each bug, find the root cause in this codebase before changing anything, and if the screenshot and the console point at different things, say so rather than guessing. For each change, find where it is implemented before writing anything and follow the patterns already in this codebase rather than introducing new ones; if it is larger than it looks, say so and propose the smallest version that delivers it. Cover every item, and say which item each change belongs to. If several items turn out to share a cause or a fix, say so rather than treating them separately.

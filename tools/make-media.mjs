@@ -44,7 +44,12 @@ async function openStage(
   });
   const page = await context.newPage();
   await page.exposeFunction('__pwCapture', async () => {
-    const png = await page.locator('#demo').screenshot({ animations: 'disabled' });
+    // caret: 'initial' because hiding the caret leaves style="" on every
+    // input it touched, and the picker would then copy that into the markup
+    // of a picked field. A real capture never writes to the page.
+    const png = await page
+      .locator('#demo')
+      .screenshot({ animations: 'disabled', caret: 'initial' });
     return `data:image/png;base64,${png.toString('base64')}`;
   });
   await page.goto(STAGE_URL);

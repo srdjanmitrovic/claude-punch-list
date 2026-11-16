@@ -161,7 +161,7 @@ main world answers exactly one action per request.
 
 | Action | From | Purpose |
 | :--- | :--- | :--- |
-| `snapshot` | bridge | Return the console, error and network buffers |
+| `snapshot` | bridge | Return the console, warning, error and network buffers, what each dropped, and `armedAt` |
 | `clear` | bridge | Empty them |
 | `inspect` | picker | Return the React or Vue component behind a marked node, and the handlers bound to it |
 
@@ -269,6 +269,33 @@ something that looks like a file extension, since a bare document path is a rout
 file and printing one sends the reader hunting for source that never existed. Framework dispatch
 frames are dropped too: only three frames are kept, and on the React fixture the third slot went
 to `react-dom`'s internals while the page's own caller sat just below the cut.
+
+### The log is a timeline, split by capture
+
+The collector keeps four rings of `LIMIT` entries: console errors, warnings, uncaught errors and
+failed loads, and failed requests. Warnings have their own because a development build can warn
+dozens of times per render, and in a shared ring that pushed out the error the report was about.
+Each ring counts what it drops, and the snapshot carries the counts, so the prompt can say the
+log is the tail of a longer one. Every entry gets `t`, milliseconds since the collector started
+(`armedAt` in the snapshot), and `seq`, one count across all four rings: a failed request, the
+warning it causes and the throw after it routinely share a millisecond, and only the count keeps
+them in the order they happened.
+
+The template merges the rings by `t` and then `seq` and prints a clock time in front of each
+entry, built by hand rather than with `toLocaleTimeString` so every line of a prompt has the same
+width. A run of entries that would print the same (the timing of a request aside) folds into the
+first, with a count and the time of the last.
+
+A list splits the log by capture. When an item is added, the panel's next context read tells it
+which load of the page the capture belongs to, and the item keeps that `armedAt`; a read whose
+collector started after the capture is ignored, since that load came later. When the report is
+copied, an item whose `armedAt` matches the log's gets the entries logged since the capture
+before it, entries after the last capture get a section of their own, and an item from another
+page or an earlier load says its entries were not read. An item with no `armedAt` (stored by an
+older build, or captured on a page too busy to answer) is judged by its page and its capture
+time instead. A single item keeps the two sections it always had, now in time order, and keeps
+its cautions, because in that layout the caution is the only line that says where the
+screenshot was taken.
 
 ## Capture and cropping
 

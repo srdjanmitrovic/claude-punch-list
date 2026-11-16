@@ -759,7 +759,23 @@ async function addItem(capture) {
   state.items.push(item);
   selectItem(item.id);
   updateSubmitState();
-  refreshContext();
+  // The read that refreshes the chips also says which load of the page this
+  // capture belongs to. Kept on the item, it lets a list print under each
+  // item what was logged since the capture before it, and say so when a
+  // reload has since thrown that away.
+  refreshContext().then((read) => {
+    const armedAt = read.context?.collected?.armedAt;
+    if (!Number.isFinite(armedAt) || read.tabId !== item.tabId) return;
+    // A collector that started after the capture is a page load that came
+    // after it (a reload or a navigation in between), which holds nothing
+    // that led up to it.
+    if (armedAt > item.capturedAt) return;
+    // By id: a sheet adopted from another window meanwhile holds new objects.
+    const live = state.items.find((candidate) => candidate.id === item.id);
+    if (!live || live.armedAt != null) return;
+    live.armedAt = armedAt;
+    if (live.path) persist();
+  });
   // Hands are on the mouse after a drag; the next thing to do is type.
   el.description.focus({ preventScroll: true });
   // Something the user should know about this capture. Shown now and again
@@ -1130,13 +1146,17 @@ async function refreshContext() {
     const collected = context?.collected || {};
     setCount(
       el.countConsole,
-      context ? (collected.console?.length || 0) + (collected.errors?.length || 0) : null
+      context
+        ? (collected.console?.length || 0) +
+            (collected.warnings?.length || 0) +
+            (collected.errors?.length || 0)
+        : null
     );
     setCount(el.countNetwork, context ? collected.network?.length || 0 : null);
   }
 
   setCount(el.countElement, state.items.filter((item) => item.element).length || null);
-  return { context, error };
+  return { context, error, tabId: tab.id };
 }
 
 // ----------------------------------------------------------------- saving --
@@ -1263,6 +1283,7 @@ function assembleReport(items, read) {
       // prints a URL only when `page` is present, so the toggle still holds.
       url: item.url,
       capturedAt: item.capturedAt,
+      armedAt: item.armedAt,
       element: el.incElement.checked ? item.element : null,
     })),
     // With nothing read, the newest item's own page stands in. Each item
@@ -1270,9 +1291,23 @@ function assembleReport(items, read) {
     page: includePage
       ? context?.page || (newest?.url ? { url: newest.url, title: newest.title || '' } : null)
       : null,
-    consoleLines: el.incConsole.checked ? collected.console || [] : [],
+    // Warnings come from a ring of their own; the template merges every line
+    // into the order it was logged in anyway.
+    consoleLines: el.incConsole.checked
+      ? [...(collected.console || []), ...(collected.warnings || [])]
+      : [],
     errors: el.incConsole.checked ? collected.errors || [] : [],
     network: el.incNetwork.checked ? collected.network || [] : [],
+    // Only for what the prompt carries: a note about dropped requests in a
+    // prompt with the network toggle off would be about nothing it shows.
+    dropped: {
+      ...(el.incConsole.checked && {
+        console: collected.dropped?.console,
+        warnings: collected.dropped?.warnings,
+        errors: collected.dropped?.errors,
+      }),
+      ...(el.incNetwork.checked && { network: collected.dropped?.network }),
+    },
     builtAt: Date.now(),
     // Tells the template an item was captured on an earlier load of this page.
     armedAt: wantedLog && Number.isFinite(collected.armedAt) ? collected.armedAt : undefined,

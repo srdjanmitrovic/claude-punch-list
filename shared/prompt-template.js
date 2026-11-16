@@ -38,6 +38,13 @@
  *                                    a path while the report stays on one
  *                                    origin, in full once it spans two.
  * @property {number=} capturedAt     When, as epoch milliseconds.
+ * @property {number=} armedAt        When the collector started on the page
+ *                                    load the item was captured on, as epoch
+ *                                    milliseconds. Matches the report's own
+ *                                    armedAt when the log read for the report
+ *                                    holds what led up to this item, which is
+ *                                    how a list prints each item's entries
+ *                                    under it.
  * @property {Object=} element        { selector, attributes, html, styles, text,
  *                                    truncated, component, handlers,
  *                                    classHints }, where component is the React
@@ -57,14 +64,20 @@
  *                                   spans two. Absent when the page toggle is
  *                                   off, in which case no URL is printed
  *                                   anywhere, though pages are still counted.
- * @property {Array=}  consoleLines  [{ level, text, t }]
+ * @property {Array=}  consoleLines  [{ level, text, t }], errors and warnings
  * @property {Array=}  errors        [{ kind, text, where, stack, t }]
  * @property {Array=}  network       [{ method, url, status, statusText, ms,
- *                                   caller, outcome }], where caller is the
+ *                                   caller, outcome, t }], where caller is the
  *                                   stack that sent the request, nearest frame
  *                                   first, and outcome is 'aborted' or
  *                                   'timeout' when the page ended the request
- *                                   itself.
+ *                                   itself. Every t is milliseconds since
+ *                                   armedAt, and orders the entries; seq, a
+ *                                   count across all three, orders the ones
+ *                                   that share a millisecond.
+ * @property {Object=} dropped       { console, warnings, errors, network }:
+ *                                   how many entries each of the collector's
+ *                                   rings pushed out before the read.
  * @property {number}  builtAt       When the buffers were read and the prompt
  *                                   assembled, as epoch milliseconds.
  * @property {number=} armedAt       When the collector started on the page the
@@ -205,41 +218,70 @@ function stamp(ms) {
   return new Date(ms).toLocaleString();
 }
 
-function formatConsole(consoleLines = [], errors = []) {
-  const lines = [];
-
-  for (const error of errors) {
-    const label = error.kind === 'unhandled-rejection' ? 'unhandled' : 'error';
-    // A failed resource and many a logged message carry a url, and a url can
-    // carry a token (see safeUrl).
-    lines.push(`[${label}] ${safeText(error.text)}`);
-
-    if (error.stack) {
-      // Skip line 0: it repeats the message already printed above. The next few
-      // frames are the throw site and its callers; deeper ones are usually
-      // framework internals and not worth the tokens.
-      const frames = error.stack
-        .split('\n')
-        .slice(1, 4)
-        .map((frame) => frame.trim())
-        .filter(Boolean);
-      for (const frame of frames) lines.push(`          ${frame}`);
-    } else if (error.where) {
-      // Only useful when there is no stack, since the first stack frame names
-      // the same location and adds the function name.
-      lines.push(`          at ${error.where}`);
-    }
-  }
-
-  for (const entry of consoleLines) {
-    lines.push(`[${entry.level}] ${safeText(entry.text)}`);
-  }
-
-  return lines;
+/**
+ * When an evidence line was logged: the clock time to the millisecond when
+ * the collector's start is known, otherwise seconds since it started. Built
+ * by hand rather than with toLocaleTimeString, whose shape follows the
+ * machine, so that every line of one prompt has the same width.
+ */
+function clockOf(t, armedAt) {
+  if (!Number.isFinite(t)) return '';
+  if (!Number.isFinite(armedAt)) return `+${(t / 1000).toFixed(3)}s`;
+  const date = new Date(armedAt + t);
+  const pad = (n, width = 2) => String(n).padStart(width, '0');
+  return (
+    `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}` +
+    `.${pad(date.getMilliseconds(), 3)}`
+  );
 }
 
 /**
- * A failed request per line, and under it the code that sent it.
+ * The frames worth printing from a stack: its first three "at" lines. Taken
+ * by what they say rather than by position, because a message that runs over
+ * several lines (a ZodError, React's invalid hook call) fills the first lines
+ * of the stack with more message.
+ */
+function stackFrames(stack) {
+  return String(stack)
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith('at '))
+    .slice(0, 3);
+}
+
+/**
+ * One log line, uncaught error or failed request, made ready to print: the
+ * first line, what goes under it with its indent, and a key that is the same
+ * for two entries only when they would print the same (bar the clock and the
+ * timing), so a run of them can fold into one.
+ *
+ * @typedef {{ t: number, seq: number, head: string, more: { indent: number, text: string }[], key: string }} Entry
+ */
+
+/** @returns {Entry} */
+function consoleEntry(entry) {
+  // A failed resource and many a logged message carry a url, and a url can
+  // carry a token (see safeUrl).
+  const head = `[${entry.level}] ${safeText(entry.text)}`;
+  return { t: entry.t, seq: entry.seq, head, more: [], key: head };
+}
+
+/** @returns {Entry} */
+function errorEntry(error) {
+  const label = error.kind === 'unhandled-rejection' ? 'unhandled' : 'error';
+  const head = `[${label}] ${safeText(error.text)}`;
+  // The throw site and its callers; deeper frames are usually framework
+  // internals and not worth the tokens. The location the collector recorded
+  // is only worth printing when the stack has no frame, since the first frame
+  // names the same place and adds the function.
+  let frames = error.stack ? stackFrames(error.stack) : [];
+  if (!frames.length && error.where) frames = [`at ${error.where}`];
+  const more = frames.map((text) => ({ indent: 10, text }));
+  return { t: error.t, seq: error.seq, head, more, key: [head, ...frames].join('\n') };
+}
+
+/**
+ * A failed request, and under it the code that sent it.
  *
  * The frames are the strongest locator in this prompt: a 500 names a route, but
  * the first frame names the file and the line the call was written on. They are
@@ -247,37 +289,115 @@ function formatConsole(consoleLines = [], errors = []) {
  * ones after it are its callers. The continuation lines are indented to sit
  * under the label rather than the margin, because a bare frame on the left
  * would read as another request.
+ *
+ * @returns {Entry}
  */
-function formatNetwork(network = []) {
+function networkEntry(request) {
+  const status = cancelledLabel(request) || (request.status === 0 ? 'FAILED' : request.status);
+  // Joined rather than interpolated: HTTP/2 responses have no status text,
+  // and a fixed template would leave two spaces where it was.
+  const parts = [request.method, request.url ? safeUrl(request.url) : '(no url)', '->', status];
+  if (request.statusText) parts.push(request.statusText);
+  const frames = (Array.isArray(request.caller) ? request.caller : [])
+    .filter((frame) => typeof frame === 'string')
+    .map(flatten)
+    .filter(Boolean)
+    .slice(0, 3);
+  // The timing is left out of the key: a poll failing thirty times takes a
+  // slightly different time on each, and is still one thing that happened.
+  const key = [parts.join(' '), ...frames].join('\n');
+  if (request.ms) parts.push(`(${request.ms}ms)`);
+  const more = frames.map((frame, index) =>
+    index === 0 ? { indent: 4, text: `called from ${frame}` } : { indent: 16, text: frame }
+  );
+  return { t: request.t, seq: request.seq, head: parts.join(' ').trim(), more, key };
+}
+
+/**
+ * Oldest first, and within one millisecond in the order the collector pushed
+ * them. An entry with no time, from an older collector, goes last.
+ */
+function byTime(a, b) {
+  const at = Number.isFinite(a.t) ? a.t : Infinity;
+  const bt = Number.isFinite(b.t) ? b.t : Infinity;
+  if (at !== bt) return at - bt;
+  return Number.isFinite(a.seq) && Number.isFinite(b.seq) ? a.seq - b.seq : 0;
+}
+
+/**
+ * Entries as lines, each behind its clock, with a run of identical ones
+ * folded into the first and counted. A poll that fails thirty times is one
+ * fact, and printed thirty times it was most of the prompt.
+ *
+ * @param {Entry[]} entries  already in the order to print
+ */
+function renderEntries(entries, armedAt) {
   const lines = [];
+  for (let start = 0; start < entries.length; ) {
+    const entry = entries[start];
+    let end = start + 1;
+    while (end < entries.length && entries[end].key === entry.key) end += 1;
+    const count = end - start;
+
+    const time = clockOf(entry.t, armedAt);
+    const prefix = time ? `${time} ` : '';
+    const last = count > 1 ? clockOf(entries[end - 1].t, armedAt) : '';
+    const repeats = count > 1 ? ` (×${count}${last ? `, last ${last}` : ''})` : '';
+    // A message that runs over several lines keeps its later lines under its
+    // own text, where they cannot be read as entries of their own.
+    const label = entry.head.indexOf('] ');
+    const under = ' '.repeat(prefix.length + (label === -1 ? 0 : label + 2));
+    lines.push(`${prefix}${entry.head.split('\n').join(`\n${under}`)}${repeats}`);
+    // Continuation lines sit under the entry, not under its clock.
+    for (const line of entry.more) {
+      lines.push(`${' '.repeat(prefix.length + line.indent)}${line.text}`);
+    }
+    start = end;
+  }
+  return lines;
+}
+
+/** Console lines and uncaught errors, merged into the order they happened. */
+function formatConsole(consoleLines = [], errors = [], armedAt) {
+  const entries = [...errors.map(errorEntry), ...consoleLines.map(consoleEntry)].sort(byTime);
+  return renderEntries(entries, armedAt);
+}
+
+function formatNetwork(network = [], armedAt) {
   // A request the page ended itself (an effect cleaning up, a search box
   // replacing its previous query, a timeout it set) is not a failure. It still
   // prints, because a page can cancel the one request it needed, but labelled
   // as what it was and after every real failure, so it cannot read as the
   // cause.
-  const ordered = [
-    ...network.filter((request) => !cancelledLabel(request)),
-    ...network.filter((request) => cancelledLabel(request)),
+  const real = network.filter((request) => !cancelledLabel(request)).map(networkEntry);
+  const ended = network.filter((request) => cancelledLabel(request)).map(networkEntry);
+  return [
+    ...renderEntries(real.sort(byTime), armedAt),
+    ...renderEntries(ended.sort(byTime), armedAt),
   ];
-  for (const request of ordered) {
-    const status = cancelledLabel(request) || (request.status === 0 ? 'FAILED' : request.status);
-    // Joined rather than interpolated: HTTP/2 responses have no status text,
-    // and a fixed template would leave two spaces where it was.
-    const parts = [request.method, request.url ? safeUrl(request.url) : '(no url)', '->', status];
-    if (request.statusText) parts.push(request.statusText);
-    if (request.ms) parts.push(`(${request.ms}ms)`);
-    lines.push(parts.join(' ').trim());
+}
 
-    const frames = (Array.isArray(request.caller) ? request.caller : [])
-      .filter((frame) => typeof frame === 'string')
-      .map(flatten)
-      .filter(Boolean)
-      .slice(0, 3);
-    frames.forEach((frame, index) => {
-      lines.push(index === 0 ? `    called from ${frame}` : `${' '.repeat(16)}${frame}`);
-    });
-  }
-  return lines;
+/**
+ * What the collector pushed out of its rings before this read, as a
+ * sentence, or '' when nothing was. The rings keep the newest LIMIT entries
+ * each, and without this a log of thirty lines reads as all there was.
+ */
+function droppedNotice(dropped) {
+  if (!dropped || typeof dropped !== 'object') return '';
+  const kinds = [
+    [dropped.console, 'console error', 'console errors'],
+    [dropped.warnings, 'warning', 'warnings'],
+    [dropped.errors, 'uncaught error or failed load', 'uncaught errors or failed loads'],
+    [dropped.network, 'failed request', 'failed requests'],
+  ].filter(([count]) => Number.isInteger(count) && count > 0);
+  if (!kinds.length) return '';
+  const parts = kinds.map(([count, one, many]) => `${count} ${count === 1 ? one : many}`);
+  const list = parts.length === 1 ? parts[0] : `${parts.slice(0, -1).join(', ')} and ${parts.at(-1)}`;
+  const total = kinds.reduce((sum, [count]) => sum + count, 0);
+  return (
+    `the collector keeps only the newest entries of each kind, so ${list} logged earlier ` +
+    `${total === 1 ? 'is' : 'are'} not shown.`
+  );
 }
 
 /** Compared, not looked up, so an unexpected outcome string can never match. */
@@ -909,10 +1029,86 @@ function unreadNotice(contextError) {
 /**
  * Whether an item was captured on an earlier load of the page the buffers
  * came from. Two loads of one address print the same url, so only the
- * collector's start time can tell them apart.
+ * collector's start time can tell them apart: the one the item recorded when
+ * it was captured, or failing that, the time it was captured.
  */
 function capturedBeforeLoad(item, armedAt) {
-  return Number.isFinite(armedAt) && Number.isFinite(item.capturedAt) && item.capturedAt < armedAt;
+  if (!Number.isFinite(armedAt)) return false;
+  if (Number.isFinite(item.armedAt)) return item.armedAt < armedAt;
+  return Number.isFinite(item.capturedAt) && item.capturedAt < armedAt;
+}
+
+/**
+ * Whether an item was captured on the very page load whose log this report
+ * read, so that the log holds what led up to it. Each item records the
+ * collector's start time when it is captured. One that has none (captured
+ * before this existed, or on a page too busy to answer) is judged by its
+ * page and its time instead.
+ */
+function onThisLog(item, report, showUrl) {
+  if (!Number.isFinite(report.armedAt)) return false;
+  if (Number.isFinite(item.armedAt)) return item.armedAt === report.armedAt;
+  if (!Number.isFinite(item.capturedAt) || item.capturedAt < report.armedAt) return false;
+  return !report.page || !item.url || showUrl(item.url) === showUrl(report.page.url);
+}
+
+/**
+ * The log split up by item, for a list: for each item captured on this page
+ * load, what was logged since the capture before it, and then what came
+ * after the last one. A list of three things noticed on the way through a
+ * flow otherwise ended in one log of everything, and which error belonged to
+ * which screenshot was left to guesswork.
+ *
+ * Null when there is no log to split: one item, nothing read, or no
+ * collector start time to measure captures against.
+ */
+function splitLog(items, report, showUrl) {
+  if (items.length < 2 || report.contextError || !Number.isFinite(report.armedAt)) return null;
+  const entries = [
+    ...(report.errors || []).map(errorEntry),
+    ...(report.consoleLines || []).map(consoleEntry),
+    ...(report.network || []).map(networkEntry),
+  ].sort(byTime);
+  const logged = items.filter(
+    (item) => Number.isFinite(item.capturedAt) && onThisLog(item, report, showUrl)
+  );
+  // No capture on this load, so nothing to split by: the log prints whole,
+  // under the caution that it was read somewhere none of them were taken.
+  if (!logged.length) return null;
+  const buckets = new Map(logged.map((item) => [item, []]));
+  const after = [];
+  for (const entry of entries) {
+    const owner = Number.isFinite(entry.t)
+      ? logged.find((item) => entry.t <= item.capturedAt - report.armedAt)
+      : undefined;
+    (owner ? buckets.get(owner) : after).push(entry);
+  }
+  return { logged, buckets, after };
+}
+
+/** The lines an item of a list carries about the log: its own entries, or why there are none. */
+function itemLog(item, items, split, report, showUrl) {
+  const bucket = split.buckets.get(item);
+  if (bucket) {
+    if (!bucket.length) return [];
+    const previous = split.logged[split.logged.indexOf(item) - 1];
+    const since = previous
+      ? `since item ${items.indexOf(previous) + 1}`
+      : 'on this page load before this capture';
+    return ['', `Logged ${since}:`, fence(renderEntries(bucket, report.armedAt).join('\n'))];
+  }
+  const said = (text) => ['', `Console and network: ${text}`];
+  // With the page toggle off there is no url to tell another page from an
+  // earlier load of this one, and only that it is not in this log is known.
+  if (!report.page) return said('recorded on another page or an earlier load, which this report did not read.');
+  if (item.url && showUrl(item.url) !== showUrl(report.page.url)) {
+    return said('recorded on another page, which this report did not read.');
+  }
+  if (capturedBeforeLoad(item, report.armedAt)) return said('lost when the page reloaded after this capture.');
+  // The same address, but a load that started after this report's: another
+  // tab open on the same page, say.
+  if (Number.isFinite(item.armedAt)) return said('recorded on another load of this page, which this report did not read.');
+  return [];
 }
 
 /**
@@ -949,6 +1145,8 @@ function formatPage(report, stale, showUrl) {
   }
 
   if (built - last > MINUTE) details.push(`- Console and network read: ${stamp(built)}`);
+  const dropped = droppedNotice(report.dropped);
+  if (dropped) details.push(`- Console and network: ${dropped}`);
 
   // The image is a moment in time; the console and network buffers are read
   // when the report is built. A navigation or a reload in between makes them
@@ -1013,6 +1211,7 @@ export function buildPrompt(report) {
   // the opening line and in full three sections later.
   const showUrl = oneOrigin(items, report.page) ? pathOf : safeUrl;
   const where = describeScope(items, report.page, showUrl);
+  const split = splitLog(items, report, showUrl);
 
   sections.push(mixed ? MIXED.lead(counts, where) : voice.lead(items.length, where));
 
@@ -1051,6 +1250,7 @@ export function buildPrompt(report) {
       if (!samePage && item.url && report.page) facts.push(`Page: ${showUrl(item.url)}`);
       if (facts.length) lines.push('', ...facts);
       if (item.element) lines.push('', ...formatElement(item.element, 'Selected element'));
+      if (split) lines.push(...itemLog(item, items, split, report, showUrl));
       sections.push(lines.join('\n'));
     });
   }
@@ -1064,22 +1264,36 @@ export function buildPrompt(report) {
     const before = items.filter(
       (item) => !elsewhere.includes(item) && capturedBeforeLoad(item, report.armedAt)
     );
-    sections.push(formatPage(report, { elsewhere, before }, showUrl));
-  } else if (report.contextError) {
-    // The page toggle is off, which keeps urls out, but the missing log still
-    // has to be explained somewhere.
-    const unread = unreadNotice(report.contextError);
-    sections.push(`## Console and network\n${unread[0].toUpperCase()}${unread.slice(1)}`);
+    // A split log says under each item where its entries are, or why there
+    // are none, so a caution here would only repeat it, about entries "below"
+    // that are above.
+    const stale = split ? { elsewhere: [], before: [] } : { elsewhere, before };
+    sections.push(formatPage(report, stale, showUrl));
+  } else {
+    // The page toggle is off, which keeps urls out, but a missing log, or a
+    // log cut short, still has to be explained somewhere.
+    const said = unreadNotice(report.contextError) || droppedNotice(report.dropped);
+    if (said) sections.push(`## Console and network\n${said[0].toUpperCase()}${said.slice(1)}`);
   }
 
-  const consoleLines = formatConsole(report.consoleLines, report.errors);
-  if (consoleLines.length) {
-    sections.push(`## Console output\n${fence(consoleLines.join('\n'))}`);
-  }
+  if (split) {
+    // Split under the items above; what is left came after the last of them.
+    if (split.after.length) {
+      sections.push(
+        `## Logged after the last capture on this page\n` +
+          fence(renderEntries(split.after, report.armedAt).join('\n'))
+      );
+    }
+  } else {
+    const consoleLines = formatConsole(report.consoleLines, report.errors, report.armedAt);
+    if (consoleLines.length) {
+      sections.push(`## Console output\n${fence(consoleLines.join('\n'))}`);
+    }
 
-  const networkLines = formatNetwork(report.network);
-  if (networkLines.length) {
-    sections.push(`## Failed network requests\n${fence(networkLines.join('\n'))}`);
+    const networkLines = formatNetwork(report.network, report.armedAt);
+    if (networkLines.length) {
+      sections.push(`## Failed network requests\n${fence(networkLines.join('\n'))}`);
+    }
   }
 
   if (items.length === 1 && items[0].element) {

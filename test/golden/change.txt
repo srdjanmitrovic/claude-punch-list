@@ -16,18 +16,18 @@ Read that image before anything else. It shows the current behaviour, which is w
 
 ## Console output
 ```
-[error] TypeError: Cannot read properties of undefined (reading 'price')
-          at applyCoupon (cart.js:142:18)
-          at handleSubmit (checkout.js:88:5)
-          at HTMLFormElement.<anonymous> (checkout.js:31:9)
-[warn] Coupon SUMMER25 missing from catalog, falling back to null
+20:51:31.840 [warn] Coupon SUMMER25 missing from catalog, falling back to null
+20:51:31.902 [error] TypeError: Cannot read properties of undefined (reading 'price')
+                       at applyCoupon (cart.js:142:18)
+                       at handleSubmit (checkout.js:88:5)
+                       at HTMLFormElement.<anonymous> (checkout.js:31:9)
 ```
 
 ## Failed network requests
 ```
-POST http://localhost:3000/api/coupons/validate -> 500 Internal Server Error (243ms)
-    called from applyCoupon (/src/components/cart/CartSummary.tsx:70:36)
-                handleApply (/src/components/cart/CartSummary.tsx:84:13)
+20:51:31.650 POST http://localhost:3000/api/coupons/validate -> 500 Internal Server Error (243ms)
+                 called from applyCoupon (/src/components/cart/CartSummary.tsx:70:36)
+                             handleApply (/src/components/cart/CartSummary.tsx:84:13)
 ```
 
 ## Selected element
