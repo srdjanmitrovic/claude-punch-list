@@ -9,7 +9,8 @@
  *
  * Message protocol
  * ----------------
- * panel      -> worker   cdr:arm            { mode: 'region'|'element', tabId }
+ * panel      -> worker   cdr:arm            { mode: 'region'|'element', tabId, armId }
+ * worker     -> panel    cdr:armed          { mode, tabId, armId } (armId absent for the shortcut)
  * panel      -> worker   cdr:disarm         { tabId }
  * content    -> *        cdr:region-selected { rect, viewport }
  * content    -> *        cdr:element-picked  { rect, viewport, element }
@@ -78,47 +79,121 @@ async function restrictionFor(tab) {
  * If the worker is evicted this map is lost, which degrades correctly: the
  * button simply shows unarmed, and clicking it arms afresh rather than
  * cancelling.
+ *
+ * Each entry is { mode, armId }, the armId being the panel's for that arm (none
+ * for the shortcut), so a panel can refuse to adopt an arm it has cancelled.
  */
 const armedByTab = new Map();
+
+/*
+ * Ordering an arm against the disarm that cancels it happens here, because
+ * only the worker sees every request in the order it was made. A panel hears
+ * of the shortcut's arm only through a broadcast, which goes out when that arm
+ * lands, so a cancel the panel sends may know nothing of it. The rule is order
+ * alone: a disarm cancels every arm asked for on that tab before it, whichever
+ * one the panel thought it was cancelling, and an arm asked for after it
+ * stands.
+ */
+
+/** The newest arm asked for on each tab, so a disarm can tell if one came after it. */
+const latestArmByTab = new Map();
+
+/** Injections of capture scripts still on their way to each tab. */
+const landingsByTab = new Map();
+
+/**
+ * Disarms per tab, counted. An arm takes the count when it is asked for; if
+ * the count has moved by the time it would inject, or by the time it has
+ * landed, a disarm came after it, and it neither goes ahead nor records
+ * itself as live.
+ */
+const disarmsByTab = new Map();
 
 chrome.sidePanel
   .setPanelBehavior({ openPanelOnActionClick: true })
   .catch((error) => console.error('[cdr] setPanelBehavior failed', error));
 
-async function arm(mode, tabId) {
+const disarmedSince = (tabId, count) => (disarmsByTab.get(tabId) || 0) !== count;
+
+function trackLanding(tabId, landing) {
+  let landings = landingsByTab.get(tabId);
+  if (!landings) landingsByTab.set(tabId, (landings = new Set()));
+  landings.add(landing);
+  landing.finally(() => landings.delete(landing)).catch(() => {});
+}
+
+async function arm(mode, tabId, armId) {
   const file = CAPTURE_SCRIPTS[mode];
   if (!file) throw new Error(`Unknown capture mode: ${mode}`);
+  const disarms = disarmsByTab.get(tabId) || 0;
+  latestArmByTab.set(tabId, Symbol('arm'));
 
   const tab = await chrome.tabs.get(tabId);
   const restriction = await restrictionFor(tab);
   if (restriction) throw new Error(restriction);
 
+  // Cancelled before anything reached the page, so there is nothing to put
+  // there and nothing to take down.
+  if (disarmedSince(tabId, disarms)) return { ok: true };
+
   // executeScript re-runs the file on every call. Both capture scripts are
   // written to be idempotent: they cache their controller on window and only
   // call start() again.
-  await chrome.scripting.executeScript({
+  const landing = chrome.scripting.executeScript({
     target: { tabId },
     files: [file],
   });
+  trackLanding(tabId, landing);
+  await landing;
 
-  armedByTab.set(tabId, mode);
+  // Cancelled while landing. The disarm stops it now that it is there.
+  if (disarmedSince(tabId, disarms)) return { ok: true };
+
+  armedByTab.set(tabId, { mode, armId });
 
   // Tell any panel that is already listening. Without this the keyboard
   // shortcut would leave the page showing a crosshair while the panel's button
   // sits unlit, and the next click on that button would read as a cancel. A
   // panel that opens later picks the same state up via cdr:check-tab instead.
-  chrome.runtime.sendMessage({ type: 'cdr:armed', mode, tabId }).catch(() => {});
+  // The panel that asked hears this too. armId lets it tell the echo of an arm
+  // it has since cancelled from a new one.
+  chrome.runtime.sendMessage({ type: 'cdr:armed', mode, tabId, armId }).catch(() => {});
 
   return { ok: true };
 }
 
+/** Take down whatever is armed on a tab, and every arm asked for there so far. */
 async function disarm(tabId) {
+  const latest = latestArmByTab.get(tabId);
+  disarmsByTab.set(tabId, (disarmsByTab.get(tabId) || 0) + 1);
   armedByTab.delete(tabId);
+
+  // Arms still landing go first. A file injection is read from the package
+  // before it is sent to the page and a function injection is not, so a stop
+  // sent now could reach the page ahead of the overlay it is meant to remove.
+  const landings = landingsByTab.get(tabId);
+  if (landings?.size) await Promise.allSettled([...landings]);
+
+  // An arm asked for while this waited came after the cancel. It lands after
+  // the ones cancelled, and its start() takes the page over, stopping the
+  // other mode if need be, so the page is left to it.
+  if (latestArmByTab.get(tabId) !== latest) return { ok: true };
+
   await chrome.scripting.executeScript({
     target: { tabId },
     func: () => {
       window.__cdrRegionOverlay?.stop();
       window.__cdrElementPicker?.stop();
+      // Settles once the page has painted a frame without the overlay, so a
+      // Screen capture that waits on this reply cannot photograph it.
+      // executeScript waits for a returned promise. The timer is there for a
+      // tab in the background, which runs no animation frames; Chrome may
+      // stretch it to a second there, and a frozen tab runs neither. Nothing
+      // waits on that case: the overlay is already gone, removed above.
+      return new Promise((resolve) => {
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve(true)));
+        setTimeout(() => resolve(true), 150);
+      });
     },
   });
   return { ok: true };
@@ -128,7 +203,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || typeof message.type !== 'string') return false;
 
   if (message.type === 'cdr:arm') {
-    arm(message.mode, message.tabId).then(sendResponse, (error) =>
+    arm(message.mode, message.tabId, message.armId).then(sendResponse, (error) =>
       sendResponse({ ok: false, error: error?.message || String(error) })
     );
     return true;
@@ -148,7 +223,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           sendResponse({
             ok: true,
             restriction,
-            armedMode: armedByTab.get(message.tabId) || null,
+            armedMode: armedByTab.get(message.tabId)?.mode || null,
+            armId: armedByTab.get(message.tabId)?.armId || null,
           }),
         (error) => sendResponse({ ok: false, error: error?.message || String(error) })
       );
@@ -178,6 +254,9 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   armedByTab.delete(tabId);
+  disarmsByTab.delete(tabId);
+  latestArmByTab.delete(tabId);
+  landingsByTab.delete(tabId);
 });
 
 chrome.commands.onCommand.addListener((command, tab) => {

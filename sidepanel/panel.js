@@ -18,7 +18,8 @@ import { buildPrompt } from '../shared/prompt-template.js';
 
 const SAVE_FOLDER = 'claude-punch-list';
 const SLOW_DOWNLOAD_HINT_MS = 2500;
-const ARM_TIMEOUT_MS = 3000; // cap on waiting for an in-flight arm to settle
+const ARM_TIMEOUT_MS = 3000; // cap on waiting for a page to take a capture overlay down
+const CONTEXT_TIMEOUT_MS = 2000; // cap on reading the log; the bridge gives the page 1000 of it
 const REPORT_TTL_MS = 7 * 24 * 60 * 60 * 1000; // how long an uncopied report survives
 const THUMB_MAX_WIDTH = 800; // the frame is never wider than this in device pixels
 const THUMB_MAX_HEIGHT = 800; // and a tall element crop should not cost a megabyte
@@ -157,19 +158,35 @@ const state = {
   intent: 'bug', // what the NEXT item starts as; sticky, like the toggles
   armedMode: null, // 'region' | 'element' | null
   armedTabId: null, // which tab that arm was issued against
-  armPending: null, // in-flight cdr:arm, so a fast cancel cannot overtake it
+  armedId: null, // the armId behind that arm, when it has one (the shortcut's has none)
+  cancelledArmIds: new Set(), // arms this panel cancelled or replaced, whose late cdr:armed is ignored
+  cancels: new Map(), // tabId -> a disarm on its way there, so a capture on that tab can wait
+  resolving: 0, // bumped by each resolveTab(), so an older one that answers late gives way
+  capturing: false, // a Screen capture in flight, so a second click cannot start another
   /** @type {Item[]} */
   items: [],
   // The item in the frame, whose description the field edits. Distinct from
   // the ticks: any number of items can be ticked, one at most is in the frame.
   selectedId: null,
-  context: null, // { page, collected }
   lastDownloadId: null,
   lastPrompt: '',
   busy: false,
 };
 
 // ---------------------------------------------------------------- helpers --
+
+const TIMED_OUT = Symbol('timed out');
+
+/** The promise, or a rejection with TIMED_OUT once `ms` have passed. */
+function withTimeout(promise, ms) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(TIMED_OUT), ms);
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
 
 function showBanner(message, kind = 'warn') {
   if (!message) {
@@ -192,9 +209,10 @@ function setCount(node, value) {
  * The tab id matters because arming is per-tab but the panel is per-window: a
  * mode armed on tab A must not read as armed once the user switches to tab B.
  */
-function setArmed(mode, tabId = null) {
+function setArmed(mode, tabId = null, armId = null) {
   state.armedMode = mode;
   state.armedTabId = mode ? tabId : null;
+  state.armedId = mode ? armId : null;
   for (const [name, node] of [
     ['region', el.modeRegion],
     ['element', el.modeElement],
@@ -314,7 +332,9 @@ function folderOf(path) {
 // ------------------------------------------------------------------- tab --
 
 async function resolveTab() {
+  const call = ++state.resolving;
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (call !== state.resolving) return;
   state.tab = tab || null;
 
   // Arming is per-tab. Switching tabs would otherwise leave the button lit for
@@ -322,18 +342,13 @@ async function resolveTab() {
   // click on it would be swallowed by the cancel branch.
   if (state.armedMode && state.armedTabId !== (tab?.id ?? null)) {
     const stale = state.armedTabId;
-    const inFlight = state.armPending;
+    if (state.armedId) state.cancelledArmIds.add(state.armedId);
     setArmed(null);
-    if (stale != null) {
-      // Chain behind any arm still in flight for that tab. Sending the disarm
-      // immediately can beat the arm's injection, stopping a controller that
-      // does not exist yet and orphaning the overlay on the page the user just
-      // left, where only Esc would clear it.
-      Promise.resolve(inFlight)
-        .catch(() => {})
-        .then(() => chrome.runtime.sendMessage({ type: 'cdr:disarm', tabId: stale }))
-        .catch(() => {});
-    }
+    // Sent at once, even if the arm is still on its way: the worker orders the
+    // two (see cancelArmed), and an arm made on coming back to that tab comes
+    // after this disarm, so it stands. Kept in state.cancels like any other,
+    // so a Screen on coming back waits for the overlay to go.
+    if (stale != null) sendDisarm(stale);
   }
 
   if (!tab) {
@@ -346,14 +361,23 @@ async function resolveTab() {
   el.targetUrl.title = tab.url || '';
 
   const response = await chrome.runtime.sendMessage({ type: 'cdr:check-tab', tabId: tab.id });
+  // A newer call, for the tab now in view, owns the panel. This answer is
+  // about a tab the user has left, and would light its mode or carry its
+  // restriction over.
+  if (call !== state.resolving) return;
   state.restriction = response?.restriction || null;
 
   // The worker tracks which tab has an overlay waiting. Adopting it here covers
   // the case a one-shot broadcast cannot: Alt+Shift+C arms the page and opens
   // the panel together, so the cdr:armed message can be sent before this
-  // document exists to hear it.
-  if (response?.armedMode && !state.armedMode) {
-    setArmed(response.armedMode, tab.id);
+  // document exists to hear it. Not an arm this panel has cancelled, though:
+  // the worker records an arm when it lands, which can be after the cancel.
+  if (
+    response?.armedMode &&
+    !state.armedMode &&
+    !(response.armId && state.cancelledArmIds.has(response.armId))
+  ) {
+    setArmed(response.armedMode, tab.id, response.armId || null);
   }
 
   el.statusDot.className = state.restriction ? 'dot blocked' : 'dot ready';
@@ -729,6 +753,9 @@ async function addItem(capture) {
   refreshContext();
   // Hands are on the mouse after a drag; the next thing to do is type.
   el.description.focus({ preventScroll: true });
+  // Something the user should know about this capture. Shown now and again
+  // once the save is done, since the save clears the banner on its way out.
+  if (capture.notice) showBanner(capture.notice);
 
   try {
     item.thumb = await makeThumb(capture.dataUrl);
@@ -753,7 +780,8 @@ async function addItem(capture) {
     renderFrame();
     const row = el.list.children[state.items.indexOf(item)];
     if (row) fillRowText(row, item, state.items.indexOf(item));
-    showBanner(null);
+    // Clears the slow save hint, but not a warning about this capture.
+    showBanner(capture.notice || null);
   } catch (error) {
     // Nothing reached the disk, so there is nothing to keep: the description
     // field has only been open for as long as the save took, and an item with
@@ -856,48 +884,76 @@ function resetAfterCopy(copied) {
   refreshContext();
 }
 
+/** Whether a capture mode is waiting on the tab in view. */
+function armedHere() {
+  return Boolean(state.armedMode) && state.armedTabId === state.tab?.id;
+}
+
+/**
+ * Cancel the armed mode, as clicking its lit button does. Settles once the
+ * worker has answered, which it does after the page has painted a frame
+ * without the overlay, so a caller about to photograph the page can wait.
+ *
+ * A cancel can come while the arm it cancels is still on its way to the page
+ * (Esc or Screen pressed straight after a mode button, on a cold worker or a
+ * busy page), and after the shortcut has armed the same tab without this panel
+ * having heard of it yet. Both are the worker's to sort out: it sees every arm
+ * and disarm in order, and a disarm cancels every arm asked for before it. The
+ * cdr:armed broadcast a cancelled arm of this panel may still send is ignored
+ * here by its armId.
+ */
+function cancelArmed() {
+  const tabId = state.armedTabId;
+  if (state.armedId) state.cancelledArmIds.add(state.armedId);
+  setArmed(null);
+  return sendDisarm(tabId);
+}
+
+/**
+ * Send a disarm, and keep it in state.cancels until it settles, so a capture
+ * on that tab, from a click rather than from the code that cancelled, waits
+ * for the page to repaint without the overlay.
+ */
+function sendDisarm(tabId) {
+  const promise = chrome.runtime.sendMessage({ type: 'cdr:disarm', tabId }).catch(() => undefined);
+  state.cancels.set(tabId, promise);
+  // Never rejects, so this chain cannot leave an unhandled rejection behind.
+  promise.then(() => {
+    if (state.cancels.get(tabId) === promise) state.cancels.delete(tabId);
+  });
+  return promise;
+}
+
 async function arm(mode) {
   if (state.restriction || !state.tab) return;
   showBanner(null);
 
-  // Wait for any arm/disarm already in flight. Without this, double-clicking a
-  // mode button can land the disarm before the arm it was meant to cancel:
-  // arm() awaits a tabs.get in the worker while disarm() does not, so on a cold
-  // service worker the second click overtakes the first and the page is left
-  // with a live overlay the panel thinks it cancelled.
-  //
-  // Bounded, because executeScript never settles against a wedged renderer.
-  // That is precisely the kind of page this extension exists to report on, and
-  // an unbounded await would leave both mode buttons dead with no explanation.
-  if (state.armPending) {
-    await Promise.race([
-      state.armPending.catch(() => {}),
-      new Promise((resolve) => setTimeout(resolve, ARM_TIMEOUT_MS)),
-    ]);
-  }
-
   // Clicking the already-armed mode cancels it, which is what the highlighted
-  // button reads as. Only treat it as a cancel when the arm belongs to the tab
-  // currently in view; otherwise it is a fresh arm for a different page.
-  if (state.armedMode === mode && state.armedTabId === state.tab.id) {
-    const target = state.armedTabId;
-    setArmed(null);
-    chrome.runtime.sendMessage({ type: 'cdr:disarm', tabId: target }).catch(() => {});
+  // button reads as, even while that arm is still on its way. Only treat it as
+  // a cancel when the arm belongs to the tab currently in view; otherwise it
+  // is a fresh arm for a different page.
+  if (state.armedMode === mode && armedHere()) {
+    cancelArmed();
     return;
   }
 
-  setArmed(mode, state.tab.id);
-
-  const request = chrome.runtime.sendMessage({
-    type: 'cdr:arm',
-    mode,
-    tabId: state.tab.id,
-  });
-  state.armPending = request;
+  // An arm of this panel that this one replaces, in flight or landed, would
+  // light its own mode over this one when its broadcast arrives. The worker
+  // needs no word of it: this arm lands after it and takes the page over.
+  if (state.armedId) state.cancelledArmIds.add(state.armedId);
+  const armId = makeId();
+  setArmed(mode, state.tab.id, armId);
 
   try {
-    const response = await request;
-    if (!response?.ok) {
+    const response = await chrome.runtime.sendMessage({
+      type: 'cdr:arm',
+      mode,
+      tabId: state.tab.id,
+      armId,
+    });
+    // Only if the button still shows this arm: one that a later click has
+    // replaced, or that was cancelled, must not turn off what came after it.
+    if (!response?.ok && state.armedId === armId) {
       setArmed(null);
       showBanner(response?.error || 'Could not start capture on this tab.', 'error');
     }
@@ -906,17 +962,37 @@ async function arm(mode) {
     // instance when the extension is reloaded. Without this the button would
     // stay lit over a page with no overlay, and the next click would read as a
     // cancel rather than arming.
-    setArmed(null);
-    showBanner(error?.message || 'Could not start capture on this tab.', 'error');
-  } finally {
-    if (state.armPending === request) state.armPending = null;
+    if (state.armedId === armId) {
+      setArmed(null);
+      showBanner(error?.message || 'Could not start capture on this tab.', 'error');
+    }
   }
 }
 
 async function captureVisible() {
-  if (state.restriction) return;
+  // One capture in flight at a time. This covers the capture itself, which
+  // can take a while on a busy page; the second click of a double click is
+  // turned away where the click is handled.
+  if (state.restriction || state.capturing) return;
+  state.capturing = true;
   try {
     showBanner(null);
+    // An armed overlay is drawn on the page itself. Photographing it would bake
+    // the dim layer and the hint into the image and leave the overlay live, so
+    // it is cancelled first and the capture waits for the page to repaint.
+    if (armedHere()) cancelArmed();
+    // This cancel, or one sent for this tab a moment before the click: Esc,
+    // or the disarm sent on leaving it. Bounded, like every wait on the page,
+    // and said out loud when it runs out: a page too busy to take the overlay
+    // down still gets photographed, since that page is often the bug, but
+    // nobody should find the dim layer later without having been told.
+    let overlayMayShow = false;
+    const pending = state.cancels.get(state.tab?.id);
+    if (pending) {
+      await withTimeout(pending, ARM_TIMEOUT_MS).catch(() => {
+        overlayMayShow = true;
+      });
+    }
     const dataUrl = await captureViewport();
     const image = await loadImage(dataUrl);
     addItem({
@@ -924,42 +1000,73 @@ async function captureVisible() {
       width: image.naturalWidth,
       height: image.naturalHeight,
       mode: 'visible',
+      notice: overlayMayShow
+        ? 'The page was too busy to take the capture overlay down in time, so it may show in this screenshot.'
+        : null,
     });
   } catch (error) {
     showBanner(error?.message || 'Screenshot failed.', 'error');
+  } finally {
+    state.capturing = false;
   }
 }
 
 // --------------------------------------------------------------- context --
 
+/**
+ * Read the page facts and the collected log from the tab in view, for the
+ * chips and for a copy.
+ *
+ * Resolves to { context, error }: the bridge's reply or null, and why there is
+ * none. 'timeout' means the page did not answer in time, which is a long task
+ * or a breakpoint; 'missing' means nothing was collecting there.
+ *
+ * Bounded, because the reply has to come from the page's own thread. Unbounded,
+ * Copy sat on "Copying…" for as long as the page stayed busy, and forever while
+ * it was paused in the debugger.
+ */
 async function refreshContext() {
-  if (!state.tab || state.restriction) {
+  const tab = state.tab;
+  if (!tab || state.restriction) {
     setCount(el.countConsole, null);
     setCount(el.countNetwork, null);
-    return;
+    // Nothing from an earlier read is handed on. It came from another tab, and
+    // a copy made here would otherwise attach that tab's log.
+    return { context: null, error: 'missing' };
   }
 
+  let context = null;
+  let error = null;
   try {
-    const response = await chrome.tabs.sendMessage(state.tab.id, { type: 'cdr:get-context' });
-    state.context = response;
-    el.collectorWarning.hidden = !response?.collected?.unavailable;
+    context = await withTimeout(
+      chrome.tabs.sendMessage(tab.id, { type: 'cdr:get-context' }),
+      CONTEXT_TIMEOUT_MS
+    );
+    // The bridge answered for a page whose own half never armed.
+    if (context?.collected?.unavailable) error = 'missing';
+  } catch (failure) {
+    // Either no content script in this tab, because it was loaded before the
+    // extension was installed or enabled, and a reload arms it; or a page too
+    // busy to answer, where a reload would destroy the state being reported.
+    context = null;
+    error = failure === TIMED_OUT ? 'timeout' : 'missing';
+  }
 
-    const collected = response?.collected || {};
+  // The user can change tabs while this is in flight. The reply then describes
+  // the tab they left, so it goes back to whoever asked and not into the chips
+  // for the tab now in view.
+  if (state.tab?.id === tab.id) {
+    el.collectorWarning.hidden = error !== 'missing';
+    const collected = context?.collected || {};
     setCount(
       el.countConsole,
-      (collected.console?.length || 0) + (collected.errors?.length || 0)
+      context ? (collected.console?.length || 0) + (collected.errors?.length || 0) : null
     );
-    setCount(el.countNetwork, collected.network?.length || 0);
-  } catch {
-    // No content script in this tab: it was loaded before the extension was
-    // installed or enabled. A reload arms it.
-    state.context = null;
-    el.collectorWarning.hidden = false;
-    setCount(el.countConsole, null);
-    setCount(el.countNetwork, null);
+    setCount(el.countNetwork, context ? collected.network?.length || 0 : null);
   }
 
   setCount(el.countElement, state.items.filter((item) => item.element).length || null);
+  return { context, error };
 }
 
 // ----------------------------------------------------------------- saving --
@@ -1065,10 +1172,17 @@ async function deleteFile(downloadId) {
  * @param {Item[]} items The items this prompt is about. Passed in rather than
  *   read from state, because a capture can land while the copy is in flight
  *   and must not leak into a prompt that was already decided.
+ * @param {{ context: Object|null, error: string|null }} read What
+ *   refreshContext() returned for this copy.
  */
-function assembleReport(items) {
-  const collected = state.context?.collected || {};
+function assembleReport(items, read) {
+  const { context, error } = read;
+  const collected = context?.collected || {};
   const includePage = el.incPage.checked;
+  // Whether the prompt says anything about the log at all. With both toggles
+  // off, a caution or a reason about entries nobody asked for is noise.
+  const wantedLog = el.incConsole.checked || el.incNetwork.checked;
+  const newest = items.at(-1);
   return {
     items: items.map((item) => ({
       intent: item.intent,
@@ -1081,11 +1195,18 @@ function assembleReport(items) {
       capturedAt: item.capturedAt,
       element: el.incElement.checked ? item.element : null,
     })),
-    page: includePage ? state.context?.page : null,
+    // With nothing read, the newest item's own page stands in. Each item
+    // recorded it at capture, and without it the prompt named no page at all.
+    page: includePage
+      ? context?.page || (newest?.url ? { url: newest.url, title: newest.title || '' } : null)
+      : null,
     consoleLines: el.incConsole.checked ? collected.console || [] : [],
     errors: el.incConsole.checked ? collected.errors || [] : [],
     network: el.incNetwork.checked ? collected.network || [] : [],
     builtAt: Date.now(),
+    // Tells the template an item was captured on an earlier load of this page.
+    armedAt: wantedLog && Number.isFinite(collected.armedAt) ? collected.armedAt : undefined,
+    contextError: wantedLog && error ? error : undefined,
   };
 }
 
@@ -1112,20 +1233,25 @@ async function copyReport() {
   showBanner(null);
 
   try {
-    await refreshContext();
+    const read = await refreshContext();
 
-    const prompt = buildPrompt(assembleReport(items));
+    const prompt = buildPrompt(assembleReport(items, read));
     const paths = items.map((item) => item.path);
     state.lastPrompt = prompt;
     state.lastDownloadId = items.at(-1).downloadId;
 
     const method = await copyText(prompt);
+    // Said here because nothing else would say it: the chips only show dashes,
+    // and the reload hint under them is wrong advice for a page that is busy.
+    const wantedLog = el.incConsole.checked || el.incNetwork.checked;
 
     // The action keeps its name through the flow: the button says Copy, so the
     // confirmation says Copied.
-    el.resultText.textContent = method
-      ? 'Copied. Paste into Claude Code.'
-      : 'The clipboard was blocked, so copy the prompt below.';
+    el.resultText.textContent = !method
+      ? 'The clipboard was blocked, so copy the prompt below.'
+      : read.error === 'timeout' && wantedLog
+        ? 'Copied without the log: the page did not answer in time. Paste into Claude Code.'
+        : 'Copied. Paste into Claude Code.';
     el.resultPath.textContent =
       paths.length === 1 ? paths[0] : `${paths.length} screenshots in ${folderOf(paths[0])}`;
     el.result.hidden = false;
@@ -1364,7 +1490,9 @@ async function restore() {
 
 function handleBroadcast(message) {
   if (message.type === 'cdr:armed') {
-    setArmed(message.mode, message.tabId);
+    // The echo of an arm this panel has already cancelled; see cancelArmed().
+    if (message.armId && state.cancelledArmIds.has(message.armId)) return;
+    setArmed(message.mode, message.tabId, message.armId || null);
     return;
   }
 
@@ -1418,7 +1546,13 @@ chrome.runtime.onMessage.addListener((message, sender) => {
 
 el.modeRegion.addEventListener('click', () => arm('region'));
 el.modeElement.addEventListener('click', () => arm('element'));
-el.modeVisible.addEventListener('click', captureVisible);
+el.modeVisible.addEventListener('click', (event) => {
+  // The second click of a double click (detail 2) would file the same screen
+  // twice, and the first capture is often finished by the time it arrives.
+  // A keyboard press has detail 0 and always counts.
+  if (event.detail > 1) return;
+  captureVisible();
+});
 el.previewClear.addEventListener('click', discardSelected);
 el.discardAll.addEventListener('click', discardAll);
 
@@ -1522,11 +1656,19 @@ el.clearBuffers.addEventListener('click', async () => {
   }
 });
 
-// Cmd/Ctrl+Enter copies without reaching for the mouse.
 document.addEventListener('keydown', (event) => {
+  // Cmd/Ctrl+Enter copies without reaching for the mouse.
   if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
     event.preventDefault();
     copyReport();
+    return;
+  }
+  // Esc cancels an armed mode from here too. Clicking a mode button leaves
+  // focus in the panel, so the page's own Esc handler, which the hint on the
+  // page names, never hears the key until the user clicks back into the page.
+  if (event.key === 'Escape' && !event.isComposing && armedHere()) {
+    event.preventDefault();
+    cancelArmed();
   }
 });
 

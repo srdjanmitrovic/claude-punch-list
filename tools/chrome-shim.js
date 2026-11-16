@@ -26,6 +26,8 @@
   const downloadListeners = [];
   const downloads = new Map();
   let nextDownloadId = 1;
+  let latestArm = null; // the newest cdr:arm, as the worker's latestArmByTab
+  const landings = new Set(); // arms still landing, as the worker's landingsByTab
 
   // getManifest is synchronous, so this has to be too.
   let manifest = { version: '0.0.0', name: 'Panel stage' };
@@ -75,12 +77,27 @@
         switch (message?.type) {
           case 'cdr:check-tab':
             return { ok: true, restriction: null, armedMode: null };
-          case 'cdr:arm':
-            if (stage) await stage.arm(message.mode);
+          case 'cdr:arm': {
+            // Ordered against a disarm as the worker orders them: a disarm
+            // waits for every arm still landing, then stops the page unless
+            // an arm was asked for while it waited.
+            const request = Symbol('arm');
+            latestArm = request;
+            if (stage) {
+              const landing = Promise.resolve(stage.arm(message.mode));
+              landings.add(landing);
+              landing.finally(() => landings.delete(landing)).catch(() => {});
+              await landing;
+            }
             return { ok: true };
-          case 'cdr:disarm':
+          }
+          case 'cdr:disarm': {
+            const latest = latestArm;
+            if (landings.size) await Promise.allSettled([...landings]);
+            if (latestArm !== latest) return { ok: true };
             if (stage) await stage.disarm();
             return { ok: true };
+          }
           default:
             return undefined;
         }

@@ -142,10 +142,10 @@ could see.
 
 | Message | From | To | Purpose |
 | :--- | :--- | :--- | :--- |
-| `cdr:arm` | panel | worker | Inject overlay or picker into a tab |
-| `cdr:disarm` | panel | worker | Tear down whatever is armed there |
+| `cdr:arm` | panel | worker | Inject overlay or picker into a tab, under a fresh `armId` |
+| `cdr:disarm` | panel | worker | Tear down whatever is armed there, and every arm asked for there so far, replying once the page has repainted without it |
 | `cdr:check-tab` | panel | worker | Ask whether a tab is usable, and what is armed on it |
-| `cdr:armed` | worker | panel | A capture mode is now waiting on a tab |
+| `cdr:armed` | worker | panel | A capture mode is now waiting on a tab. Carries the `armId` of the `cdr:arm` behind it, or none for the shortcut, so a panel can ignore the echo of an arm it cancelled in flight |
 | `cdr:region-selected` | overlay | panel | A rectangle was dragged |
 | `cdr:element-picked` | picker | panel | An element was clicked |
 | `cdr:capture-cancelled` | overlay, picker | panel | The user pressed Escape |
@@ -184,6 +184,28 @@ broadcast is not enough by itself, because `Alt+Shift+C` opens the panel and arm
 the same breath: the message can be sent before the panel document exists to hear it. The
 panel picks the state up from the `cdr:check-tab` reply instead.
 
+**The worker orders an arm and the disarm that cancels it.** A cancel can come while its arm is
+still on the way (Esc straight after a mode button, on a cold worker or a busy page), and the
+shortcut can arm the same tab in between. Only the worker sees all of these in the order they
+were made. The panel hears of the shortcut only through the broadcast that goes out when that
+arm lands, so a cancel it sends may know nothing of it. The panel therefore sends its disarm at
+once, and the worker applies one rule, order alone: a disarm cancels every arm asked for on that
+tab before it, and an arm asked for after it stands. In practice the worker:
+
+* counts disarms per tab, and each arm takes the count when it is asked for. An arm whose count
+  has moved before it injects drops out with nothing put on the page, and one whose count moves
+  while it lands does not record itself as live;
+* waits for every arm still landing before sending the stop, because a file injection is read
+  from the package first and a function injection is not, so a stop sent second could reach the
+  page first;
+* skips the stop if an arm was asked for while it waited. That arm came after the cancel, lands
+  after the ones cancelled, and its `start()` takes the page over, stopping the other mode if
+  need be.
+
+Every arm from the panel carries an `armId`. The panel remembers the ids of the arms it
+cancelled or replaced and refuses both their `cdr:armed` broadcast and a `cdr:check-tab` answer
+that names one. The shortcut's arm has no id, so it is always news.
+
 ### A failed request records who sent it
 
 The URL of a request that failed says what broke. The function that sent it says where to look,
@@ -197,6 +219,39 @@ only on failure, so a healthy page pays one allocation per request and nothing e
 wrapper releases its `Error` as soon as the request settles, because an unformatted one holds a
 strong reference to every recorded frame's function and receiver, which a long polling request
 would otherwise pin for its lifetime.
+
+What counts as failed is decided by status. A fetch is recorded at 400 or above, as an XHR
+always was, because `response.ok` is also false for a no-cors response, a manual redirect and a
+304, none of which failed. A rejection the page caused itself, through the request's
+`AbortSignal` or an XHR `abort` or `timeout` event, is recorded with an `outcome` of `aborted` or
+`timeout`, and the prompt prints it after the real failures under that label. The signal is
+asked rather than the error, because `abort(reason)` rejects with whatever reason the page
+passed.
+
+An XHR object can carry two requests at once. A page may reopen it from inside a handler of the
+request that is just finishing (a retry in `ontimeout`, the next long poll in `onload`), and
+Chrome still dispatches that request's `loadend` afterwards, with the status already reset by
+the reopen. So each `open()` starts a record of its own, a reopen parks the finishing record
+with the status it ended on, and late events are credited to it. They are told apart by
+`readyState`: the finishing request's own events arrive while the object is DONE, the late ones
+after the reopen has moved it back to OPENED. An `abort()` on a finished request parks it the
+same way, because Chrome fires no event for it and drops the object to UNSENT with status 0
+before the `loadend` arrives. A park is only committed once the native call has gone through,
+so an `open()` the browser refuses (a bad method or URL) leaves the bookkeeping as it was. Parks
+can nest: a handler of a parked request can finish a second request synchronously and reopen
+again, and Chrome then delivers the inner request's late events before the outer one's, so the
+parked slot is a stack. A handler can also run a synchronous request to the end without
+reopening, leaving the object DONE for a request that has already settled; a settled record
+gets no more events of its own, so what arrives next goes to the parked one. If no late event
+ever comes, a zero delay timer settles the parked
+record. That timer, and the collector's own listeners, go through the `setTimeout` and
+`addEventListener` the page had at `document_start`, not whatever zone.js or a fake clock has
+put in their place since, so an Angular page does not run change detection for them.
+
+A synchronous request that fails at the network level is the one case with no event at all:
+Chrome throws `NetworkError` out of `send()` and fires nothing, `loadend` included. The send
+wrapper settles that request in its catch, and only when the throw moved the object from OPENED
+to DONE, which tells it apart from a `send()` the browser refused outright.
 
 Frames are filtered down to the page's own code. A frame is kept only when its path ends in
 something that looks like a file extension, since a bare document path is a route rather than a
