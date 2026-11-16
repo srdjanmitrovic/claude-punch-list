@@ -972,14 +972,16 @@ Stated here so nothing above reads as more certain than it is.
 
 ## Implemented after the review
 
-Items 2 and 3 of the top 5, on 2026-11-16, uncommitted on `main` at the time of writing. Line
-references from here on point at that working tree.
+All of it on 2026-11-16, on the branch `review-fixes`. Line references from here on point at that
+branch.
+
+### Items 2 and 3 of the top 5
 
 **Tests and CI (improvement 6).** `npm test` runs `node:test` with no dependency: goldens for the
-prompt in `test/golden/` (the one item cases equal to the `a0c9335` output byte for byte), the real
-collector in a `node:vm` realm against a fake XMLHttpRequest that behaves as Chrome 156 was observed
-to, and static checks on every path the manifest, the worker and the panel name.
-`.github/workflows/ci.yml` runs it on Node 20 and 24, and `release.yml` runs it before building.
+prompt in `test/golden/`, the real collector in a `node:vm` realm against a fake XMLHttpRequest
+that behaves as Chrome 156 was observed to, and static checks on every path the manifest, the
+worker and the panel name. `.github/workflows/ci.yml` runs it on Node 20 and 24, and `release.yml`
+runs it before building.
 
 **Small fixes (improvements 2 to 5).**
 
@@ -1012,27 +1014,178 @@ to, and static checks on every path the manifest, the worker and the panel name.
 **How it was checked.** Six rounds in headless Chrome for Testing 156.0.8078.4, from the fourth on
 with the real unpacked extension (the panel run as a tab, the shortcut stood in for by a `cdr:arm`
 with no id), each followed by an adversarial review and skeptics on its findings. The last round
-passed 46 scenario checks and its review found nothing new to that round. A real side panel, the
-real Alt+Shift+C command and headed Chrome were never used.
+passed 46 scenario checks and its review found nothing new to that round.
+
+### Items 4 and 5 of the top 5, and F1 to F4
+
+**Navigation and Screen while armed.** These four were found while verifying items 2 and 3, and
+first listed in the table below.
+
+* F1. Chrome reports `pushState`, `replaceState` and a hash change as `loading`, as it does a real
+  navigation, and panel and worker went dark while the overlay stayed live. A navigation is now
+  checked rather than assumed: on `loading` and `complete` the worker asks the page which controller
+  is active, after any arm still landing (`background.js:225`), and the panel asks the same before
+  it goes dark (`sidepanel/panel.js:988`). The overlay and the picker stop themselves on `pagehide`
+  (`content/overlay.js:236`, `content/picker.js:969`), so a page restored from the back/forward
+  cache comes back without one.
+* F2. A mode armed while Screen waits on its cancel stays armed. The disarm's reply says when an
+  arm asked for since has taken the page over (`background.js:187`), and Screen then asks
+  `screenAfterRearm` (`sidepanel/panel.js:1097`) whether to photograph the page and what to say.
+  For now it photographs it and says the overlay may show. Which of the three choices is right
+  (capture and warn, skip and say why, or decide by mode) is still open. The region and element
+  failure handlers no longer turn off a mode armed after the drag.
+* F3. Covered by F1. An arm that lands in a document on its way out is seen to be gone, and its
+  late broadcast is refused as a cancelled arm's is.
+* F4. Every banner carries a scope (`sidepanel/panel.js:209`). A notice about one capture, such as
+  "the overlay may show", stays until the tab changes; an error about the page goes when the page
+  changes; one about the report (a missing file, a failed copy, a failed save) is left alone by
+  both. A restriction replaces any banner, and once it goes a missing file, which still holds
+  Copy back, is said again. A tab change is measured against the last `resolveTab` call to
+  finish, because opening a tab fires several at once.
+
+**Redaction (improvements 7 and 13).**
+
+* One name test, in three identical copies (template, collector, picker) that a static test holds
+  identical. It matches whole words in camelCase, snake case and kebab case names, ignores a
+  trailing number, and matches a few words at either end of a run together name (`authtoken`).
+  `className` is no longer redacted, and `pwd`, `pin`, `otp`, `cvc` and `otp1` are.
+* One URL block, in the template and the picker. Credentials are stripped, and a query or fragment
+  value whose name matches is masked, splitting on `;` as well as `&` and following a URL nested in
+  a value (`shared/prompt-template.js:1016`). The template applies it to every URL it prints, and
+  through `safeText` (`shared/prompt-template.js:1115`) to URLs inside console text, stack frames,
+  the `where` line and request caller frames.
+* Picker (`content/picker.js:640`). The value of a password, hidden, email or tel input, and of any
+  control, attribute, `srcset` candidate, style `url()` or textarea whose name matches, is masked in
+  both the attribute list and the serialised markup. Truncation finds the real end of the opening
+  tag before it cuts.
+* Collector. Keys are tested while props and logged objects are serialised
+  (`content/collector-main.js:118`), and `value`, `defaultValue` and `modelValue` are hidden on a
+  component whose props describe a password, one time code or card field
+  (`content/collector-main.js:777`).
+* README. The privacy section lists what is screened and what is not, and the restriction recipe
+  narrows only the two `content_scripts` matches. `docs/ARCHITECTURE.md` states the `activeTab`
+  limit correctly.
+
+**Evidence per item, in time order (feature 1 step one, improvement 8).**
+
+* The collector keeps warnings in a ring of their own, counts what each ring drops, stamps every
+  entry with a time and a sequence number, and takes both clocks from the natives it had at
+  `document_start` (`content/collector-main.js:42`), so a page that fakes `Date` cannot move them.
+* The panel stamps an item's time just before `captureVisibleTab` (`sidepanel/panel.js:461`) and
+  stores the page load it was captured on (`sidepanel/panel.js:829`).
+* The template merges console lines and errors by time, prints a clock (with the date when an
+  entry falls on another day than the copy), folds repeats with a count, and takes frames from the
+  lines that start with `at`. With more than one item, each item lists what was logged since the
+  item before it on the same page load (`shared/prompt-template.js:1306`, `:1331`), says when its
+  evidence was on another page or another load, and notes when a ring had already dropped entries
+  from its stretch. What came after the last capture gets a section of its own.
+* **This breaks the byte for byte rule, once and on purpose**, as improvement 8 said it would.
+  Rendered from the same input, the one item prompt differs from `a0c9335` in its console and
+  network sections only: the entries reorder by time, gain a clock, and their continuation lines
+  move right to match. The goldens in `test/golden/` show it line by line. The preview sample's
+  CSS Module line changed too, because the old sample printed a sentence the picker cannot
+  produce.
+
+**Found and fixed while verifying those.**
+
+* An arm counts as landing from the moment it is asked for (`background.js:137`), not from its
+  injection. A check that arrived while the worker still looked the tab up asked a page the overlay
+  had not reached, turned the button dark over it, and left Screen to photograph it with no notice.
+  New with F1; on a page rewriting its URL as fast as Chrome allows it hit 1 click in 100 in one
+  harness and 3 in 80 in another.
+* A tab opened in the foreground no longer keeps the previous tab's banner, an error about one
+  page no longer outlives a navigation, and the slow save hint goes with its save, including when
+  the item was discarded mid save.
+* Redaction gaps seen in Chrome: `&amp;` in markup, parameters split by `;`, nested and percent
+  encoded URLs, `//user:pass@`, the later candidates of a `srcset`, `ping`, `xlink:href`,
+  `data-src`, `data-href`, style `url()`, secret named textareas and buttons, relative URLs and
+  frames in console text, and a truncated opening tag that lost its masked attributes.
+* Timeline: a page's own `Date.now` could move the collector's clock; an item's time was read after
+  the screenshot rather than before; an item from another tab's load of the same URL was called a
+  reload; the date was missing when the log crossed midnight.
+* From the fourth round, on the fixes themselves. A URL nested a few thousand times ran the
+  screening out of stack, and the page address then printed raw: nesting is followed four levels
+  and masked whole past that, and an address that cannot be parsed is still screened. Console
+  text stopped matching a URL at its first letter outside ASCII, which printed the token of an
+  international address the earlier code had masked: letters of any script now count. A key over
+  100 characters was skipped. The style `url()` pattern and the trailing bracket trim could take
+  seconds on hostile input, and now take one pass. In Chrome before 138, which leaves a `>` inside
+  an attribute value as it is, a cut could split the opening tag and print it unmasked. A `;` or a
+  `:line:col` could leave the tail of a secret value in clear. The text of a short secret
+  textarea was cut out of all the element's text. A log read on another origin could be filed
+  under an item with the page toggle off. A date before the clock read differently by locale and
+  is now year first. The slow save hint is cleared when the last slow save ends, however it ends.
+  Two older gaps went with them: credentials in a nested URL with no query, and the masking
+  marker taken for a child element, which dropped an element's own text from "Search for".
+* From a fifth round, on those fixes. Narrowing where a relative URL may start, which had made
+  the scan linear, stopped screening one after `:`, `,`, `|`, `#`, JSON's `\/` or another script,
+  or with brackets in its path. The scan now takes each run of URL characters once and finds the
+  URL's start inside it, under the old rule. A quoted style `url()` holding a parenthesis, as
+  CSSOM writes a signed CDN URL, went unmasked. A long key judged whole could block the page for
+  seconds, and is now judged by its two ends. A frame on a script URL with no file extension lost
+  its position, and a frame is now told by its shape. Running text in another script before an
+  e-mail address was taken for credentials and deleted.
+* From a sixth round, which ran 604 log lines with planted secrets through the new scan and the
+  two earlier ones, and 249 ordinary lines through the new one. The new scan masked 166 secrets
+  an earlier one printed, and printed 25 that one had masked. A `(` or an `at` in prose was taken
+  for a stack frame, which left digits after a colon outside the mask: a frame is now told by its
+  whole line, and its position must hold both line and column. A path in front of an absolute
+  URL hid that URL's credentials. A password with a letter outside ASCII was no longer stripped,
+  in console text or in the picker. The indexes of a long array filled the key cache, so every
+  key logged after one was judged again on every row. The missing file banner kept a stale item
+  number after a discard, and a discard could hide the restriction banner. After these fixes the
+  corpus prints 35 lines, all printed by the earlier scans of this branch too but one, which only
+  the first of them masked (F20). The ordinary lines change as before: four intended masks and
+  two over strips (F24).
+
+**How it was checked.** `npm test` (97 tests, every golden byte for byte; each new test was run
+against the tree before its fix, where it fails). Then three rounds in
+headless Chrome for Testing 156.0.8078.4 with the real unpacked extension, each followed by an
+adversarial review and skeptics: one for navigation and Screen (about 40 scenarios, among them
+same document navigations, cross document ones fast and slow, the back/forward cache and pages
+still streaming), one for redaction (React 18 and 19 forms, AMP markup, truncation and timings),
+and one for the timeline. A fourth round re-ran all three against the fixes and reviewed their
+diff. It confirmed the navigation and arm race fixes in every scenario, found that the banner
+rule it was given cleared item errors on any URL change (the scopes under F4 replaced that rule),
+and found the fourth round items above, all fixed. Every defect the rounds confirmed is fixed
+above or listed below.
+A fifth, shorter round re-ran the failed scenarios in Chrome and reviewed the diff of the fixes
+after the fourth. Its banner, save, arm race and redaction scenarios passed, and the defects it
+found in those fixes are listed under the fifth round above and fixed. The sixth was not run in
+Chrome: it compared the scans line by line in Node, timed hostile input up to 1 MB (every case
+under 100 ms but F22 and F23), and ran the panel's banner functions against a stub of the DOM.
+
+A real side panel, the real Alt+Shift+C command and headed Chrome were never used. Headless Chrome
+did not enforce the capture quota, so F14 below was seen only in a simulation.
 
 ## Found while implementing, not fixed
 
-All of these also exist at `a0c9335`, in the same or a worse form. None is new in the working tree.
+F5 to F12 also exist at `a0c9335`, in the same or a worse form. F13 onwards turned up while
+verifying items 4 and 5 and F1 to F4, and each says whether it is new.
 
 | Id | Where | What | Fix |
 | :--- | :--- | :--- | :--- |
-| F1 | `sidepanel/panel.js:1679`, `background.js:252` | Chrome fires `tabs.onUpdated` with status `loading` for same document navigations (`pushState`, `replaceState`, a hash change). Panel and worker drop the armed state while the overlay stays live, so Esc in the panel is ignored and Screen photographs the overlay with no notice. Medium. | M: have the capture scripts report their own teardown on `pagehide` instead of inferring it from `loading`. |
-| F2 | `sidepanel/panel.js:750` | A mode click or the shortcut while Screen waits on its cancel: `addItem` turns the new arm's button off, and a stop the worker skipped (a later arm stands) reads as a repaint, so the shot can hold the overlay with no notice. Medium. | S: leave the armed state alone for a visible capture, have the worker say when it skipped the stop, and treat that as "may show". |
-| F3 | `sidepanel/panel.js:1679` | An arm whose injection lands as the tab navigates still broadcasts, and the button relights over the new page. | S: add the armed id to `cancelledArmIds` in the `loading` branch. |
-| F4 | `sidepanel/panel.js:384` | `resolveTab` clears any banner, so the "may show" notice disappears when a busy page finishes loading or changes its URL just after the capture. | S: clear it only on a tab change or when a restriction comes or goes. |
-| F5 | `background.js:175` | The stop waits in the worker's memory for arms still landing. If Chrome stops the worker during that wait, the overlay survives with the button dark. | S: also send the stop at once; it is idempotent. |
-| F6 | `sidepanel/panel.js:363` | CW9, still open: no catch around `cdr:check-tab`, so a failed startup call leaves `ready` rejected and every later broadcast dropped. | S |
+| F5 | `background.js:181` | The stop waits in the worker's memory for arms still landing. If Chrome stops the worker during that wait, the overlay survives with the button dark. Seen again in every round since; the overlay stays visible and Esc on the page closes it. Low. | S: also send the stop at once; it is idempotent. |
+| F6 | `sidepanel/panel.js:386` | CW9, still open: no catch around `cdr:check-tab`, so a failed startup call leaves `ready` rejected and every later broadcast dropped. | S |
 | F7 | `background.js:137` | Arm against arm is ordered by when each arm's awaits resolve, so an older arm whose `tabs.get` answers late beats a newer one. Seen only with an injected delay. | S: drop an arm before it injects if a newer one was asked for. |
-| F8 | `content/collector-main.js:499` | The XHR bookkeeping lives in enumerable own properties, visible to `Object.keys` and `JSON.stringify` (URL and method included), and is written even onto a non XHR `this`. | M: a `WeakMap` inside the collector. |
-| F9 | `content/collector-main.js:491` | An `open()` over a request still in flight replaces its record. Chrome cancels that request with no event, so it is never recorded, while an `abort()` of it is. | S |
-| F10 | `content/collector-main.js:589` | A page listener added before the first send that calls `stopImmediatePropagation()` silences the collector's; and a synchronous retry from `onreadystatechange` at readyState 4 after a timeout or abort is recorded as a network failure. | Not worth a heuristic. |
-| F11 | `sidepanel/panel.js:378` | A `cdr:check-tab` answer read before a disarm of the shortcut's arm and delivered after it relights the button. The window is under a millisecond. | S |
-| F12 | `background.js:175` | On a page that never reaches `document_idle`, an armed injection never lands, so every later Screen there waits the full 3 s and shows the notice. | S: bound the worker's wait. |
+| F8 | `content/collector-main.js:591` | The XHR bookkeeping lives in enumerable own properties, visible to `Object.keys` and `JSON.stringify` (URL and method included), and is written even onto a non XHR `this`. | M: a `WeakMap` inside the collector. |
+| F9 | `content/collector-main.js:583` | An `open()` over a request still in flight replaces its record. Chrome cancels that request with no event, so it is never recorded, while an `abort()` of it is. | S |
+| F10 | `content/collector-main.js:681` | A page listener added before the first send that calls `stopImmediatePropagation()` silences the collector's; and a synchronous retry from `onreadystatechange` at readyState 4 after a timeout or abort is recorded as a network failure. | Not worth a heuristic. |
+| F11 | `sidepanel/panel.js:409` | A `cdr:check-tab` answer read before a disarm of the shortcut's arm and delivered after it relights the button. The window is under a millisecond. | S |
+| F12 | `background.js:181` | On a page that never reaches `document_idle`, an armed injection never lands, so every later Screen there waits the full 3 s and shows the notice. | S: bound the worker's wait. |
+| F13 | `sidepanel/panel.js:1690`, `background.js:295` | A region drag's `cdr:region-selected` arrives two frames after the release and clears whatever is armed, so an Element click within about 25 ms of releasing the drag is turned dark in the panel and dropped by the worker while the picker stays live. Low; also at `a0c9335`. | S: clear only when the mode armed is the one that sent the message. |
+| F14 | `sidepanel/panel.js:1137` | The check for a mode armed while Screen waited runs before `captureViewport`, whose quota retry can wait 1.2 s, so a mode armed during that retry is photographed with no notice. Low; also at `a0c9335`. | S: check again after the capture. |
+| F15 | `background.js:311` | Each URL change on an armed tab runs up to four probe injections (the worker's own on `loading` and `complete`, and the panel's on each), so a page that rewrites its URL often gets a steady stream of `executeScript` calls while armed. No wrong result came of it. Low; new with F1. | S: share one probe per tab while one is in flight. |
+| F16 | `content/picker.js:731` | An attribute whose name contains a quote or starts with `=` is not masked in the markup. The README says so. Low; the `=` case also at `a0c9335`. | Not worth it. |
+| F17 | `content/picker.js:731` | Masking the markup costs about 180 ms on a 1.9 MB subtree, on top of reading it. Low; new. | S: mask only the part that is kept. |
+| F18 | `content/collector-main.js:79` | The name test in the collector uses string and regular expression methods the page can replace, since the collector runs in the page's world. A page that does so can make a key read as harmless. Low; new. | S: bind the natives at `document_start`, as the clocks are. |
+| F19 | `content/picker.js:589` | A void element (`img`, `input`) whose markup is over the limit gets a closing tag that does not exist, and its whole opening tag. Low; also at `a0c9335`. | S |
+| F20 | `shared/prompt-template.js:1069` | URLs in text the scan does not find, in 35 of the 604 lines: a path not starting with `/` after a space (`GET api/x?token=`, `./api`, `v1.2/api`), a bare `?code=` or `#access_token=`, credentials in a second URL run together with the first (`https://cors.test/https://user:pass@…`, or after letters of another script), JSON's `\/` and `\u0026` escapes, `;jsessionid=`, `sid=`, a doubly encoded redirect. The README lists them. Low to medium; older than the scan, and at `a0c9335` no text was screened at all. | S each for a bare fragment and for credentials anywhere in a URL; the rest trade false positives. |
+| F21 | `content/collector-main.js:118` | A logged key over 400 characters is judged by its first and last 200, so a secret word in its middle withholds nothing. The README says so. Low; new, the price of a bound on the cost. | Not worth it. |
+| F22 | `content/collector-main.js:163` | `JSON.stringify` builds the whole string before the cut to 600 characters, and the node budget does not bound characters: 200 rows of ten 100 000 character keys cost about 350 ms in the page. Low; also at `a0c9335`. | S: a character budget in the replacer. |
+| F23 | `shared/prompt-template.js:980` | A query parameter name of a million characters costs about 290 ms to judge, in the panel for a URL in text and in the page for a style `url()` when it is picked. Low; also at `a0c9335`. | S: judge a long name by its ends, as F21. |
+| F24 | `shared/prompt-template.js:945` | An e-mail address run into a URL with no path (`https://example.com;help@example.com`) is read as that URL's userinfo, as `new URL()` reads it, and dropped. Nothing leaks; the text loses the address. Low; older than the scan. | Not worth it. |
+| F25 | `shared/prompt-template.js:1102` | A line that reads as a Firefox frame (`alice@https://a.test/?auth=admin:12:34`) keeps its last two numbers outside the mask. A frame and such a line cannot be told apart. Low; new. | Not worth it. |
 
 The stage (`tools/panel-stage.html`) cannot model an arm that lands out of order because of the
 stage's own artificial delay; the real extension landed 75 of 75 back to back injections in order.
