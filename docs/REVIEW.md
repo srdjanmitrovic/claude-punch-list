@@ -1024,19 +1024,19 @@ first listed in the table below.
 * F1. Chrome reports `pushState`, `replaceState` and a hash change as `loading`, as it does a real
   navigation, and panel and worker went dark while the overlay stayed live. A navigation is now
   checked rather than assumed: on `loading` and `complete` the worker asks the page which controller
-  is active, after any arm still landing (`background.js:225`), and the panel asks the same before
-  it goes dark (`sidepanel/panel.js:988`). The overlay and the picker stop themselves on `pagehide`
-  (`content/overlay.js:236`, `content/picker.js:969`), so a page restored from the back/forward
+  is active, after any arm still landing (`background.js:322`), and the panel asks the same before
+  it goes dark (`sidepanel/panel.js:1009`). The overlay and the picker stop themselves on `pagehide`
+  (`content/overlay.js:236`, `content/picker.js:1160`), so a page restored from the back/forward
   cache comes back without one.
 * F2. A mode armed while Screen waits on its cancel stays armed. The disarm's reply says when an
-  arm asked for since has taken the page over (`background.js:187`), and Screen then asks
-  `screenAfterRearm` (`sidepanel/panel.js:1097`) whether to photograph the page and what to say.
-  For now it photographs it and says the overlay may show. Which of the three choices is right
-  (capture and warn, skip and say why, or decide by mode) is still open. The region and element
-  failure handlers no longer turn off a mode armed after the drag.
+  arm asked for since has taken the page over (`background.js:277`), and Screen then
+  photographs the page and says the overlay may show (`sidepanel/panel.js:1113`).
+  That is settled: the page as it was is often the point, and the notice covers the overlay that
+  may be in it. The region and element failure handlers no longer turn off a mode armed after
+  the drag.
 * F3. Covered by F1. An arm that lands in a document on its way out is seen to be gone, and its
   late broadcast is refused as a cancelled arm's is.
-* F4. Every banner carries a scope (`sidepanel/panel.js:209`). A notice about one capture, such as
+* F4. Every banner carries a scope (`sidepanel/panel.js:210`). A notice about one capture, such as
   "the overlay may show", stays until the tab changes; an error about the page goes when the page
   changes; one about the report (a missing file, a failed copy, a failed save) is left alone by
   both. A restriction replaces any banner, and once it goes a missing file, which still holds
@@ -1051,17 +1051,17 @@ first listed in the table below.
   `className` is no longer redacted, and `pwd`, `pin`, `otp`, `cvc` and `otp1` are.
 * One URL block, in the template and the picker. Credentials are stripped, and a query or fragment
   value whose name matches is masked, splitting on `;` as well as `&` and following a URL nested in
-  a value (`shared/prompt-template.js:1016`). The template applies it to every URL it prints, and
-  through `safeText` (`shared/prompt-template.js:1115`) to URLs inside console text, stack frames,
+  a value (`shared/prompt-template.js:1054`). The template applies it to every URL it prints, and
+  through `safeText` (`shared/prompt-template.js:1223`) to URLs inside console text, stack frames,
   the `where` line and request caller frames.
-* Picker (`content/picker.js:640`). The value of a password, hidden, email or tel input, and of any
+* Picker (`content/picker.js:752`). The value of a password, hidden, email or tel input, and of any
   control, attribute, `srcset` candidate, style `url()` or textarea whose name matches, is masked in
   both the attribute list and the serialised markup. Truncation finds the real end of the opening
   tag before it cuts.
 * Collector. Keys are tested while props and logged objects are serialised
-  (`content/collector-main.js:118`), and `value`, `defaultValue` and `modelValue` are hidden on a
+  (`content/collector-main.js:282`), and `value`, `defaultValue` and `modelValue` are hidden on a
   component whose props describe a password, one time code or card field
-  (`content/collector-main.js:777`).
+  (`content/collector-main.js:1098`).
 * README. The privacy section lists what is screened and what is not, and the restriction recipe
   narrows only the two `content_scripts` matches. `docs/ARCHITECTURE.md` states the `activeTab`
   limit correctly.
@@ -1070,13 +1070,13 @@ first listed in the table below.
 
 * The collector keeps warnings in a ring of their own, counts what each ring drops, stamps every
   entry with a time and a sequence number, and takes both clocks from the natives it had at
-  `document_start` (`content/collector-main.js:42`), so a page that fakes `Date` cannot move them.
-* The panel stamps an item's time just before `captureVisibleTab` (`sidepanel/panel.js:461`) and
-  stores the page load it was captured on (`sidepanel/panel.js:829`).
+  `document_start` (`content/collector-main.js:43`), so a page that fakes `Date` cannot move them.
+* The panel stamps an item's time just before `captureVisibleTab` (`sidepanel/panel.js:482`) and
+  stores the page load it was captured on (`sidepanel/panel.js:850`).
 * The template merges console lines and errors by time, prints a clock (with the date when an
   entry falls on another day than the copy), folds repeats with a count, and takes frames from the
   lines that start with `at`. With more than one item, each item lists what was logged since the
-  item before it on the same page load (`shared/prompt-template.js:1306`, `:1331`), says when its
+  item before it on the same page load (`shared/prompt-template.js:1414`, `:1439`), says when its
   evidence was on another page or another load, and notes when a ring had already dropped entries
   from its stretch. What came after the last capture gets a section of its own.
 * **This breaks the byte for byte rule, once and on purpose**, as improvement 8 said it would.
@@ -1088,7 +1088,7 @@ first listed in the table below.
 
 **Found and fixed while verifying those.**
 
-* An arm counts as landing from the moment it is asked for (`background.js:137`), not from its
+* An arm counts as landing from the moment it is asked for (`background.js:166`), not from its
   injection. A check that arrived while the worker still looked the tab up asked a page the overlay
   had not reached, turned the button dark over it, and left Screen to photograph it with no notice.
   New with F1; on a page rewriting its URL as fast as Chrome allows it hit 1 click in 100 in one
@@ -1156,36 +1156,141 @@ Chrome: it compared the scans line by line in Node, timed hostile input up to 1 
 under 100 ms but F22 and F23), and ran the panel's banner functions against a stub of the DOM.
 
 A real side panel, the real Alt+Shift+C command and headed Chrome were never used. Headless Chrome
-did not enforce the capture quota, so F14 below was seen only in a simulation.
+did not enforce the capture quota, so F14 was only ever seen with the quota refusal simulated.
+
+### F5 to F25
+
+The items the rounds above left open, finished for 0.5.0. They fell into three areas, each changed
+in a copy of the branch, attacked by a verifier of its own, and repaired where the verifier found
+a defect, then combined and checked again.
+
+**The worker and the panel.**
+
+* F5. A disarm with arms still landing also puts a stop in the page's queue at once
+  (`background.js:245`), which the page runs at `document_idle` straight after every
+  arm already sent there, so the cancel holds if Chrome stops the worker during the wait. In
+  Chrome, with the worker stopped while a streaming page held the arm, the page ended with no
+  overlay; before, it kept one with the button dark.
+* F6 (CW9). A `cdr:check-tab` that fails is read as a tab nothing is known about, and `ready`
+  catches a failed restore and a failed first `resolveTab`, so it always fulfils and broadcasts
+  keep arriving (`sidepanel/panel.js:398`, `:1926`).
+* F7. An arm drops out before it injects when a newer arm was asked for on that tab, and one
+  replaced while it lands neither records nor announces itself
+  (`background.js:180`, `:206`).
+* F11. The panel adopts an arm from a `cdr:check-tab` answer only if its own armed state did not
+  change while it asked (`sidepanel/panel.js:394`).
+* F12. A disarm waits at most a second for arms still landing (`background.js:122`).
+  If they have not landed, it queues a second stop behind them and answers once a stop the page
+  runs at once has run, so a page still streaming its HTML gets its Screen in about a second with
+  no notice, where it took three with one.
+* F13. A capture message ends the arm only when the mode armed is the one that sent it, in the
+  worker (`background.js:428`) and the panel (`sidepanel/panel.js:1740`).
+* F14. Screen asks again, after the capture and any quota retry, whether a mode was armed
+  (`sidepanel/panel.js:1150`).
+* F15. One probe runs per tab at a time (`background.js:322`); a request that comes
+  while one runs waits for the next. A URL change on an armed tab now costs two probe injections
+  instead of four.
+* F2's open choice is settled as capture and warn, and the function that held it, with the branch
+  it could never take, is gone.
+* `test/worker.test.mjs` and `test/panel.test.mjs` run the real worker and panel in `node:vm`
+  against a model of the order in which Chrome runs injections and delivers messages
+  (`test/support/`), so these rules have unit tests for the first time. Taking out any one fix
+  fails its own test.
+
+**The collector.**
+
+* F8. The XHR bookkeeping lives in a `WeakMap` inside the collector
+  (`content/collector-main.js:710`), so the page no longer sees it in `Object.keys` or
+  `JSON.stringify`, and nothing is written onto an object that is not an `XMLHttpRequest`.
+* F9. An `open()` over a request still in flight records that request as aborted, as an `abort()`
+  of it is (`content/collector-main.js:769`); Chrome sends no event for it.
+* F10, in part. A synchronous retry from `onreadystatechange` after a timeout or abort keeps its
+  label, though Chrome replays the retry's `load` and `loadend` first, and an abort is recorded
+  even when a page listener stops its events. What remains is listed below.
+* F18. The collector judges names and keys with `isSecretNameIn`
+  (`content/collector-main.js:169`), a copy of the shared name test that calls
+  no method at all, and reaches its maps, `slice` and `exec` through natives taken at
+  `document_start`. A page that replaces `String.prototype.split` or `RegExp.prototype.test` can
+  no longer make a secret key read as harmless. A test runs the copy against the shared block over
+  the same names, so the two cannot drift apart unnoticed.
+* F22. `serialize()` keeps a character budget beside its node budget
+  (`content/collector-main.js:21`): once more than 6 000 characters are certain to
+  print, ten times the 600 kept, it leaves further members out, their names with them. The printed
+  text is unchanged, and two hundred rows of ten keys of 100 000 characters take about a
+  millisecond where they took 350.
+* Found by the verifier and fixed: a record field left for later was looked up on
+  `Object.prototype`, so a page that set `Object.prototype.fallback` hid every failed XHR; and
+  object keys made of digits went uncounted by the budget.
+
+**The template and the picker.**
+
+* F16. An attribute name may hold a quote or a `<` and start with `=`, as the parser allows and
+  `outerHTML` writes back, and such a tag is masked like any other
+  (`content/picker.js:828`). A tag name with a `<` in it (`<div<1 …>`) is read
+  from its last `<`.
+* F17. The picked markup is masked only as far as it is kept, the opening tag and one `MAX_HTML`
+  after it, cut where no tag and no textarea's text is open (`content/picker.js:894`).
+  A 1.07 MB table took 84 to 90 ms to mask in Chrome 156 and now takes about 3 ms. A tag name no
+  longer runs on through `<a<a<a…` in script text, which took seconds.
+* F19. A void element over the limit is its opening tag with each value over 120 characters cut,
+  and no closing tag (`content/picker.js:676`).
+* F20, in part. In a message, a query or fragment with nothing in front of it, a path with path
+  parameters, credentials wherever a URL starts (`shared/prompt-template.js:1080`),
+  `\u0026` between parameters, `sid` and a redirect encoded twice are screened, and every URL
+  loses the secret values of its path parameters (`:1123`). A `data:` URL's content is
+  left alone. Of the 35 corpus lines that still printed a secret, 33 now mask; no line the base
+  masked prints, and none of the 249 ordinary lines changes.
+* F23. A parameter or attribute name, and a form field's name or id, over 400 characters is judged
+  by its first and last 200, as the collector judges a key (`shared/prompt-template.js:977`).
+* Found by the verifier and fixed: the first F16 pattern stopped reading a tag name holding `<`
+  and a non letter, which printed that tag's attributes; a `data:` URL's payload was read as path
+  parameters; and a bare `//` in ordinary text (XPath's `//ns:tag`) was taken for credentials.
+
+F24 and F25 stay as they were, with their reasons below, and F21 for the reason it gives.
+
+**How it was checked.** `npm test` (148 tests, every golden byte for byte; each new test fails on
+the tree before its fix). For the worker and the panel, each fix was driven in headless Chrome for
+Testing 156 against the tree before it, to show the behaviour changed where the item says, and
+the earlier suites were run again on the new tree: the scenario suite (194 checks), X1 to X8, B0
+to B5c, D0 to D5 and the arm race runs (190), with no failure. The collector's verifier tried to
+break host pages: XHR used every way, builtins replaced after load, hostile object graphs, and
+timings. The template's verifier ran the 604 line corpus and 100 more lines aimed at the new code,
+and timed hostile input of up to 1 MB.
+
+The combined tree was then reviewed by someone who had not seen the code and run end to end in
+Chrome for Testing 156 with the real extension: a page logging errors that hold secrets, failing
+fetch and XHR requests with secret parameters, and a form with a password; Region, Element and
+Screen; a sentence each; Copy. Every run gave three items in order, each file on disk, the log
+under the right item, every planted secret masked in the prompt and in storage, no exception in
+the page, the worker or the panel, and the page's own fetch, XHR and console behaving exactly as
+they do without the extension. The regression suites passed again, as did fuzzing of 99 000 URL
+lines and 8 000 picked subtrees against the base, with no regression. It found four defects in the
+patches, fixed since, each with a test that fails before the fix: a cancelled arm whose file
+Chrome read slower than the disarm's bounded wait landed after every stop and stayed, and now
+stops itself; a frame with a `;jsessionid=` lost its position into the mask; a page path starting
+with `//@` lost what came before the `@`; and three test comments still described listeners
+added at the first `send()`. It also found an older one, fixed with them: an uncaught error
+whose location held a masked value lost its line and column. And since F9 records an `open()`
+over a request in flight, which a type-ahead can do on every keystroke, a full ring of failed
+requests now drops one the page ended itself before a real failure.
 
 ## Found while implementing, not fixed
 
-F5 to F12 also exist at `a0c9335`, in the same or a worse form. F13 onwards turned up while
-verifying items 4 and 5 and F1 to F4, and each says whether it is new.
+F10, F26 and F30 also exist at `a0c9335`, in the same or a worse form. The rest turned up while
+verifying, and each says whether it is new.
 
 | Id | Where | What | Fix |
 | :--- | :--- | :--- | :--- |
-| F5 | `background.js:181` | The stop waits in the worker's memory for arms still landing. If Chrome stops the worker during that wait, the overlay survives with the button dark. Seen again in every round since; the overlay stays visible and Esc on the page closes it. Low. | S: also send the stop at once; it is idempotent. |
-| F6 | `sidepanel/panel.js:386` | CW9, still open: no catch around `cdr:check-tab`, so a failed startup call leaves `ready` rejected and every later broadcast dropped. | S |
-| F7 | `background.js:137` | Arm against arm is ordered by when each arm's awaits resolve, so an older arm whose `tabs.get` answers late beats a newer one. Seen only with an injected delay. | S: drop an arm before it injects if a newer one was asked for. |
-| F8 | `content/collector-main.js:591` | The XHR bookkeeping lives in enumerable own properties, visible to `Object.keys` and `JSON.stringify` (URL and method included), and is written even onto a non XHR `this`. | M: a `WeakMap` inside the collector. |
-| F9 | `content/collector-main.js:583` | An `open()` over a request still in flight replaces its record. Chrome cancels that request with no event, so it is never recorded, while an `abort()` of it is. | S |
-| F10 | `content/collector-main.js:681` | A page listener added before the first send that calls `stopImmediatePropagation()` silences the collector's; and a synchronous retry from `onreadystatechange` at readyState 4 after a timeout or abort is recorded as a network failure. | Not worth a heuristic. |
-| F11 | `sidepanel/panel.js:409` | A `cdr:check-tab` answer read before a disarm of the shortcut's arm and delivered after it relights the button. The window is under a millisecond. | S |
-| F12 | `background.js:181` | On a page that never reaches `document_idle`, an armed injection never lands, so every later Screen there waits the full 3 s and shows the notice. | S: bound the worker's wait. |
-| F13 | `sidepanel/panel.js:1690`, `background.js:295` | A region drag's `cdr:region-selected` arrives two frames after the release and clears whatever is armed, so an Element click within about 25 ms of releasing the drag is turned dark in the panel and dropped by the worker while the picker stays live. Low; also at `a0c9335`. | S: clear only when the mode armed is the one that sent the message. |
-| F14 | `sidepanel/panel.js:1137` | The check for a mode armed while Screen waited runs before `captureViewport`, whose quota retry can wait 1.2 s, so a mode armed during that retry is photographed with no notice. Low; also at `a0c9335`. | S: check again after the capture. |
-| F15 | `background.js:311` | Each URL change on an armed tab runs up to four probe injections (the worker's own on `loading` and `complete`, and the panel's on each), so a page that rewrites its URL often gets a steady stream of `executeScript` calls while armed. No wrong result came of it. Low; new with F1. | S: share one probe per tab while one is in flight. |
-| F16 | `content/picker.js:731` | An attribute whose name contains a quote or starts with `=` is not masked in the markup. The README says so. Low; the `=` case also at `a0c9335`. | Not worth it. |
-| F17 | `content/picker.js:731` | Masking the markup costs about 180 ms on a 1.9 MB subtree, on top of reading it. Low; new. | S: mask only the part that is kept. |
-| F18 | `content/collector-main.js:79` | The name test in the collector uses string and regular expression methods the page can replace, since the collector runs in the page's world. A page that does so can make a key read as harmless. Low; new. | S: bind the natives at `document_start`, as the clocks are. |
-| F19 | `content/picker.js:589` | A void element (`img`, `input`) whose markup is over the limit gets a closing tag that does not exist, and its whole opening tag. Low; also at `a0c9335`. | S |
-| F20 | `shared/prompt-template.js:1069` | URLs in text the scan does not find, in 35 of the 604 lines: a path not starting with `/` after a space (`GET api/x?token=`, `./api`, `v1.2/api`), a bare `?code=` or `#access_token=`, credentials in a second URL run together with the first (`https://cors.test/https://user:pass@…`, or after letters of another script), JSON's `\/` and `\u0026` escapes, `;jsessionid=`, `sid=`, a doubly encoded redirect. The README lists them. Low to medium; older than the scan, and at `a0c9335` no text was screened at all. | S each for a bare fragment and for credentials anywhere in a URL; the rest trade false positives. |
-| F21 | `content/collector-main.js:118` | A logged key over 400 characters is judged by its first and last 200, so a secret word in its middle withholds nothing. The README says so. Low; new, the price of a bound on the cost. | Not worth it. |
-| F22 | `content/collector-main.js:163` | `JSON.stringify` builds the whole string before the cut to 600 characters, and the node budget does not bound characters: 200 rows of ten 100 000 character keys cost about 350 ms in the page. Low; also at `a0c9335`. | S: a character budget in the replacer. |
-| F23 | `shared/prompt-template.js:980` | A query parameter name of a million characters costs about 290 ms to judge, in the panel for a URL in text and in the page for a style `url()` when it is picked. Low; also at `a0c9335`. | S: judge a long name by its ends, as F21. |
-| F24 | `shared/prompt-template.js:945` | An e-mail address run into a URL with no path (`https://example.com;help@example.com`) is read as that URL's userinfo, as `new URL()` reads it, and dropped. Nothing leaks; the text loses the address. Low; older than the scan. | Not worth it. |
-| F25 | `shared/prompt-template.js:1102` | A line that reads as a Firefox frame (`alice@https://a.test/?auth=admin:12:34`) keeps its last two numbers outside the mask. A frame and such a line cannot be told apart. Low; new. | Not worth it. |
+| F10 | `content/collector-main.js:875` | A page listener added before the first `open()` that calls `stopImmediatePropagation()` on `loadend` or `timeout` still silences the collector: the request is recorded only when the object is opened again, and a timeout reads as a network failure. Listening in the capture phase does not help, since Chrome runs an `XMLHttpRequest`'s listeners in the order they were added. Low; also at `a0c9335`. | Not worth a heuristic. |
+| F20 | `shared/prompt-template.js:1173` | Two shapes still print: a `data:` URL whose percent encoded content holds a link, and a parameter holding percent encoded JSON (`state=%7B%22token%22…`). Screening them means decoding and parsing another format inside a value. The README lists them, with the rarer shapes the scan does not read. Low. | M |
+| F21 | `content/collector-main.js:282` | A logged key over 400 characters is judged by its first and last 200, so a secret word in its middle withholds nothing. The README says so. Low. | Not worth it: judging costs time in proportion to the key's length, in the page's own thread, and only the two ends keep that cost constant. The budget of F22 bounds what is printed, not what is judged. |
+| F24 | `shared/prompt-template.js:954` | An e-mail address run into a URL with no path (`https://example.com;help@example.com`) is read as that URL's userinfo, as `new URL()` reads it, and dropped. Since F20 the same holds for a URL run into another or glued to a word, and a user name without a password goes too (`id=42ssh://git@github.com/…` loses `git@`), as it does at a URL's start. Nothing leaks; the text loses the address. Low; older than the scan. | Not worth it. |
+| F25 | `shared/prompt-template.js:1208` | A line that reads as a Firefox frame (`alice@https://a.test/?auth=admin:12:34`) keeps its last two numbers outside the mask. Low; new. | Not worth it: a Firefox or Safari frame (`f@url:3:9`) is exactly this shape, and a rule that masks the numbers here strips every such frame's position. At most two numbers print. |
+| F26 | `content/picker.js:840` | Script text holding a long run of attributes whose names start with or hold a `<` (`<a <a="1" <a="1"…`) is read again from every `<` in it: about 0.3 s for 40 kB and 1.8 s for 100 kB, in the page, when an element holding it is picked. Reading from every `<` is what finds a real tag that starts inside text the pattern took for a value. Low; also at `a0c9335`, at the same cost. | M: a scanner that knows where script text ends. |
+| F27 | `background.js:428` | If Element is clicked within about 25 ms of releasing a region drag, the region screenshot is taken with the picker already live, so a region over the top centre holds its hint pill. Low; also at `a0c9335`. | S: attach the Screen notice when another mode is lit as the drag's message arrives. |
+| F28 | `background.js:428` | The same mode re-armed by the shortcut in the two frames before a drag's late message is still ended by it. Low; what F13 leaves. | M: an identity for each `start()`. |
+| F29 | `background.js:245` | A disarm within a few milliseconds of the arm's injection, with the worker stopped within the second after, can still leave the overlay up. And, reasoned from the timeline rather than run: if the worker is stopped while an arm nobody cancelled waits for `document_idle`, the panel goes dark and the overlay lands later. Esc on the page closes it. Low; what F5 leaves. | S: always queue a stop on disarm, and have the panel send a disarm when `cdr:arm` rejects. |
+| F30 | `content/collector-main.js:384` | `serialize()` still pays for `JSON.stringify`'s own walk where no replacer can stop it: a sparse array of ten million slots (about 560 ms), an object of a million keys (about 220 ms), and thousands of `String` wrapper objects, which `JSON.stringify` unwraps after the replacer sees them (about 1 s for 4 000 of 100 000 characters). Each was slower before. Low; also at `a0c9335`. | M: walk the value without `JSON.stringify`. |
 
 The stage (`tools/panel-stage.html`) cannot model an arm that lands out of order because of the
 stage's own artificial delay; the real extension landed 75 of 75 back to back injections in order.
