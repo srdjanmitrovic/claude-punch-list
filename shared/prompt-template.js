@@ -60,10 +60,21 @@
  * @property {Array=}  consoleLines  [{ level, text, t }]
  * @property {Array=}  errors        [{ kind, text, where, stack, t }]
  * @property {Array=}  network       [{ method, url, status, statusText, ms,
- *                                   caller }], where caller is the stack that
- *                                   sent the request, nearest frame first.
+ *                                   caller, outcome }], where caller is the
+ *                                   stack that sent the request, nearest frame
+ *                                   first, and outcome is 'aborted' or
+ *                                   'timeout' when the page ended the request
+ *                                   itself.
  * @property {number}  builtAt       When the buffers were read and the prompt
  *                                   assembled, as epoch milliseconds.
+ * @property {number=} armedAt       When the collector started on the page the
+ *                                   buffers came from, as epoch milliseconds.
+ *                                   An item captured before it was captured on
+ *                                   an earlier load of that page.
+ * @property {string=} contextError  Set when the buffers could not be read:
+ *                                   'timeout' if the tab did not answer, any
+ *                                   other value if nothing came back. The page
+ *                                   then comes from the newest item.
  */
 
 /**
@@ -237,12 +248,23 @@ function formatConsole(consoleLines = [], errors = []) {
  */
 function formatNetwork(network = []) {
   const lines = [];
-  for (const request of network) {
-    const status = request.status === 0 ? 'FAILED' : request.status;
-    const timing = request.ms ? ` (${request.ms}ms)` : '';
-    lines.push(
-      `${request.method} ${request.url || '(no url)'} -> ${status} ${request.statusText || ''}${timing}`.trim()
-    );
+  // A request the page ended itself (an effect cleaning up, a search box
+  // replacing its previous query, a timeout it set) is not a failure. It still
+  // prints, because a page can cancel the one request it needed, but labelled
+  // as what it was and after every real failure, so it cannot read as the
+  // cause.
+  const ordered = [
+    ...network.filter((request) => !cancelledLabel(request)),
+    ...network.filter((request) => cancelledLabel(request)),
+  ];
+  for (const request of ordered) {
+    const status = cancelledLabel(request) || (request.status === 0 ? 'FAILED' : request.status);
+    // Joined rather than interpolated: HTTP/2 responses have no status text,
+    // and a fixed template would leave two spaces where it was.
+    const parts = [request.method, request.url || '(no url)', '->', status];
+    if (request.statusText) parts.push(request.statusText);
+    if (request.ms) parts.push(`(${request.ms}ms)`);
+    lines.push(parts.join(' ').trim());
 
     const frames = (Array.isArray(request.caller) ? request.caller : [])
       .filter((frame) => typeof frame === 'string')
@@ -254,6 +276,13 @@ function formatNetwork(network = []) {
     });
   }
   return lines;
+}
+
+/** Compared, not looked up, so an unexpected outcome string can never match. */
+function cancelledLabel(request) {
+  if (request.outcome === 'aborted') return 'ABORTED by the page';
+  if (request.outcome === 'timeout') return 'TIMEOUT set by the page';
+  return '';
 }
 
 function formatStyles(styles = {}) {
@@ -778,7 +807,40 @@ function describeScope(items, page, showUrl) {
   return url ? `on ${showUrl(url)}` : 'on the captured page';
 }
 
-function formatPage(report, itemsElsewhere, showUrl) {
+/**
+ * The sentence saying the buffers are missing, or '' when they were read.
+ *
+ * Printed because a report with no console section otherwise reads as a page
+ * that logged nothing, which is exactly the conclusion it cannot support.
+ *
+ * Neither wording blames the captured page. The buffers are read from the tab
+ * in view when the copy is made, which need not be where the items were taken
+ * (a restricted tab, another busy one), so all either can say for certain is
+ * that nothing came back.
+ */
+function unreadNotice(contextError) {
+  if (!contextError) return '';
+  const reason =
+    contextError === 'timeout'
+      ? 'not read for this report (the browser tab did not answer in time)'
+      : 'not available for this report';
+  return `${reason}, so nothing can be concluded from their absence.`;
+}
+
+/**
+ * Whether an item was captured on an earlier load of the page the buffers
+ * came from. Two loads of one address print the same url, so only the
+ * collector's start time can tell them apart.
+ */
+function capturedBeforeLoad(item, armedAt) {
+  return Number.isFinite(armedAt) && Number.isFinite(item.capturedAt) && item.capturedAt < armedAt;
+}
+
+/**
+ * @param {{ elsewhere: Item[], before: Item[] }} stale Items captured on
+ *   another page, and items captured on this page before it last loaded.
+ */
+function formatPage(report, stale, showUrl) {
   const { page } = report;
   const { viewport } = page;
   const details = [`- URL: ${showUrl(page.url)}`];
@@ -798,26 +860,58 @@ function formatPage(report, itemsElsewhere, showUrl) {
   details.push(
     last - first > MINUTE ? `- Captured: ${stamp(first)} to ${stamp(last)}` : `- Captured: ${stamp(first)}`
   );
+
+  // Nothing was read, so there is no read time to give and nothing for a
+  // caution to qualify.
+  const unread = unreadNotice(report.contextError);
+  if (unread) {
+    details.push(`- Console and network: ${unread}`);
+    return `## Page\n${details.join('\n')}`;
+  }
+
   if (built - last > MINUTE) details.push(`- Console and network read: ${stamp(built)}`);
 
   // The image is a moment in time; the console and network buffers are read
-  // when the report is built. A reload or navigation in between makes them
+  // when the report is built. A navigation or a reload in between makes them
   // disagree, and Claude Code should know which half to trust.
-  if (itemsElsewhere.length === 1 && report.items.length === 1) {
+  const { elsewhere, before } = stale;
+  const affected = report.items.filter((item) => elsewhere.includes(item) || before.includes(item));
+  if (affected.length === 1 && report.items.length === 1) {
     details.push(
-      `- CAUTION: the screenshot was taken on ${showUrl(itemsElsewhere[0].url)}, but the page ` +
-        'changed before this report was generated. The console and network entries below ' +
-        'come from the current page, so they may not correspond to the image.'
+      elsewhere.length
+        ? `- CAUTION: the screenshot was taken on ${showUrl(elsewhere[0].url)}, but the page ` +
+            'changed before this report was generated. The console and network entries below ' +
+            'come from the current page, so they may not correspond to the image.'
+        : '- CAUTION: the page was reloaded after the screenshot was taken. The console and ' +
+            'network entries below come from the reloaded page, so they may not correspond to ' +
+            'the image.'
     );
-  } else if (itemsElsewhere.length) {
-    const numbers = itemsElsewhere.map((item) => report.items.indexOf(item) + 1);
-    const which =
-      numbers.length === 1
-        ? `Item ${numbers[0]} was`
-        : `Items ${numbers.slice(0, -1).join(', ')} and ${numbers.at(-1)} were`;
+  } else if (affected.length) {
+    const named = (items) => {
+      const numbers = items.map((item) => report.items.indexOf(item) + 1);
+      return numbers.length === 1
+        ? { noun: `Item ${numbers[0]}`, verb: 'was' }
+        : { noun: `Items ${numbers.slice(0, -1).join(', ')} and ${numbers.at(-1)}`, verb: 'were' };
+    };
+    // Each reason names its own items, so the reader knows which screenshots
+    // were taken on another page and which on an earlier load of this one.
+    let which;
+    if (!before.length) {
+      const away = named(elsewhere);
+      which = `${away.noun} ${away.verb} captured elsewhere`;
+    } else if (!elsewhere.length) {
+      const early = named(before);
+      which = `${early.noun} ${early.verb} captured before this page last loaded`;
+    } else {
+      const away = named(elsewhere);
+      const early = named(before);
+      which =
+        `${away.noun} ${away.verb} captured elsewhere, and ` +
+        `${early.noun.toLowerCase()} before this page last loaded`;
+    }
     details.push(
-      `- CAUTION: the console and network entries below were read on this page. ${which} ` +
-        'captured elsewhere, so they may not correspond to those screenshots.'
+      `- CAUTION: the console and network entries below were read on this page. ${which}, ` +
+        'so they may not correspond to those screenshots.'
     );
   }
 
@@ -888,7 +982,15 @@ export function buildPrompt(report) {
     const elsewhere = items.filter(
       (item) => item.url && showUrl(item.url) !== showUrl(report.page.url)
     );
-    sections.push(formatPage(report, elsewhere, showUrl));
+    const before = items.filter(
+      (item) => !elsewhere.includes(item) && capturedBeforeLoad(item, report.armedAt)
+    );
+    sections.push(formatPage(report, { elsewhere, before }, showUrl));
+  } else if (report.contextError) {
+    // The page toggle is off, which keeps urls out, but the missing log still
+    // has to be explained somewhere.
+    const unread = unreadNotice(report.contextError);
+    sections.push(`## Console and network\n${unread[0].toUpperCase()}${unread.slice(1)}`);
   }
 
   const consoleLines = formatConsole(report.consoleLines, report.errors);

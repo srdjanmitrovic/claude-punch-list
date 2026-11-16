@@ -14,8 +14,13 @@
  *
  * The samples deliberately include every optional section at once, which is
  * the worst case for length. A real capture usually has fewer.
+ *
+ * The tests import sampleReport() from here, so the golden files under
+ * test/golden and what this prints are always built from the same data.
  */
 
+import { realpathSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { buildPrompt } from '../shared/prompt-template.js';
 
 const PAGE = {
@@ -168,64 +173,94 @@ const LIST = [
   },
 ];
 
-const mode = ['change', 'mixed', 'minified'].includes(process.argv[2]) ? process.argv[2] : 'bug';
+export const MODES = ['bug', 'change', 'mixed', 'minified'];
 
-const items =
-  mode === 'mixed'
-    ? LIST
-    : [
-        {
-          ...SINGLE[mode === 'minified' ? 'bug' : mode],
-          screenshotPath: `${FOLDER}/2026-08-07_20-51-33_localhost-checkout.png`,
-          url: PAGE.url,
-          capturedAt: at('20:51:33'),
-          element: mode === 'minified' ? MINIFIED_ELEMENT : ELEMENT,
-        },
-      ];
+/**
+ * The report the panel would hand buildPrompt() for one of MODES.
+ *
+ * A fresh copy every call, so a caller that edits one (the tests do, to reach
+ * branches no preview shows) cannot leak that edit into the next.
+ */
+export function sampleReport(mode = 'bug') {
+  const items =
+    mode === 'mixed'
+      ? LIST
+      : [
+          {
+            ...SINGLE[mode === 'minified' ? 'bug' : mode],
+            screenshotPath: `${FOLDER}/2026-08-07_20-51-33_localhost-checkout.png`,
+            url: PAGE.url,
+            capturedAt: at('20:51:33'),
+            element: mode === 'minified' ? MINIFIED_ELEMENT : ELEMENT,
+          },
+        ];
 
-const sample = {
-  items,
-  builtAt: at('20:51:33'),
-  page: PAGE,
-  consoleLines: [
-    { level: 'warn', text: 'Coupon SUMMER25 missing from catalog, falling back to null', t: 1840 },
-  ],
-  errors: [
-    {
-      kind: 'exception',
-      text: "TypeError: Cannot read properties of undefined (reading 'price')",
-      where: 'http://localhost:3000/js/cart.js:142:18',
-      stack:
-        "TypeError: Cannot read properties of undefined (reading 'price')\n" +
-        '    at applyCoupon (cart.js:142:18)\n' +
-        '    at handleSubmit (checkout.js:88:5)\n' +
-        '    at HTMLFormElement.<anonymous> (checkout.js:31:9)',
-      t: 1902,
-    },
-  ],
-  network: [
-    {
-      method: 'POST',
-      url: 'http://localhost:3000/api/coupons/validate',
-      status: 500,
-      statusText: 'Internal Server Error',
-      ms: 243,
-      via: 'fetch',
-      // Nearest frame first, and already resolved through the source map, which
-      // is why these are src paths and not bundle offsets.
-      caller: [
-        'applyCoupon (/src/components/cart/CartSummary.tsx:70:36)',
-        'handleApply (/src/components/cart/CartSummary.tsx:84:13)',
-      ],
-    },
-  ],
-};
+  return structuredClone({
+    items,
+    builtAt: at('20:51:33'),
+    page: PAGE,
+    consoleLines: CONSOLE_LINES,
+    errors: ERRORS,
+    network: NETWORK,
+  });
+}
 
-const prompt = buildPrompt(sample);
+const CONSOLE_LINES = [
+  { level: 'warn', text: 'Coupon SUMMER25 missing from catalog, falling back to null', t: 1840 },
+];
 
-console.log(prompt);
-console.log('\n' + '-'.repeat(60));
-console.log(
-  `${mode}: ${items.length} item${items.length === 1 ? '' : 's'}, ${prompt.length} characters, ` +
-    `roughly ${Math.ceil(prompt.length / 4)} tokens, ${prompt.split('\n').length} lines`
-);
+const ERRORS = [
+  {
+    kind: 'exception',
+    text: "TypeError: Cannot read properties of undefined (reading 'price')",
+    where: 'http://localhost:3000/js/cart.js:142:18',
+    stack:
+      "TypeError: Cannot read properties of undefined (reading 'price')\n" +
+      '    at applyCoupon (cart.js:142:18)\n' +
+      '    at handleSubmit (checkout.js:88:5)\n' +
+      '    at HTMLFormElement.<anonymous> (checkout.js:31:9)',
+    t: 1902,
+  },
+];
+
+const NETWORK = [
+  {
+    method: 'POST',
+    url: 'http://localhost:3000/api/coupons/validate',
+    status: 500,
+    statusText: 'Internal Server Error',
+    ms: 243,
+    via: 'fetch',
+    // Nearest frame first, and already resolved through the source map, which
+    // is why these are src paths and not bundle offsets.
+    caller: [
+      'applyCoupon (/src/components/cart/CartSummary.tsx:70:36)',
+      'handleApply (/src/components/cart/CartSummary.tsx:84:13)',
+    ],
+  },
+];
+
+// Printing is for `npm run prompt`. Importing this file, as the tests do, only
+// hands over the samples. Compared as real paths, because import.meta.url has
+// symlinks resolved and argv does not.
+function runDirectly() {
+  try {
+    return realpathSync(process.argv[1]) === fileURLToPath(import.meta.url);
+  } catch {
+    return false;
+  }
+}
+
+if (process.argv[1] && runDirectly()) {
+  const mode = MODES.includes(process.argv[2]) ? process.argv[2] : 'bug';
+  const sample = sampleReport(mode);
+  const prompt = buildPrompt(sample);
+  const count = sample.items.length;
+
+  console.log(prompt);
+  console.log('\n' + '-'.repeat(60));
+  console.log(
+    `${mode}: ${count} item${count === 1 ? '' : 's'}, ${prompt.length} characters, ` +
+      `roughly ${Math.ceil(prompt.length / 4)} tokens, ${prompt.split('\n').length} lines`
+  );
+}

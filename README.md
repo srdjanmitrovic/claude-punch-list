@@ -383,7 +383,12 @@ the failed request.
 
 ### If something does not work
 
-**The counts show a dash.** The tab was open before the extension was enabled. Reload it.
+**The counts show a dash.** Either the tab was open before the extension was enabled, in
+which case a line under the counts says so and a reload fixes it, or the page was too busy to
+answer within two seconds (a long task, or paused at a breakpoint). Do not reload in the second
+case, because a reload throws away the state you are reporting. Let the page finish or resume
+the debugger, then copy. A prompt copied in the meantime says its console and network were not
+read, rather than leaving them out without a word.
 
 **Every capture opens a "Save as" dialog.** Chrome's "Ask where to save each file before
 downloading" setting is on. Turn it off in `chrome://settings/downloads` and saving becomes
@@ -408,11 +413,15 @@ page. For local files, turn on "Allow access to file URLs" on the extension's ca
 | Toggle | What it adds |
 | :--- | :--- |
 | **console** | `console.error` and `console.warn` calls, uncaught exceptions with stack frames, unhandled promise rejections, and failed resource loads |
-| **network** | Requests that returned 4xx or 5xx or failed outright, with method, URL, status, timing, and the function that sent them with its file and line |
+| **network** | Requests that returned 4xx or 5xx or failed outright, with method, URL, status, timing, and the function that sent them with its file and line. Requests the page ended itself, by aborting them or through a timeout it set, come last and are labelled as such |
 | **element** | For each item picked with the element tool: the component behind it on a React or Vue page, the handlers bound to it and the first line of their source, a line of search targets, any file its class names imply, the node's markup, a CSS selector that finds it again, and a curated set of computed styles |
 | **page** | URL, title, viewport size and device pixel ratio, plus each item's own URL when the sheet spans more than one page. URLs print as paths (`/checkout?step=2`) while the sheet stays on one origin, and in full once it spans two |
 
-Console and network are read once, when you copy, from the tab you are looking at. Element
+Console and network are read once, when you copy, from the tab you are looking at. If that
+read fails, because the tab has no collector or does not answer within two seconds, the prompt
+says the log was not read instead of leaving it out silently, and still names the page each
+item was captured on. If the page was reloaded after an item was captured, the prompt says so,
+since the log then comes from a later load. Element
 payloads belong to the item they were picked with and are printed under it. Each toggle is
 remembered between sessions, and so is the sheet itself: items, sentences and thumbnails come
 back when the panel reopens, and a sheet untouched for a week is dropped at startup. The

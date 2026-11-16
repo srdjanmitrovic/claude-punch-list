@@ -268,6 +268,27 @@
     return frames;
   }
 
+  /**
+   * 'aborted' or 'timeout' when the page ended a fetch itself, otherwise ''.
+   *
+   * The signal is asked rather than the error. abort(reason) rejects with
+   * whatever reason the page passed, which need not be an AbortError at all,
+   * while signal.aborted is true however it was aborted. AbortSignal.timeout()
+   * aborts with a TimeoutError, which is what separates the two outcomes.
+   */
+  function cancelledBy(signal, error) {
+    try {
+      if (signal && signal.aborted) {
+        const reason = signal.reason;
+        return reason && reason.name === 'TimeoutError' ? 'timeout' : 'aborted';
+      }
+      if (error && error.name === 'AbortError') return 'aborted';
+    } catch {
+      /* a page signal of its own that threw */
+    }
+    return '';
+  }
+
   // ----------------------------------------------------------------- fetch --
   const nativeFetch = window.fetch;
   if (typeof nativeFetch === 'function') {
@@ -275,10 +296,16 @@
     window.fetch = function cdrFetch(...args) {
       let method = 'GET';
       let url = '';
+      let signal = null;
       try {
         const [input, init] = args;
         url = typeof input === 'string' ? input : input && input.url ? input.url : String(input);
         method = (init && init.method) || (input && input.method) || 'GET';
+        // Kept for the rejection, to tell a request the page cancelled from
+        // one that failed. A Request always carries a signal, and init
+        // overrides it even with null, as the Request constructor does.
+        signal =
+          init && init.signal !== undefined ? init.signal : (input && input.signal) || null;
       } catch {
         /* ignore */
       }
@@ -291,7 +318,10 @@
       return nativeFetch.apply(this, args).then(
         (response) => {
           try {
-            if (!response.ok) {
+            // The status, not response.ok. A no-cors response (status 0), a
+            // manual redirect (0) and a 304 all have ok false and none of them
+            // failed. The XHR branch below draws the line at 400 as well.
+            if (response.status >= 400) {
               const entry = {
                 method: String(method).toUpperCase(),
                 url: truncate(url),
@@ -311,14 +341,18 @@
         },
         (error) => {
           try {
+            const outcome = cancelledBy(signal, error);
             const entry = {
               method: String(method).toUpperCase(),
               url: truncate(url),
               status: 0,
-              statusText: `Network failure: ${error && error.message ? error.message : error}`,
+              statusText: outcome
+                ? ''
+                : `Network failure: ${error && error.message ? error.message : error}`,
               ms: Math.round(performance.now() - started),
               via: 'fetch',
             };
+            if (outcome) entry.outcome = outcome;
             const caller = callerFrames(stack);
             if (caller.length) entry.caller = caller;
             push(buffers.network, entry);
@@ -332,59 +366,229 @@
   }
 
   // ------------------------------------------------------------------- XHR --
+  // Each open() starts a record of its own, kept on the object as __cdrReq.
+  //
+  // One object can carry two requests at once. A page may reopen it from
+  // inside a handler of the request that is just finishing: a retry in
+  // ontimeout, the next long poll in onload. That request's remaining events,
+  // its loadend included, are still dispatched after the reopen, by which time
+  // open() has reset status to 0. Read naively, a timed out request's retry is
+  // labelled a timeout, and every successful long poll is recorded as a
+  // network failure. So open() parks the finishing record with the status it
+  // ended on, and recordFor() credits those late events to it. abort() on a
+  // finished request does the same, for the same reason: Chrome fires no event
+  // for it and drops the status to 0 before the loadend arrives.
   const nativeOpen = XMLHttpRequest.prototype.open;
   const nativeSend = XMLHttpRequest.prototype.send;
+  const nativeAbort = XMLHttpRequest.prototype.abort;
+  // Both taken now, at document_start, before the page can replace them. A
+  // page running zone.js or fake timers would otherwise see the collector's
+  // timer and listeners as its own: an extra change detection pass on every
+  // request, a test that waits on them, or a timer that never fires because
+  // the clock is stopped.
+  const nativeSetTimeout = window.setTimeout;
+  const nativeAddEventListener = EventTarget.prototype.addEventListener;
 
-  // Named so that callerFrames() can drop this frame from a capture.
-  XMLHttpRequest.prototype.open = function cdrXhrOpen(method, url, ...rest) {
+  /**
+   * The record an abort, timeout or loadend event belongs to. A finishing
+   * request's own events arrive while the object is DONE (readyState 4). Late
+   * ones arrive after a reopen has moved it back to OPENED, or while it is DONE
+   * for a synchronous request a handler ran to the end, which has settled by
+   * then: a settled record gets no more events of its own.
+   */
+  function recordFor(xhr) {
+    const current = xhr.__cdrReq;
+    if (xhr.readyState === 4 && current && !current.settled) return current;
+    return xhr.__cdrParked || current;
+  }
+
+  /**
+   * The request on this object, with the status it ended on, if it has ended
+   * (DONE) but its loadend has not settled it yet. That only happens inside
+   * one of its own handlers. Read before the open() or abort() that is about to
+   * clear the status, and handed to park() once that call has gone through.
+   * A record is parked once at most, which keeps the chain below acyclic.
+   */
+  function finishing(xhr) {
+    const record = xhr.__cdrReq;
+    if (!record || !record.sent || record.settled || record.ended || xhr.readyState !== 4) {
+      return null;
+    }
+    return { record, status: xhr.status, statusText: xhr.statusText };
+  }
+
+  /** Credit a finished request's late events to its own record. */
+  function park(xhr, { record, status, statusText }) {
+    record.ended = { status, statusText };
+    // Parks can nest. A handler of a parked request can finish a second one
+    // synchronously, with an abort() or a synchronous send(), and that one is
+    // parked in turn when the handler reopens. Chrome then delivers the inner
+    // request's late events first and the outer's after, so the slot is a
+    // stack: settle() hands it back to the record underneath.
+    record.under = xhr.__cdrParked || null;
+    xhr.__cdrParked = record;
     try {
-      this.__cdrMethod = method;
-      this.__cdrUrl = url;
-      // Captured in open() rather than send(), because open() is where the
-      // caller is. A library queues the send a tick later from a helper of its
-      // own, and by then the stack names the library, not the page.
-      this.__cdrStack = captureStack();
+      // In case no further event arrives for it. settle() ignores a record its
+      // loadend has already recorded.
+      nativeSetTimeout.call(window, () => settle(xhr, record), 0);
     } catch {
       /* ignore */
     }
-    return nativeOpen.call(this, method, url, ...rest);
+  }
+
+  /** Record a request once, if it failed. Safe to call more than once. */
+  function settle(xhr, record) {
+    try {
+      if (!record || !record.sent || record.settled) return;
+      record.settled = true;
+      if (xhr.__cdrParked === record) {
+        let below = record.under;
+        while (below && below.settled) below = below.under;
+        xhr.__cdrParked = below || null;
+      }
+      record.under = null;
+
+      // A parked record carries the status it ended on; the object's own
+      // status now belongs to the request that replaced it.
+      const status = record.ended ? record.ended.status : xhr.status;
+      const statusText = record.ended ? record.ended.statusText : xhr.statusText;
+
+      // Released before the success early return below. An unformatted V8
+      // Error holds a strong reference to every recorded frame's function and
+      // receiver, so a long lived XHR, which is how a page long polls, would
+      // pin those objects for as long as it lives. Only a failure pays for
+      // formatting it.
+      const stack = record.stack;
+      record.stack = null;
+
+      // status 0 means the request never got a response: CORS rejection,
+      // connection refused, or ended by the page, which the abort and timeout
+      // listeners have noted on the record.
+      if (!(status === 0 || status >= 400)) return;
+      const outcome = status === 0 ? record.outcome : '';
+      const entry = {
+        method: String(record.method || 'GET').toUpperCase(),
+        url: truncate(record.url || xhr.responseURL || ''),
+        status,
+        statusText: status === 0 ? (outcome ? '' : 'Network failure') : statusText,
+        ms: Math.round(performance.now() - (record.started || performance.now())),
+        via: 'xhr',
+      };
+      if (outcome) entry.outcome = outcome;
+      const caller = callerFrames(stack);
+      if (caller.length) entry.caller = caller;
+      push(buffers.network, entry);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  // Named so that callerFrames() can drop this frame from a capture.
+  // Declared with (method, url) so that open.length stays 2, as native, but
+  // forwarded with `arguments` (unmapped, in strict mode) so the browser sees
+  // exactly what the page passed. open('GET') must still throw for a missing
+  // url, not quietly request one called "undefined".
+  XMLHttpRequest.prototype.open = function cdrXhrOpen(method, url) {
+    let ended = null;
+    let previous = null;
+    try {
+      ended = finishing(this);
+      previous = { req: this.__cdrReq, parked: this.__cdrParked };
+      // In place before the native open() runs, because that call fires a
+      // readystatechange of its own, and a page may send() from it.
+      this.__cdrReq = {
+        method,
+        url,
+        // Captured in open() rather than send(), because open() is where the
+        // caller is. A library queues the send a tick later from a helper of
+        // its own, and by then the stack names the library, not the page.
+        stack: captureStack(),
+        started: 0,
+        sent: false,
+        outcome: '',
+        settled: false,
+        ended: null,
+      };
+    } catch {
+      /* ignore */
+    }
+    let result;
+    try {
+      result = nativeOpen.apply(this, arguments);
+    } catch (error) {
+      // A method or url the browser refuses throws before anything on the
+      // object changes. The request on it is still the one in progress, so
+      // the bookkeeping goes back to match.
+      try {
+        if (previous) {
+          this.__cdrReq = previous.req;
+          this.__cdrParked = previous.parked;
+        }
+      } catch {
+        /* ignore */
+      }
+      throw error;
+    }
+    try {
+      if (ended) park(this, ended);
+    } catch {
+      /* ignore */
+    }
+    return result;
+  };
+
+  XMLHttpRequest.prototype.abort = function cdrXhrAbort(...args) {
+    let ended = null;
+    try {
+      ended = finishing(this);
+    } catch {
+      /* ignore */
+    }
+    const result = nativeAbort.apply(this, args);
+    try {
+      if (ended) park(this, ended);
+    } catch {
+      /* ignore */
+    }
+    return result;
   };
 
   XMLHttpRequest.prototype.send = function (...args) {
+    let record = null;
+    let before = null;
+    let opened = false;
     try {
-      // Timing is per-send, so it is refreshed every call.
-      this.__cdrStarted = performance.now();
+      record = this.__cdrReq;
+      opened = this.readyState === 1;
+      if (record) {
+        before = { started: record.started, sent: record.sent };
+        record.started = performance.now();
+        record.sent = true;
+      }
 
-      // The listener, however, must be attached only once per object. A page
-      // that long-polls by reusing a single XMLHttpRequest would otherwise
+      // The listeners are attached once per object, not per send. A page that
+      // long-polls by reusing a single XMLHttpRequest would otherwise
       // accumulate one listener per send and record the same failure N times,
       // flushing every other entry out of the ring buffer.
       if (!this.__cdrHooked) {
         this.__cdrHooked = true;
-        this.addEventListener('loadend', () => {
+        // Both fire before loadend, which is how a request the page ended
+        // itself is told apart from one that failed.
+        const mark = (event) => {
           try {
-            // status 0 at loadend means the request failed outright: CORS
-            // rejection, connection refused, or aborted.
-            // Read and release before the success early return below. An
-            // unformatted V8 Error holds a strong reference to every recorded
-            // frame's function and receiver, so a long lived XHR, which is how
-            // a page long polls, would pin those objects for as long as it
-            // lives. Two formatted strings are cheap; the Error is not.
-            const caller = callerFrames(this.__cdrStack);
-            this.__cdrStack = null;
-
-            const failed = this.status === 0 || this.status >= 400;
-            if (!failed) return;
-            const entry = {
-              method: String(this.__cdrMethod || 'GET').toUpperCase(),
-              url: truncate(this.__cdrUrl || this.responseURL || ''),
-              status: this.status,
-              statusText: this.status === 0 ? 'Network failure or aborted' : this.statusText,
-              ms: Math.round(performance.now() - (this.__cdrStarted || performance.now())),
-              via: 'xhr',
-            };
-            if (caller.length) entry.caller = caller;
-            push(buffers.network, entry);
+            const target = recordFor(this);
+            if (target && !target.settled) {
+              target.outcome = event.type === 'timeout' ? 'timeout' : 'aborted';
+            }
+          } catch {
+            /* ignore */
+          }
+        };
+        nativeAddEventListener.call(this, 'abort', mark);
+        nativeAddEventListener.call(this, 'timeout', mark);
+        nativeAddEventListener.call(this, 'loadend', () => {
+          try {
+            settle(this, recordFor(this));
           } catch {
             /* ignore */
           }
@@ -393,7 +597,27 @@
     } catch {
       /* ignore */
     }
-    return nativeSend.apply(this, args);
+    try {
+      return nativeSend.apply(this, args);
+    } catch (error) {
+      try {
+        if (opened && record && this.readyState === 4) {
+          // A synchronous request that failed at the network level (refused,
+          // a CORS rejection) throws out of send() and fires no event at all,
+          // loadend included, so nothing else would ever record it. It is the
+          // one throw that moves the object from OPENED to DONE.
+          settle(this, record);
+        } else if (record && before) {
+          // Refused outright (InvalidStateError: sent twice, or not opened).
+          // The request, if one is running, keeps the clock it started with.
+          record.started = before.started;
+          record.sent = before.sent;
+        }
+      } catch {
+        /* ignore */
+      }
+      throw error;
+    }
   };
 
   // ---------------------------------------------------------------- inspect --
@@ -1273,3 +1497,13 @@
     window.__cdrCollector = true;
   }
 })();
+
+// DevTools links a console message to the frame that called console.warn or
+// console.error, which on every page is the wrapper in this file rather than
+// the page's own code. The map below lists this file's only source in
+// ignoreList, so DevTools skips its frames and links the page's line instead.
+// It is a comment: nothing reads it at runtime, and it is written by hand, so
+// there is still no build step. Decoded:
+// {"version":3,"file":"collector-main.js","sources":["punch-list-collector.js"],
+//  "names":[],"mappings":"AAAA","ignoreList":[0],"x_google_ignoreList":[0]}
+//# sourceMappingURL=data:application/json;base64,eyJ2ZXJzaW9uIjozLCJmaWxlIjoiY29sbGVjdG9yLW1haW4uanMiLCJzb3VyY2VzIjpbInB1bmNoLWxpc3QtY29sbGVjdG9yLmpzIl0sIm5hbWVzIjpbXSwibWFwcGluZ3MiOiJBQUFBIiwiaWdub3JlTGlzdCI6WzBdLCJ4X2dvb2dsZV9pZ25vcmVMaXN0IjpbMF19
