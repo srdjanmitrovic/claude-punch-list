@@ -10,6 +10,7 @@
   },
   "scripts": {
     "build": "node tools/build.mjs",
+    "test": "node --test test/*.test.mjs",
     "prompt": "node tools/preview-prompt.mjs",
     "icons": "python3 tools/make-icons.py"
   },

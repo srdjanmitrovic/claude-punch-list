@@ -1,0 +1,50 @@
+Fix this issue on /checkout
+
+## What's wrong
+The order total shows NaN after applying a coupon. Expected the discounted price.
+
+## Screenshot
+/Users/you/Downloads/claude-punch-list/2026-08-07_20-51-33_localhost-checkout.png
+
+Read that image before anything else. It shows the problem as rendered.
+
+## Page
+- URL: /checkout
+- Title: Checkout | Example Store
+- Viewport: 1280 x 720 @2x
+- Captured: 8/7/2026, 8:51:33 PM
+- CAUTION: the page was reloaded after the screenshot was taken. The console and network entries below come from the reloaded page, so they may not correspond to the image.
+
+## Console output
+```
+[error] TypeError: Cannot read properties of undefined (reading 'price')
+          at applyCoupon (cart.js:142:18)
+          at handleSubmit (checkout.js:88:5)
+          at HTMLFormElement.<anonymous> (checkout.js:31:9)
+[warn] Coupon SUMMER25 missing from catalog, falling back to null
+```
+
+## Failed network requests
+```
+POST http://localhost:3000/api/coupons/validate -> 500 Internal Server Error (243ms)
+    called from applyCoupon (/src/components/cart/CartSummary.tsx:70:36)
+                handleApply (/src/components/cart/CartSummary.tsx:84:13)
+```
+
+## Selected element
+Component: `Total` (React, development build)
+Call site: /src/components/cart/CartSummary.tsx:42:9 (where CartSummary writes this JSX; Total is defined elsewhere)
+Inside CartSummary > CheckoutPage
+Search for: `cart-total`, "Order total", `handleApply`, `handleSave`, `Total`
+Handlers on `form.coupon`, 2 elements up the DOM, not on the picked element: onSubmit=ƒ handleApply, onChange
+`onSubmit` body starts: setPending(true); applyCoupon(inputRef.current ? ...
+Props of `Total`: amount=NaN, currency="EUR", onRetry=ƒ handleSave
+Classes: _total_1f3k9_12 is a CSS Module: .total in CartSummary.module.css
+Selector: `form.coupon > div.cart-summary > span.total`
+```html
+<span class="total price price--emphasis _total_1f3k9_12" data-testid="cart-total" aria-label="Order total">NaN</span>
+```
+Computed styles: display: inline; color: rgb(220, 38, 38); font-size: 18px; font-weight: 700
+
+---
+Find the root cause in this codebase before changing anything. If the screenshot and the console point at different things, say so rather than guessing.

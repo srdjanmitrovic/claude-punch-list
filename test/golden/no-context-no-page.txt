@@ -1,0 +1,30 @@
+Fix this issue on the captured page
+
+## What's wrong
+The order total shows NaN after applying a coupon. Expected the discounted price.
+
+## Screenshot
+/Users/you/Downloads/claude-punch-list/2026-08-07_20-51-33_localhost-checkout.png
+
+Read that image before anything else. It shows the problem as rendered.
+
+## Console and network
+Not available for this report, so nothing can be concluded from their absence.
+
+## Selected element
+Component: `Total` (React, development build)
+Call site: /src/components/cart/CartSummary.tsx:42:9 (where CartSummary writes this JSX; Total is defined elsewhere)
+Inside CartSummary > CheckoutPage
+Search for: `cart-total`, "Order total", `handleApply`, `handleSave`, `Total`
+Handlers on `form.coupon`, 2 elements up the DOM, not on the picked element: onSubmit=ƒ handleApply, onChange
+`onSubmit` body starts: setPending(true); applyCoupon(inputRef.current ? ...
+Props of `Total`: amount=NaN, currency="EUR", onRetry=ƒ handleSave
+Classes: _total_1f3k9_12 is a CSS Module: .total in CartSummary.module.css
+Selector: `form.coupon > div.cart-summary > span.total`
+```html
+<span class="total price price--emphasis _total_1f3k9_12" data-testid="cart-total" aria-label="Order total">NaN</span>
+```
+Computed styles: display: inline; color: rgb(220, 38, 38); font-size: 18px; font-weight: 700
+
+---
+Find the root cause in this codebase before changing anything. If the screenshot and the console point at different things, say so rather than guessing.

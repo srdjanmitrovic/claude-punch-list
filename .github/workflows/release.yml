@@ -38,6 +38,9 @@ jobs:
           fi
           echo "version=$MANIFEST" >> "$GITHUB_ENV"
 
+      - name: Test
+        run: npm test
+
       - name: Build
         run: node tools/build.mjs
 

@@ -52,14 +52,29 @@ screenshots, which is what `tools/make-media.mjs` does to produce the README's i
 Before opening a pull request:
 
 ```bash
+npm test               # the tests below; CI runs the same command on every push and pull request
 npm run build          # validates the manifest and every path it references
 npm run prompt         # renders the prompt template, in case you touched it
 npm run prompt mixed   # the same, for a report with several items
 npm run prompt minified # the same, for a production build with no real component name
 ```
 
-There is no test suite yet. If you add one, please keep it dependency free or make the
-dependency a dev only one that `npm run build` does not need.
+The tests use `node:test`, which ships with Node, so there is nothing to install. They live in
+`test/` and come in three kinds:
+
+* `test/prompt.test.mjs` renders the template against the samples in `tools/preview-prompt.mjs`,
+  plus a few variations no preview shows, and compares each prompt byte for byte with a file in
+  `test/golden/`. If you change the prompt on purpose, run `UPDATE_GOLDEN=1 npm test` and commit
+  the regenerated files with the change, so the diff shows exactly what Claude Code will now read.
+* `test/collector.test.mjs` runs `content/collector-main.js` in a fresh `node:vm` realm and holds
+  every wrapper to the rules below.
+* `test/static.test.mjs` checks what would otherwise only fail in Chrome: every file the manifest,
+  the worker and the panel name exists, every file parses, and the re-injected capture scripts
+  declare nothing at the top level.
+
+None of this runs Chrome. The stage and a real install are still the check for anything visual,
+for the worker, and for how the panel and the page hand focus back and forth. Keep any new test
+dependency free, or make the dependency a dev only one that `npm run build` does not need.
 
 ## Things worth knowing before you change code
 
@@ -71,6 +86,12 @@ reading a single file, and breaking them tends to fail silently rather than loud
   `chrome.*`. It also runs on every page the user visits, so a defect there breaks real
   websites. Every wrapper in it must preserve `this`, pass return values through, re-reject
   rejections, and swallow its own errors.
+* The last line of `content/collector-main.js` is a hand written source map that puts the file on
+  DevTools' ignore list. Without it, DevTools links every `console.warn`, `console.error` and
+  failed request on every page to the collector instead of the page's own code. The same map
+  sends links into the collector itself to a placeholder file, so to debug the collector, turn
+  off **JavaScript source maps** in DevTools settings for the session, or delete the line
+  locally. `npm test` fails if the line goes missing.
 * `content/overlay.js` and `content/picker.js` are re-injected in full on every use. They must
   not declare anything at the top level with `const`, `let` or `class`.
 * The picker reads a React fiber or a Vue instance by asking `content/collector-main.js`, because
@@ -84,8 +105,9 @@ reading a single file, and breaking them tends to fail silently rather than loud
 * Screenshots go to disk at capture time, and an item is only persisted once it has a path.
   Discarding an uncopied item deletes its file; the reset after a copy must not, because the
   prompt on the clipboard names every file.
-* `shared/prompt-template.js` must render a one item report byte for byte as it did before
-  the list existed. `npm run prompt` and `npm run prompt change` are the check.
+* `shared/prompt-template.js` must render a one item report byte for byte as it did before.
+  `npm test` is the check: the goldens in `test/golden/` are that "before", and a deliberate
+  change to them belongs in the same commit as the change to the template.
 
 ## Style
 

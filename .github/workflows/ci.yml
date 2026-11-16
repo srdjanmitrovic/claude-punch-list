@@ -1,0 +1,32 @@
+# Run the tests and a release build on every push to main and every pull request.
+#
+# Nothing to install: the tests use node:test and the build writes its own zip.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: ["20", "24"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: node tools/build.mjs
