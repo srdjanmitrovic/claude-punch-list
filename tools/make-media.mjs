@@ -1,8 +1,10 @@
 /**
  * Produce the README's screenshots and the frames for its GIF.
  *
+ *     npm install --no-save playwright   # once; --no-save keeps it out of package.json
+ *     npx playwright install chromium    # once; or skip it and set PLAYWRIGHT_CHANNEL=chrome
  *     python3 -m http.server 8000        # in one terminal, from the repo root
- *     node tools/make-media.mjs          # in another; needs `npm i -D playwright`
+ *     node tools/make-media.mjs          # in another
  *     python3 tools/make-gif.py          # turn the frames into docs/media/demo.gif
  *
  * Drives tools/panel-stage.html, so everything in the pictures is the real
@@ -11,8 +13,12 @@
  * reproducible: change the panel, rerun this, commit the result.
  *
  * Playwright is not a dependency of the extension and is deliberately not in
- * package.json. Install it locally when you need this, or pass a browser from
- * any Playwright session to run().
+ * package.json, which is why the install above says --no-save: `npm i -D`
+ * would write it there. Since Playwright 1.38 installing the package fetches
+ * no browser, so launch() fails until `npx playwright install chromium` has
+ * run, unless PLAYWRIGHT_CHANNEL=chrome points it at an installed Google
+ * Chrome (or PLAYWRIGHT_EXECUTABLE at any Chromium binary). A browser from
+ * any other Playwright session can also be passed to run().
  */
 
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs';

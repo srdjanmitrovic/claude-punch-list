@@ -30,3 +30,21 @@ jobs:
 
       - name: Build
         run: node tools/build.mjs
+
+  # Merging to main releases the version in manifest.json, and a version that
+  # is already out cannot name a second build. Said here, a pull request
+  # learns it needs a version bump before it merges, not after.
+  version:
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the tags, to compare with the last release
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Check the version names one build
+        run: node tools/release-check.mjs --check

@@ -24,8 +24,13 @@
   const listeners = [];
   const storageListeners = [];
   const downloadListeners = [];
-  const downloads = new Map();
-  let nextDownloadId = 1;
+  // Chrome's download history outlives the side panel, and a reopened panel
+  // asks it about the ids its stored items carry. So the records and the
+  // next id live on the stage, beside storage, and survive the panel frame
+  // being reloaded. Kept here, a reopened panel would find none of its
+  // items' records, and its next capture would be given an id a stored item
+  // already has, which a discard of either then acts on.
+  const downloadStore = (stage && stage.downloads) || { records: {}, nextId: 1 };
   let latestArm = null; // the newest cdr:arm, as the worker's latestArmByTab
   const landings = new Set(); // arms still landing, as the worker's landingsByTab
 
@@ -125,24 +130,47 @@
 
     downloads: {
       async download({ filename }) {
-        const id = nextDownloadId++;
+        const id = downloadStore.nextId++;
         const dir = stage ? stage.downloadsDir() : '/Users/you/Downloads/';
-        const record = { id, state: 'in_progress', filename: '', exists: true };
-        downloads.set(id, record);
         // Real downloads take a moment, and a "Save as" dialog can take
-        // minutes. The stage's delay makes the SAVING state visible.
-        setTimeout(() => {
-          record.state = 'complete';
-          record.filename = `${dir}${filename}`;
-        }, stage ? stage.saveDelay() : 0);
+        // minutes. The stage's delay makes the SAVING state visible. The
+        // record says when it completes rather than a timer completing it,
+        // because a timer set here dies with the panel frame, while a real
+        // download carries on with the panel closed.
+        downloadStore.records[id] = {
+          id,
+          path: `${dir}${filename}`,
+          readyAt: Date.now() + (stage ? stage.saveDelay() : 0),
+          exists: true,
+        };
         return id;
       },
       async search({ id }) {
-        return downloads.has(id) ? [{ ...downloads.get(id) }] : [];
+        const record = downloadStore.records[id];
+        if (!record) return [];
+        const complete = Date.now() >= record.readyAt;
+        return [
+          {
+            id,
+            state: complete ? 'complete' : 'in_progress',
+            filename: complete ? record.path : '',
+            exists: record.exists,
+          },
+        ];
       },
       show() {},
-      async removeFile() {},
-      async erase() {},
+      // As in Chrome: removing the file leaves the record, marked as gone,
+      // and erasing takes the record out of the history.
+      async removeFile(id) {
+        const record = downloadStore.records[id];
+        if (!record) throw new Error(`Invalid download id ${id}`);
+        record.exists = false;
+      },
+      async erase({ id }) {
+        if (!downloadStore.records[id]) return [];
+        delete downloadStore.records[id];
+        return [id];
+      },
       onChanged: {
         addListener(fn) {
           downloadListeners.push(fn);

@@ -20,7 +20,13 @@
       </div>
     </header>
 
-    <div class="notice" id="banner" hidden></div>
+    <!-- A live region announces what appears inside it, not a region that
+         appears along with its text, so this one is never hidden: the banner
+         inside it is. Sticky, so a banner is on screen however far the panel
+         has been scrolled when it comes. -->
+    <div class="notice-live" id="banner-live" aria-live="polite" aria-atomic="true">
+      <div class="notice" id="banner" hidden></div>
+    </div>
 
     <main>
       <!-- Signature element: the proof frame. Crop marks at the corners, a
@@ -32,8 +38,10 @@
           <div class="frame-empty" id="preview-empty">
             <p class="invite">Frame what you noticed.</p>
             <p class="invite-sub">Drag a region, pick an element, or grab the screen. Keep going for as many as you like.</p>
-            <p class="invite-keys">
-              <kbd>Alt</kbd><kbd>Shift</kbd><kbd>C</kbd>
+            <!-- The manifest's suggested key, shown until panel.js has asked
+                 Chrome what is actually bound, and wherever it cannot ask. -->
+            <p class="invite-keys" id="shortcut-keys">
+              <span class="sr">Region shortcut:</span><kbd>Alt</kbd><kbd>Shift</kbd><kbd>C</kbd>
             </p>
           </div>
           <img id="preview-img" alt="Captured screenshot" hidden />
@@ -44,13 +52,13 @@
         </div>
 
         <div class="modes" role="group" aria-label="Capture mode">
-          <button class="mode" id="mode-region" type="button">
+          <button class="mode" id="mode-region" type="button" aria-pressed="false">
             <svg viewBox="0 0 20 20" aria-hidden="true">
               <path d="M2.5 6.5v-4h4M13.5 2.5h4v4M17.5 13.5v4h-4M6.5 17.5h-4v-4" />
             </svg>
             <span>Region</span>
           </button>
-          <button class="mode" id="mode-element" type="button">
+          <button class="mode" id="mode-element" type="button" aria-pressed="false">
             <svg viewBox="0 0 20 20" aria-hidden="true" class="fill">
               <path d="M4.5 3v11.4l3-2.9 2 4.7 2.2-1-2-4.6h4.2z" />
             </svg>
@@ -84,23 +92,32 @@
           rows="3"
           placeholder="The total shows NaN once a coupon is applied. It should show the discounted price."
         ></textarea>
+        <!-- With the item, not only in the shared banner, which other news
+             replaces: why this item holds Copy back, and what lifts it. -->
+        <p class="footnote" id="item-missing" hidden>
+          This screenshot is no longer on disk, so Copy waits while the item is ticked. Untick or
+          discard it to copy the rest.
+        </p>
+        <!-- After a drag on the page the caret is in the field but the keys
+             still go to the page, until the panel is clicked. -->
+        <p class="field-hint" id="description-hint" hidden>The page still has the keyboard. Click the field to type here.</p>
       </section>
 
       <section>
         <p class="key">Attach</p>
-        <ul class="chips" id="toggles">
+        <ul class="chips">
           <li>
             <label class="chip">
               <input type="checkbox" id="inc-console" checked />
               <span class="chip-name">console</span>
-              <em class="count" id="count-console">0</em>
+              <em class="count" id="count-console">…</em>
             </label>
           </li>
           <li>
             <label class="chip">
               <input type="checkbox" id="inc-network" checked />
               <span class="chip-name">network</span>
-              <em class="count" id="count-network">0</em>
+              <em class="count" id="count-network">…</em>
             </label>
           </li>
           <li>
@@ -114,7 +131,6 @@
             <label class="chip">
               <input type="checkbox" id="inc-page" checked />
               <span class="chip-name">page</span>
-              <em class="count"></em>
             </label>
           </li>
         </ul>
@@ -135,25 +151,62 @@
             <button class="ghost-link" id="clear-selection" type="button" hidden>
               Clear selection
             </button>
+            <!-- With the sheet it empties, pushed to the far end of the row.
+                 It used to sit in the footer, 12 px from the identically styled
+                 "Clear collected log". -->
+            <button class="ghost-link far" id="discard-all" type="button" hidden>Discard all</button>
           </div>
           <p class="key">On the sheet</p>
           <ul class="list" id="list" aria-label="Captured items"></ul>
         </div>
 
-        <button class="send" id="submit" type="button" disabled>
+        <!-- The last discard, for a few seconds: what went, and Undo. Outside
+             the sheet, which hides once it is empty. Always in the layout,
+             collapsed while empty, because it is a live region. -->
+        <div class="undo" id="undo" role="status"></div>
+
+        <button
+          class="send"
+          id="submit"
+          type="button"
+          disabled
+          aria-describedby="submit-note"
+          aria-keyshortcuts="Control+Enter Meta+Enter"
+        >
           <span id="submit-label">Copy for Claude Code</span>
           <em class="send-count" id="submit-count" hidden></em>
         </button>
+        <!-- Why Copy is held back, or the key that copies when it is not.
+             Its own line, because the banner is shared and anything can
+             replace what it says. -->
+        <p class="send-note" id="submit-note" hidden></p>
 
         <div class="receipt" id="result" hidden>
-          <p class="receipt-head" id="result-text">Copied</p>
+          <p class="receipt-head" id="result-text"></p>
           <code class="receipt-path" id="result-path"></code>
+          <p class="receipt-note" id="result-note" hidden></p>
           <div class="receipt-acts">
             <button class="ghost-link" id="copy-again" type="button">Copy again</button>
             <button class="ghost-link" id="reveal" type="button">Show files</button>
-            <button class="ghost-link" id="preview-prompt" type="button">Read prompt</button>
+            <button
+              class="ghost-link"
+              id="preview-prompt"
+              type="button"
+              aria-expanded="false"
+              aria-controls="prompt-preview"
+            >
+              Read prompt
+            </button>
+            <!-- Only after a blocked clipboard: the copied items leave the
+                 sheet, and their files stay for the prompt copied by hand. -->
+            <button class="ghost-link" id="clear-copied" type="button" hidden>
+              Clear these items
+            </button>
           </div>
         </div>
+        <!-- What the receipt says, read out. The receipt appears along with
+             its text, which a live region of its own would not announce. -->
+        <p class="sr" id="announce" role="status"></p>
         <pre class="proof" id="prompt-preview" hidden></pre>
       </section>
     </main>
@@ -169,7 +222,6 @@
     <footer class="colophon">
       <div class="colophon-acts">
         <button class="ghost-link" id="clear-buffers" type="button">Clear collected log</button>
-        <button class="ghost-link" id="discard-all" type="button" hidden>Discard all</button>
       </div>
       <span class="stamp" id="version"></span>
     </footer>

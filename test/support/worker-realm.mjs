@@ -11,7 +11,11 @@
  * scripts are stood in for by controllers with the start(), stop() and
  * isActive() the real ones expose. The functions the worker injects (the stop
  * and the probe) are the worker's own, serialised and run in a realm of the
- * page's, as executeScript does.
+ * page's, as executeScript does. The stop it queues is a file, content/stop.js,
+ * and arrives in order with the other files; the collector's files are only
+ * recorded, unless the page is given both of its worlds (FakePage's `worlds`,
+ * see makeWorlds), where they run for real in the world each is injected
+ * into, as do the functions.
  *
  * Time is a fake clock the test moves, and Chrome stopping the worker is
  * kill(): nothing reaches the worker after it, while the pages carry on.
@@ -21,6 +25,11 @@ import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 
 const SOURCE = readFileSync(new URL('../../background.js', import.meta.url), 'utf8');
+const MANIFEST = readFileSync(new URL('../../manifest.json', import.meta.url), 'utf8');
+const COLLECTOR_FILES = {
+  'content/collector-main.js': readFileSync(new URL('../../content/collector-main.js', import.meta.url), 'utf8'),
+  'content/collector-bridge.js': readFileSync(new URL('../../content/collector-bridge.js', import.meta.url), 'utf8'),
+};
 
 // Values made in the worker's realm have that realm's prototypes, which strict
 // deep equality would reject. Every reply crosses a message channel in Chrome
@@ -68,23 +77,297 @@ export function makeClock() {
   };
 }
 
+/**
+ * A tab's two JavaScript worlds, the page's (main) and an extension's
+ * (isolated), as far as the collector and its bridge can tell them apart.
+ * Each is a realm of its own, with its own globals and prototypes, so what a
+ * page script replaces in its world stays as it was in the other, and they
+ * share the window's events: an event dispatched in either reaches the
+ * listeners of both, synchronously, capture listeners first, each in the
+ * order added, and each world sees it through its own prototypes. An init
+ * dictionary is read as WebIDL reads one, member by member through the
+ * object's prototype chain; a detail read in another world than the one
+ * that set it is a structured clone, as Chrome makes it; and while a
+ * listener runs, its world's window.event is the event. A message posted to
+ * the window reaches every message listener a task later.
+ *
+ * The isolated world's chrome.runtime has no id, so every bridge injected is
+ * one after a reload of the extension, and ask() goes to the last of them.
+ */
+export function makeWorlds({ url = 'https://example.test/', title = 'Example', readyState = 'loading' } = {}) {
+  const listeners = new Map(); // type -> [{ world, fn, capture }]
+  const STATE = new WeakMap(); // an event, in either world -> what both worlds see of it
+  const posted = [];
+  const errors = []; // thrown by listeners, which Chrome reports and goes on
+  const worlds = {};
+  let onMessage = null;
+
+  const listFor = (type) => {
+    if (!listeners.has(type)) listeners.set(type, []);
+    return listeners.get(type);
+  };
+  const clone = (value) => (value !== null && typeof value === 'object' ? structuredClone(value) : value);
+
+  /** The event as `name`'s world sees it. */
+  function wrap(state, name) {
+    let wrapper = state.wrappers.get(name);
+    if (!wrapper) {
+      const classes = worlds[name].classes;
+      wrapper = Object.create((state.custom ? classes.CustomEvent : classes.Event).prototype);
+      STATE.set(wrapper, state);
+      state.wrappers.set(name, wrapper);
+    }
+    return wrapper;
+  }
+
+  function classesFor(name) {
+    const stateOf = (event) => {
+      const state = STATE.get(event);
+      if (!state) throw new TypeError('Illegal invocation');
+      return state;
+    };
+    const member = (init, key) => (init === undefined || init === null ? undefined : init[key]);
+    class Event {
+      constructor(type, init) {
+        const state = {
+          type: String(type),
+          bubbles: Boolean(member(init, 'bubbles')),
+          cancelable: Boolean(member(init, 'cancelable')),
+          composed: Boolean(member(init, 'composed')),
+          detail: null,
+          world: name,
+          custom: false,
+          defaultPrevented: false,
+          stopped: false,
+          dispatching: false,
+          wrappers: new Map(),
+        };
+        state.wrappers.set(name, this);
+        STATE.set(this, state);
+      }
+      get type() {
+        return stateOf(this).type;
+      }
+      get cancelable() {
+        return stateOf(this).cancelable;
+      }
+      get defaultPrevented() {
+        return stateOf(this).defaultPrevented;
+      }
+      preventDefault() {
+        const state = stateOf(this);
+        if (state.cancelable) state.defaultPrevented = true;
+      }
+      stopPropagation() {}
+      stopImmediatePropagation() {
+        stateOf(this).stopped = true;
+      }
+    }
+    class CustomEvent extends Event {
+      constructor(type, init) {
+        super(type, init);
+        const state = stateOf(this);
+        state.custom = true;
+        const detail = member(init, 'detail');
+        state.detail = detail === undefined ? null : detail;
+      }
+      get detail() {
+        const state = stateOf(this);
+        return state.world === name ? state.detail : clone(state.detail);
+      }
+    }
+    return { Event, CustomEvent };
+  }
+
+  function eventsFor(name, win) {
+    const capturing = (options) => options === true || Boolean(options && typeof options === 'object' && options.capture);
+    return {
+      addEventListener(type, fn, options) {
+        const capture = capturing(options);
+        const list = listFor(String(type));
+        if (list.some((one) => one.world === name && one.fn === fn && one.capture === capture)) return;
+        list.push({ world: name, fn, capture });
+      },
+      removeEventListener(type, fn, options) {
+        const capture = capturing(options);
+        const list = listFor(String(type));
+        const at = list.findIndex((one) => one.world === name && one.fn === fn && one.capture === capture);
+        if (at !== -1) list.splice(at, 1);
+      },
+      dispatchEvent(event) {
+        const state = STATE.get(event);
+        if (!state) throw new TypeError("Failed to execute 'dispatchEvent': parameter 1 is not of type 'Event'.");
+        if (state.dispatching) throw new Error('InvalidStateError: the event is already being dispatched.');
+        state.dispatching = true;
+        state.stopped = false;
+        const all = [...listFor(state.type)];
+        try {
+          for (const entry of [...all.filter((one) => one.capture), ...all.filter((one) => !one.capture)]) {
+            if (state.stopped) break;
+            if (!listFor(state.type).includes(entry)) continue;
+            const target = worlds[entry.world].window;
+            const seen = wrap(state, entry.world);
+            const previous = target.event;
+            target.event = seen;
+            try {
+              entry.fn.call(worlds[entry.world].self, seen);
+            } catch (error) {
+              errors.push(error);
+            } finally {
+              target.event = previous;
+            }
+          }
+        } finally {
+          state.dispatching = false;
+        }
+        return !state.defaultPrevented;
+      },
+      postMessage(data) {
+        posted.push(JSON.parse(JSON.stringify(data)));
+        setTimeout(() => {
+          for (const entry of [...listFor('message')]) {
+            const self = worlds[entry.world].self;
+            try {
+              entry.fn.call(self, { source: self, data: clone(data) });
+            } catch (error) {
+              errors.push(error);
+            }
+          }
+        }, 0);
+      },
+    };
+  }
+
+  const document = { title, readyState, scripts: [], querySelector: () => null };
+  const location = { href: url };
+  const shared = {
+    document,
+    location,
+    innerWidth: 1280,
+    innerHeight: 800,
+    devicePixelRatio: 2,
+    scrollX: 0,
+    scrollY: 0,
+    navigator: { userAgent: 'Mozilla/5.0 (test)' },
+    crypto: globalThis.crypto,
+  };
+  class FakeEventTarget {
+    addEventListener() {}
+  }
+  for (const name of ['main', 'isolated']) {
+    const win = { ...shared };
+    const classes = classesFor(name);
+    Object.assign(win, classes, eventsFor(name, win), { setTimeout, clearTimeout });
+    if (name === 'main') {
+      Object.assign(win, {
+        console: { error() {}, warn() {}, log() {}, info() {}, debug() {} },
+        XMLHttpRequest: class extends FakeEventTarget {
+          open() {}
+          send() {}
+          abort() {}
+        },
+        EventTarget: FakeEventTarget,
+        performance: { now: () => 0 },
+        Element: class Element {},
+      });
+    } else {
+      win.chrome = {
+        runtime: {
+          onMessage: {
+            addListener(listener) {
+              onMessage = listener;
+            },
+          },
+        },
+      };
+    }
+    win.window = win;
+    win.event = undefined;
+    const realm = vm.createContext(win);
+    // What the world's own code sees as window: node hands its scripts the
+    // realm's global proxy rather than the object it was made from.
+    worlds[name] = { window: win, classes, realm, self: vm.runInContext('window', realm) };
+  }
+
+  return {
+    main: worlds.main,
+    isolated: worlds.isolated,
+    document,
+    posted,
+    errors,
+    /** Run code in a world: 'main' (the page's, and the collector's) or 'isolated'. */
+    run(name, code, filename) {
+      return vm.runInContext(code, worlds[name].realm, filename ? { filename } : undefined);
+    },
+    /** What a message from the panel to the tab is answered with, by the last bridge. */
+    ask(type) {
+      return new Promise((resolve, reject) => {
+        if (!onMessage) reject(new Error('no bridge ever listened'));
+        else onMessage({ type }, {}, (reply) => resolve(JSON.parse(JSON.stringify(reply))));
+      });
+    },
+  };
+}
+
 const CONTROLLER = { 'content/overlay.js': 'region', 'content/picker.js': 'element' };
+
+/** The file the worker queues a stop with, which takes either controller down. */
+const STOP_FILE = 'content/stop.js';
+
+/** The extension's own origin, which its pages send from and getURL('') names. */
+export const EXTENSION_URL = 'chrome-extension://test-extension/';
+export const PANEL_SENDER = { id: 'test-extension', url: `${EXTENSION_URL}sidepanel/panel.html` };
 
 /** One tab's document, as far as the worker can see it. */
 export class FakePage {
-  constructor({ idle = true, url = 'https://example.test/' } = {}) {
+  /**
+   * runs: each controller's start() makes a run id and the file injection
+   * answers with it, as the real capture scripts do. Off by default, so a
+   * test written before runs existed sees the entries it always saw.
+   *
+   * worlds: the page's two worlds (makeWorlds, given these options), where
+   * the collector's files and the worker's functions run for real, each in
+   * the world it is injected into. The capture controllers live in the
+   * isolated one, as the capture scripts do.
+   */
+  constructor({ idle = true, url = 'https://example.test/', runs = false, worlds = null } = {}) {
     this.url = url;
+    this.runs = runs;
+    this.nextRun = 1;
     this.idle = idle; // has reached document_idle
     this.busy = false; // main thread blocked: nothing runs until resume()
     this.inbox = []; // arrived while busy, in arrival order
     this.waiting = []; // arrived, waiting for document_idle
     this.log = []; // what ran, in order
-    this.window = {};
-    this.window.window = this.window;
+    if (worlds) {
+      this.worlds = makeWorlds({ url, ...worlds });
+      this.window = this.worlds.isolated.window;
+      this.realm = this.worlds.isolated.realm;
+      this.mainRealm = this.worlds.main.realm;
+    } else {
+      this.worlds = null;
+      this.window = {};
+      this.window.window = this.window;
+      // Where the worker's listener for a late start goes (markLate), with
+      // no collector here to hear it.
+      this.window.addEventListener = () => {};
+      this.window.removeEventListener = () => {};
+      this.realm = vm.createContext(this.window);
+      this.mainRealm = this.realm;
+    }
     // A stop's promise settles on the second animation frame.
     this.window.requestAnimationFrame = (callback) => setImmediate(callback);
     this.window.setTimeout = () => 0;
-    this.realm = vm.createContext(this.window);
+  }
+
+  /**
+   * What Chrome does at document_start of a page the manifest declares the
+   * collector for: both halves, each in its world, before any of the page's
+   * own scripts.
+   */
+  declare() {
+    this.worlds.run('isolated', COLLECTOR_FILES['content/collector-bridge.js'], 'content/collector-bridge.js');
+    this.worlds.run('main', COLLECTOR_FILES['content/collector-main.js'], 'content/collector-main.js');
   }
 
   /** The mode live on the page, or null. */
@@ -100,10 +383,13 @@ export class FakePage {
     const page = this;
     this.window[key] ||= {
       active: false,
+      run: undefined,
       start() {
-        if (this.active) return;
+        if (this.active) return this.run;
         page.window[other]?.stop();
         this.active = true;
+        this.run = page.runs ? `run-${page.nextRun++}` : undefined;
+        return this.run;
       },
       stop() {
         this.active = false;
@@ -128,11 +414,21 @@ export class FakePage {
   run(injection) {
     let result = null;
     try {
-      if (injection.file) {
-        this.controller(CONTROLLER[injection.file]).start();
+      if (injection.file === STOP_FILE) {
+        this.window.__cdrRegionOverlay?.stop();
+        this.window.__cdrElementPicker?.stop();
+        this.log.push('stop');
+      } else if (injection.file && CONTROLLER[injection.file]) {
+        result = this.controller(CONTROLLER[injection.file]).start() ?? null;
+        this.log.push(injection.file);
+      } else if (injection.file && this.worlds && COLLECTOR_FILES[injection.file]) {
+        this.worlds.run(injection.world === 'MAIN' ? 'main' : 'isolated', COLLECTOR_FILES[injection.file], injection.file);
+        this.log.push(injection.file);
+      } else if (injection.file) {
+        // Any other file (the collector's halves, without the worlds) is only recorded.
         this.log.push(injection.file);
       } else {
-        result = vm.runInContext(`(${injection.func})()`, this.realm);
+        result = vm.runInContext(`(${injection.func})()`, injection.world === 'MAIN' ? this.mainRealm : this.realm);
         this.log.push(injection.kind);
       }
     } catch (error) {
@@ -175,15 +471,18 @@ export class FakePage {
  *   pages?: Record<number, FakePage>,
  *   tabsGet?: (tabId: number) => Promise<object>,
  *   holdFiles?: boolean,
+ *   setup?: (chrome: object) => void,
  * }} options  holdFiles keeps every file injection in the package read until
- *   releaseFiles(), so a test can send a function injection past one.
+ *   releaseFiles(), so a test can send a function injection past one. setup
+ *   can change the chrome fake before the worker starts.
  */
-export function loadWorker({ pages = { 1: new FakePage() }, tabsGet, holdFiles = false } = {}) {
+export function loadWorker({ pages = { 1: new FakePage() }, tabsGet, holdFiles = false, setup = () => {} } = {}) {
   const clock = makeClock();
-  const listeners = { message: [], updated: [], removed: [], command: [] };
+  const listeners = { message: [], updated: [], removed: [], command: [], connect: [] };
   const broadcasts = [];
   const injections = []; // every executeScript call, in order
   const heldFiles = [];
+  const accessLevels = []; // every storage.local.setAccessLevel call
   let dead = false;
 
   // After kill() nothing settles in the worker's realm: Chrome has thrown the
@@ -200,10 +499,23 @@ export function loadWorker({ pages = { 1: new FakePage() }, tabsGet, holdFiles =
     sidePanel: { setPanelBehavior: async () => {}, open: async () => {} },
     extension: { isAllowedFileSchemeAccess: async () => true },
     runtime: {
+      id: PANEL_SENDER.id,
+      // The real manifest, so a test sees the match patterns that ship.
+      getManifest: () => JSON.parse(MANIFEST),
+      getURL: (path = '') => `${EXTENSION_URL}${String(path).replace(/^\//, '')}`,
+      lastError: undefined,
       onMessage: { addListener: (fn) => listeners.message.push(fn) },
+      onConnect: { addListener: (fn) => listeners.connect.push(fn) },
       sendMessage: (message) => {
         if (!dead) broadcasts.push(message);
         return Promise.resolve();
+      },
+    },
+    storage: {
+      local: {
+        setAccessLevel: async (options) => {
+          accessLevels.push(plain(options));
+        },
       },
     },
     tabs: {
@@ -227,8 +539,11 @@ export function loadWorker({ pages = { 1: new FakePage() }, tabsGet, holdFiles =
           file: details.files?.[0] || null,
           func: details.func || null,
           immediate: Boolean(details.injectImmediately),
+          world: details.world || 'ISOLATED',
           // By what the function does, which is all a test can rely on.
-          kind: details.files
+          kind: details.files?.[0] === STOP_FILE
+            ? 'stop'
+            : details.files
             ? 'file'
             : /isActive/.test(String(details.func))
               ? 'probe'
@@ -252,16 +567,21 @@ export function loadWorker({ pages = { 1: new FakePage() }, tabsGet, holdFiles =
     },
   };
 
+  setup(chrome);
+
   const context = vm.createContext({
     chrome,
     console,
+    URL, // a worker has it, a bare node:vm realm does not
     setTimeout: clock.setTimeout,
     clearTimeout: clock.clearTimeout,
   });
   // Strict, as a module is. The worker exports nothing, so the trailing
   // expression is the only way in to the state the tests look at.
   const internals = vm.runInContext(
-    `'use strict';${SOURCE}\n;({ armedByTab, latestArmByTab, landingsByTab })`,
+    `'use strict';${SOURCE}\n;({ armedByTab, latestArmByTab, landingsByTab, matchesPattern, ` +
+      `matchesGlob: typeof matchesGlob === 'function' ? matchesGlob : undefined, ` +
+      `collectorSiteDeclaredFor: typeof collectorSiteDeclaredFor === 'function' ? collectorSiteDeclaredFor : undefined })`,
     context,
     { filename: 'background.js' }
   );
@@ -273,8 +593,13 @@ export function loadWorker({ pages = { 1: new FakePage() }, tabsGet, holdFiles =
     broadcasts,
     injections,
     internals,
-    /** A message from a panel or a content script; resolves to the reply, if any. */
-    send(message, sender = {}) {
+    accessLevels,
+    /**
+     * A message from a panel or a content script; resolves to the reply, if
+     * any. From the panel unless a sender is given: a content script's names
+     * its tab, and the page it runs on as its url.
+     */
+    send(message, sender = PANEL_SENDER) {
       return new Promise((resolve) => {
         let async = false;
         const reply = (value) => resolve(plain(value));
@@ -298,6 +623,41 @@ export function loadWorker({ pages = { 1: new FakePage() }, tabsGet, holdFiles =
     },
     kill() {
       dead = true;
+    },
+    /**
+     * A port opened to the worker, as chrome.runtime.connect does from a
+     * panel (or from `sender`). post() delivers a message to the worker's
+     * side; close() is the panel going away; closed says whether the worker
+     * shut it.
+     */
+    connect(name, sender = PANEL_SENDER) {
+      const onMessage = [];
+      const onDisconnect = [];
+      const port = {
+        name,
+        sender,
+        closed: false,
+        onMessage: { addListener: (fn) => onMessage.push(fn) },
+        onDisconnect: { addListener: (fn) => onDisconnect.push(fn) },
+        postMessage() {},
+        disconnect() {
+          port.closed = true;
+        },
+      };
+      for (const listener of listeners.connect) listener(port);
+      return {
+        get closed() {
+          return port.closed;
+        },
+        post(message) {
+          if (!dead && !port.closed) for (const fn of onMessage) fn(message, port);
+        },
+        close() {
+          if (dead || port.closed) return;
+          port.closed = true;
+          for (const fn of onDisconnect) fn(port);
+        },
+      };
     },
   };
 }

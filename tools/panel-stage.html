@@ -148,6 +148,9 @@
         const cursor = document.getElementById('cursor');
 
         const storage = {};
+        // Chrome's download history, which outlives a side panel just as
+        // storage does. The shim keeps its records here.
+        const downloads = { records: {}, nextId: 1 };
         let demoListeners = [];
 
         const CONTENT = new URL('../content/', location.href);
@@ -177,11 +180,15 @@
 
         // The demo tab's own chrome.*: just enough for the bridge to register a
         // listener and for the overlay and picker to broadcast to the panel.
+        // The id is what tells them the extension is still there: without it
+        // they take themselves for leftovers of a reloaded extension and stop
+        // at the first frame.
         function installDemoShim() {
           const win = demoWindow();
           demoListeners = [];
           win.chrome = {
             runtime: {
+              id: 'stage',
               onMessage: {
                 addListener(fn) {
                   demoListeners.push(fn);
@@ -216,6 +223,7 @@
 
         window.__stage = {
           storage,
+          downloads,
           tabUrl: () => demoWindow().location.href,
           tabTitle: () => demoWindow().document.title,
           downloadsDir: () => '/Users/you/Downloads/',
@@ -237,6 +245,11 @@
               for (const fn of demoListeners) {
                 const keepOpen = fn(message, { tab: { id: 1 } }, (response) => {
                   handled = true;
+                  // The collector says it started late, because the stage
+                  // injects it after the demo page has loaded. The extension
+                  // declares it at document_start, so on a real page this log
+                  // would be a whole one, and the stage shows it as one.
+                  if (response?.collected) delete response.collected.late;
                   resolve(response);
                 });
                 if (keepOpen === true) handled = true;

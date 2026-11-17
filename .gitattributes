@@ -1,3 +1,75 @@
 # The golden prompts are compared byte for byte, so they keep LF on every
 # platform, including a Windows checkout with core.autocrlf on.
 test/golden/*.txt text eol=lf
+
+# The same for the text the release zip ships, and only for the text: git
+# converts exactly the files tools/build.mjs converts, which are LICENSE and
+# the extensions in its TEXT_EXTENSIONS. The build packs those with LF
+# whatever the checkout holds, so the checksum does not depend on this; it
+# keeps an unpacked load of a Windows checkout byte for byte the same as the
+# zip. test/build.test.mjs fails when the two lists part.
+#
+# Anything else in the shipped folders is never converted, so an image or a
+# font is committed and checked out as it is. A plain `text` on a whole
+# folder calls every file in it text, and git would strip the CR from the
+# CR LF that every PNG carries in its first eight bytes.
+content/** -text
+content/**/*.js text eol=lf
+content/**/*.mjs text eol=lf
+content/**/*.json text eol=lf
+content/**/*.html text eol=lf
+content/**/*.css text eol=lf
+content/**/*.svg text eol=lf
+content/**/*.txt text eol=lf
+content/**/*.md text eol=lf
+
+shared/** -text
+shared/**/*.js text eol=lf
+shared/**/*.mjs text eol=lf
+shared/**/*.json text eol=lf
+shared/**/*.html text eol=lf
+shared/**/*.css text eol=lf
+shared/**/*.svg text eol=lf
+shared/**/*.txt text eol=lf
+shared/**/*.md text eol=lf
+
+sidepanel/** -text
+sidepanel/**/*.js text eol=lf
+sidepanel/**/*.mjs text eol=lf
+sidepanel/**/*.json text eol=lf
+sidepanel/**/*.html text eol=lf
+sidepanel/**/*.css text eol=lf
+sidepanel/**/*.svg text eol=lf
+sidepanel/**/*.txt text eol=lf
+sidepanel/**/*.md text eol=lf
+
+icons/** -text
+icons/**/*.js text eol=lf
+icons/**/*.mjs text eol=lf
+icons/**/*.json text eol=lf
+icons/**/*.html text eol=lf
+icons/**/*.css text eol=lf
+icons/**/*.svg text eol=lf
+icons/**/*.txt text eol=lf
+icons/**/*.md text eol=lf
+
+# LICENSE at any depth, as the build has it, and the files at the top.
+LICENSE text eol=lf
+manifest.json text eol=lf
+background.js text eol=lf
+
+# Binary wherever it is (no diff, no merge, no conversion), whatever
+# core.autocrlf says and whatever git would guess from the content.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.avif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.otf binary
+*.wasm binary
+*.zip binary

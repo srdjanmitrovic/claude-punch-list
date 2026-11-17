@@ -3,6 +3,7 @@
   "name": "Punch List for Claude Code",
   "version": "0.5.0",
   "description": "Mark bugs and suggestions on any page, then hand Claude Code one prompt with every screenshot and the console behind them.",
+  "incognito": "not_allowed",
   "minimum_chrome_version": "116",
 
   "permissions": [

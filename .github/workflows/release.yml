@@ -1,8 +1,22 @@
 # Build the extension zip and attach it to a GitHub release.
 #
-# Triggered by pushing a version tag:
+# A version is released once. Bump "version" in manifest.json and
+# package.json in the change that alters what ships, and merge it: a push to
+# main whose version has no tag yet tags that commit v<version>, builds the
+# zip and publishes the release. Pushing the tag yourself does the same, for
+# the commit the tag is on, on main or not:
 #
-#     git tag v0.1.0 && git push origin v0.1.0
+#     git tag v0.6.0 && git push origin v0.6.0
+#
+# A manual run (Run workflow) from main releases a version that has no tag
+# yet, or one that is tagged but has no release, from the tag, when nothing
+# it ships has changed since the tag. For a version already released it does
+# nothing when nothing it ships has changed since. Once a version is tagged,
+# a change to what it ships fails the run and asks for a version bump,
+# whether or not the tag has a release, as a push to main does. Run from a
+# tag, it does what pushing that tag does, which is how a tag that never got
+# a release is released as it is; run from any other branch, it fails.
+# tools/release-check.mjs makes every one of these decisions.
 #
 # The build has no dependencies, so there is no install step and no lockfile.
 
@@ -10,6 +24,7 @@ name: Release
 
 on:
   push:
+    branches: [main]
     tags:
       - "v*"
   workflow_dispatch:
@@ -17,36 +32,54 @@ on:
 permissions:
   contents: write
 
+# A push to main and a tag pushed with it arrive as two runs. One at a time,
+# so the second finds the release the first made and stops.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   release:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Every tag, and the history to compare the shipped files with the
+          # last release.
+          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
 
-      - name: Check the tag matches the manifest version
-        run: |
-          TAG="${GITHUB_REF_NAME#v}"
-          MANIFEST=$(node -p "require('./manifest.json').version")
-          if [ "$TAG" != "$MANIFEST" ]; then
-            echo "Tag $GITHUB_REF_NAME does not match manifest version $MANIFEST." >&2
-            echo "Bump manifest.json and package.json, then retag." >&2
-            exit 1
-          fi
-          echo "version=$MANIFEST" >> "$GITHUB_ENV"
+      - name: Decide what to release
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node tools/release-check.mjs
+
+      # The commit to release is this run's own, except for a tag that never
+      # got a release, which is built from the tag so that its checksum is
+      # the one a local build of the tag gives.
+      - name: Check out the commit to release
+        if: steps.plan.outputs.publish == 'true'
+        run: git checkout --detach "${{ steps.plan.outputs.commit }}"
 
       - name: Test
+        if: steps.plan.outputs.publish == 'true'
         run: npm test
 
       - name: Build
+        if: steps.plan.outputs.publish == 'true'
         run: node tools/build.mjs
 
       - name: Publish
+        if: steps.plan.outputs.publish == 'true'
         uses: softprops/action-gh-release@v2
         with:
+          # Creates the tag at that commit when it does not exist yet.
+          tag_name: ${{ steps.plan.outputs.tag }}
+          target_commitish: ${{ steps.plan.outputs.commit }}
           files: |
             dist/*.zip
             dist/*.sha256
@@ -54,10 +87,11 @@ jobs:
           body: |
             ## Install
 
-            1. Download `claude-punch-list-v${{ env.version }}.zip` below and unzip it.
+            1. Download `claude-punch-list-v${{ steps.plan.outputs.version }}.zip` below and unzip it.
             2. Open `chrome://extensions` and turn on **Developer mode**.
             3. Click **Load unpacked** and select the unzipped folder.
             4. Reload any tab you want to debug, so the collector can arm on it.
 
-            Requires Chrome 116 or newer. The `.sha256` file contains the archive checksum;
-            builds are reproducible, so building the same tag locally gives the same hash.
+            Requires Chrome 116 or newer. The `.sha256` file contains the archive checksum.
+            Builds are reproducible, so building the same tag locally with `node tools/build.mjs`
+            gives the same hash, whatever the platform or the Node version.

@@ -182,6 +182,8 @@ export function loadPanel({
   const runtimeListeners = [];
   const sent = [];
   const shots = { next: [] };
+  const ports = []; // every port the panel opened, with what it posted
+
 
   const document = {
     activeElement: null,
@@ -214,6 +216,31 @@ export function loadPanel({
         } catch (error) {
           return Promise.reject(error);
         }
+      },
+      // A port to the worker. posted holds what the panel sent on it; the
+      // test closes it from the worker's end with close().
+      connect: ({ name } = {}) => {
+        const onDisconnect = [];
+        const port = {
+          name,
+          posted: [],
+          disconnected: false,
+          postMessage(message) {
+            if (port.disconnected) throw new Error('Attempting to use a disconnected port object');
+            port.posted.push(JSON.parse(JSON.stringify(message)));
+          },
+          disconnect() {
+            port.disconnected = true;
+          },
+          onDisconnect: { addListener: (fn) => onDisconnect.push(fn) },
+          onMessage: { addListener() {} },
+          close() {
+            port.disconnected = true;
+            for (const fn of onDisconnect) fn(port);
+          },
+        };
+        ports.push(port);
+        return port;
       },
     },
     tabs: {
@@ -285,6 +312,7 @@ export function loadPanel({
     clock,
     sent,
     shots,
+    ports,
     internals,
     element,
     /** Which mode buttons are lit. */
@@ -302,6 +330,10 @@ export function loadPanel({
       for (const listener of documentListeners.get('keydown') || []) {
         listener({ key, isComposing: false, metaKey: false, ctrlKey: false, preventDefault() {} });
       }
+    },
+    /** Fire the document's own listeners for `type` with `event`. */
+    documentEvent(type, event = {}) {
+      for (const listener of documentListeners.get(type) || []) listener(event);
     },
     /** A broadcast, from a content script on `tabId` or from the worker. */
     broadcast(message, sender = {}) {

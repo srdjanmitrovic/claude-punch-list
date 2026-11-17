@@ -4,7 +4,10 @@
     python3 tools/make-gif.py                      # docs/media/frames -> docs/media/demo.gif
     python3 tools/make-gif.py frames out.gif 900   # explicit paths and output width
 
-Needs Pillow (python3 -m pip install Pillow), which macOS ships with. One
+Needs Pillow, which no Python ships with, macOS's included. For macOS's own
+/usr/bin/python3, `python3 -m pip install --user Pillow` works. A Homebrew or
+Linux distribution Python refuses pip outside a virtual environment (PEP 668),
+so there, make one and install Pillow into it. One
 palette is computed from a spread of frames and applied to all of them, so the
 interface does not flicker between frames the way per-frame palettes make it.
 No dithering: the panel is flat colour and dithering would only add noise and

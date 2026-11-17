@@ -306,3 +306,189 @@ test('worker: a probe waits for an arm still landing', async () => {
   await flush();
   assert.deepEqual(await worker.settled(answer), { ok: true, mode: 'region' });
 });
+
+// F29. The stop a disarm queued was a function, which reached the page ahead
+// of an arm whose file Chrome was still reading. With the worker stopped in
+// the wait that follows, nothing sent another stop, and the overlay that
+// landed after it stayed up.
+test('worker: a disarm takes down an arm still being read, though the worker is stopped straight after', async () => {
+  const worker = loadWorker({ holdFiles: true });
+  worker.send({ type: 'cdr:arm', mode: 'region', tabId: TAB, armId: 'a' });
+  await flush();
+  worker.send({ type: 'cdr:disarm', tabId: TAB });
+  await flush();
+  worker.kill();
+  worker.releaseFiles();
+  await flush();
+  assert.equal(worker.pages[TAB].live(), null, 'the overlay landed after the only stop, and stayed');
+});
+
+// F29. A worker stopped while an arm waited for document_idle: the panel's
+// request failed, it went dark and sent a disarm, which a new worker that
+// never heard of the arm answered with a stop the page ran at once, before
+// the arm. The overlay then landed with the button dark.
+test('worker: a disarm from a worker started afresh still comes after an arm the stopped one sent', async () => {
+  const page = new FakePage({ idle: false });
+  const first = loadWorker({ pages: { [TAB]: page } });
+  first.send({ type: 'cdr:arm', mode: 'region', tabId: TAB, armId: 'a' });
+  await flush();
+  first.kill();
+
+  const second = loadWorker({ pages: { [TAB]: page } });
+  const reply = second.send({ type: 'cdr:disarm', tabId: TAB });
+  await second.clock.advance(200);
+  assert.deepEqual(await second.settled(reply), { ok: true, superseded: false });
+  page.reachIdle();
+  await flush();
+  assert.equal(page.live(), null, 'the arm landed after every stop the new worker sent');
+});
+
+// The stop now always queued must not cancel an arm asked for after the
+// disarm: it is a file asked for before that arm's file, so it runs first.
+test('worker: the stop a disarm queues does not take down an arm asked for after it', async () => {
+  const page = new FakePage({ idle: false });
+  const worker = loadWorker({ pages: { [TAB]: page }, holdFiles: true });
+  worker.send({ type: 'cdr:disarm', tabId: TAB });
+  await flush();
+  worker.send({ type: 'cdr:arm', mode: 'element', tabId: TAB, armId: 'b' });
+  await flush();
+  worker.releaseFiles();
+  page.reachIdle();
+  await worker.clock.advance(1500);
+  assert.equal(page.live(), 'element');
+});
+
+// F28. The shortcut arms Region again in the two frames between a drag's
+// release and its message. The message named only its mode, so it ended the
+// newer arm, and a panel opening later showed the page unarmed.
+test('worker: a late message from an earlier run does not end a newer arm of the same mode', async () => {
+  const page = new FakePage({ runs: true });
+  const worker = loadWorker({ pages: { [TAB]: page } });
+  await armed(worker, 'region');
+  assert.equal(worker.internals.armedByTab.get(TAB)?.run, 'run-1');
+  assert.equal(worker.broadcasts.at(-1).run, 'run-1');
+
+  page.window.__cdrRegionOverlay.stop(); // the drag's release
+  await armed(worker, 'region'); // the shortcut, before the drag's message
+  assert.equal(worker.internals.armedByTab.get(TAB)?.run, 'run-2');
+
+  await worker.send({ type: 'cdr:region-selected', rect: {}, viewport: {}, run: 'run-1' }, fromTab);
+  assert.equal(worker.internals.armedByTab.get(TAB)?.mode, 'region', 'the late drag ended the newer arm');
+  const check = await worker.settled(worker.send({ type: 'cdr:check-tab', tabId: TAB }));
+  assert.equal(check.run, 'run-2');
+
+  await worker.send({ type: 'cdr:capture-cancelled', mode: 'region', run: 'run-2' }, fromTab);
+  assert.equal(worker.internals.armedByTab.has(TAB), false);
+});
+
+/** setup for loadWorker: the shipped content_scripts entries with `fields` put over each. */
+const narrowedTo = (fields) => (chrome) => {
+  const real = chrome.runtime.getManifest();
+  chrome.runtime.getManifest = () => ({
+    ...real,
+    content_scripts: real.content_scripts.map((entry) => ({ ...entry, ...fields })),
+  });
+};
+
+// Low in the last regression check (Z1, Z4): an include glob with no '/'
+// before its path text, such as '*app*' or '*app/*', was taken to keep every
+// site out, so a single page app that had moved off it lost its running
+// collector's log after a reload of the extension. Chrome runs a script with
+// include_globs ['*app*'] on https://any.site/app, so the site is declared.
+test('worker: an include glob declares a site when some URL of the site matches it', async () => {
+  const URL_ = 'http://127.0.0.1:8861/settings';
+  const cases = [
+    [{ include_globs: ['*app*'] }, URL_, true],
+    [{ include_globs: ['*app/*'] }, URL_, true],
+    [{ include_globs: ['*admin*'] }, URL_, true],
+    [{ include_globs: ['*nothing*'] }, URL_, true],
+    [{ include_globs: ['*/app/*'] }, URL_, true],
+    [{ include_globs: ['http://*/app/*'] }, URL_, true],
+    [{ include_globs: ['http://*/app/*'] }, 'https://shop.test/settings', false],
+    // A glob about hosts still keeps other hosts out.
+    [{ include_globs: ['*://*.example.com/*'] }, 'https://shop.example.com/settings', true],
+    [{ include_globs: ['*://*.example.com/*'] }, 'https://bank.test/settings', false],
+    [{ include_globs: ['http://127.0.0.1:*'] }, 'http://localhost:8861/settings', false],
+    // An exclude keeps the site out only when it matches every URL of it.
+    [{ exclude_globs: ['*admin*'] }, URL_, true],
+    [{ exclude_globs: ['*app*'] }, URL_, true],
+    [{ exclude_globs: ['*://localhost:*/*'] }, 'http://localhost:8861/settings', false],
+    [{ exclude_globs: ['*://localhost:*/*'] }, URL_, true],
+    [{ exclude_matches: ['http://localhost/*'] }, 'http://localhost:8861/settings', false],
+  ];
+  const wrong = cases.filter(([fields, url, expected]) => {
+    const { collectorSiteDeclaredFor } = loadWorker({ setup: narrowedTo(fields) }).internals;
+    return collectorSiteDeclaredFor(url) !== expected;
+  });
+  assert.deepEqual(wrong, []);
+
+  // The single page app that loaded at /app/spa under the glob and moved to
+  // /settings: its collector, still running, is bridged.
+  for (const glob of ['*app*', '*app/*']) {
+    const page = new FakePage({ url: URL_ });
+    page.window.__cdrCollector = true; // answers the probe as the running collector does
+    const worker = loadWorker({ pages: { [TAB]: page }, setup: narrowedTo({ include_globs: [glob] }) });
+    assert.deepEqual(await worker.settled(worker.send({ type: 'cdr:collect', tabId: TAB })), { ok: true, fresh: false }, glob);
+    assert.deepEqual(worker.injections.filter((i) => i.file).map((i) => i.file), ['content/collector-bridge.js']);
+  }
+});
+
+// Low in the check of that fix (L2): the URL built from a glob's text was
+// tried as it was written, so a glob whose text no URL holds as Chrome writes
+// it ('café' is 'caf%C3%A9' in a path, a query or a fragment, a space is
+// '%20') declared every site, and so did an include glob the same entry's
+// exclude glob cancels. In both cases Chrome runs the collector on no URL of
+// the site, so the page must get no probe and no bridge.
+test('worker: a site is declared only when Chrome would run the collector on some URL of it', async () => {
+  const URL_ = 'http://127.0.0.1:8861/forger';
+  const cases = [
+    [{ include_globs: ['*café*'] }, false],
+    [{ include_globs: ['*a b*'] }, false],
+    [{ include_globs: ['*"x*'] }, false],
+    [{ include_globs: ['*caf%C3%A9*'] }, true],
+    [{ include_globs: ['*app*'], exclude_globs: ['*app*'] }, false],
+    [{ include_globs: ['*admin*'], exclude_globs: ['*admin*'] }, false],
+    [{ include_globs: ['*app/*'], exclude_globs: ['*app/*'] }, false],
+    [{ include_globs: ['*app*'], exclude_globs: ['*app/admin*'] }, true],
+    // Chrome runs this on /xapp, which the exclude leaves in.
+    [{ include_globs: ['*app*'], exclude_matches: ['http://127.0.0.1/app*'] }, true, '/app'],
+    // Medium in the last verification (C2): on a URL the excludes take out,
+    // an exclude that also takes out the other URLs tried (the root, a
+    // pattern's own path) lost a running collector. Each path is where the
+    // tab was in Chrome.
+    [{ exclude_matches: ['http://127.0.0.1/'] }, true, '/'],
+    [{ exclude_globs: ['*/'] }, true, '/app/'],
+    [{ exclude_globs: ['*:8861/', '*settings*'] }, true, '/settings'],
+    [{ matches: ['*://*/app/*'], exclude_matches: ['*://*/app/'] }, true, '/settings'],
+    [{ include_globs: ['*/app/*'], exclude_globs: ['*/app/'] }, true, '/settings'],
+    [{ matches: ['http://*/*.html'], exclude_globs: ['*/.html'] }, true, '/settings'],
+    [{ matches: ['http://127.0.0.1/app*'], exclude_globs: ['*/app'] }, true, '/settings'],
+    // A pattern's path and a glob that meet only on a longer URL (/app/admin).
+    [{ matches: ['*://*/app/*'], include_globs: ['*/admin*'] }, true, '/app/users'],
+    // A glob that meets a pattern's path only before it (/x.html).
+    [{ matches: ['http://*/*.html'], include_globs: ['*?x*'] }, true, '/app/x'],
+    // A glob that names a scheme is not tried as a path (a stated limit),
+    // though Chrome runs this one on /app.
+    [{ include_globs: ['*://*app*'], exclude_globs: ['*/'] }, false, '/app/'],
+    // A pattern's path as Chrome writes it.
+    [{ matches: ['http://127.0.0.1/ü/*'] }, true, '/%C3%BC/x'],
+    // And still out where nothing of the site gets it.
+    [{ exclude_matches: ['http://127.0.0.1/*'] }, false, '/'],
+    [{ exclude_globs: ['*127.0.0.1*'] }, false, '/settings'],
+    // A match pattern's ? is part of a query, not a wildcard.
+    [{ matches: ['http://127.0.0.1/page?mode=x'] }, true],
+    [{ matches: ['http://127.0.0.1/page?mode=x'], exclude_matches: ['http://127.0.0.1/page?mode=x'] }, false],
+  ];
+  const wrong = cases.filter(([fields, expected, at]) => {
+    const { collectorSiteDeclaredFor } = loadWorker({ setup: narrowedTo(fields) }).internals;
+    return collectorSiteDeclaredFor(at ? new URL(at, URL_).href : URL_) !== expected;
+  });
+  assert.deepEqual(wrong, []);
+
+  // The forging page of the check: it answers the probe, and gets nothing.
+  const page = new FakePage({ url: URL_ });
+  page.window.__cdrCollector = true;
+  const worker = loadWorker({ pages: { [TAB]: page }, setup: narrowedTo({ include_globs: ['*café*'] }) });
+  assert.deepEqual(await worker.settled(worker.send({ type: 'cdr:collect', tabId: TAB })), { ok: false, outside: 'site' });
+  assert.deepEqual(worker.injections, []);
+});

@@ -26,7 +26,10 @@
   --bg-sunken: #f1efea;
   --surface: #ffffff;
   --fg: #15151a;
-  --fg-dim: #6e6e78;
+  /* The darkest surface it sits on is --bg-sunken (the banner, the receipt,
+     the masthead), and against that it must still make 4.5:1. #6e6e78 made
+     4.39. */
+  --fg-dim: #686872;
   --rule: #dfddd7;
   --rule-strong: #c7c4bb;
   --proof: #b4126a;
@@ -159,6 +162,15 @@ body {
 }
 
 /* ------------------------------------------------------------------ notice */
+
+/* The live region around the banner. Sticky, because the panel document
+   scrolls once the sheet grows, and a banner in normal flow then lands above
+   the viewport where nobody sees it. Empty, it takes no room at all. */
+.notice-live {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+}
 
 /* Errors invert to a solid block instead of adopting a warning hue. It is the
    loudest thing the panel can do with no extra colour. */
@@ -385,6 +397,31 @@ main {
   margin-bottom: 9px;
 }
 
+/* Discard all, at the far end of the row from the actions that only change
+   the frame or the ticks. */
+.sheet-acts .far {
+  margin-left: auto;
+}
+
+/* The last discard and its Undo. A live region, so it stays in the layout and
+   collapses to nothing while there is nothing to undo. */
+.undo {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin: 0 0 12px;
+  padding: 8px 10px;
+  font-size: 10.5px;
+  color: var(--fg-dim);
+  border: 1px dashed var(--rule-strong);
+}
+
+.undo:empty {
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
 .list {
   display: flex;
   flex-direction: column;
@@ -427,9 +464,15 @@ main {
   opacity: 0.35;
 }
 
-/* Unticked: still on the sheet, not in the next prompt. */
-.row:not(.included) .row-pick {
+/* Unticked: still on the sheet, not in the next prompt. The thumbnail fades,
+   and the sentence steps down to the muted ink. Fading the text itself took
+   it to 2.96:1, and the readout above it to 1.86. */
+.row:not(.included) .row-thumb {
   opacity: 0.45;
+}
+
+.row:not(.included) .row-body {
+  color: var(--fg-dim);
 }
 
 .row-tick {
@@ -463,7 +506,6 @@ main {
   font: inherit;
   text-align: left;
   cursor: pointer;
-  transition: opacity 120ms;
 }
 
 /* The list clips its overflow to scroll, which would take the edges of the
@@ -479,6 +521,7 @@ main {
   overflow: hidden;
   border: 1px solid var(--rule);
   background: var(--bg-sunken);
+  transition: opacity 120ms;
 }
 
 /* Anchored top left rather than centred: a wide crop of a table row is
@@ -525,7 +568,9 @@ main {
 
 /* What a row says when hovered and its sentence did not fit: an ink block like
    the gauge, carrying the whole sentence in the human voice. Positioned by
-   panel.js. */
+   panel.js. It takes the pointer, so it can be moved onto and read at length
+   (and its text selected); panel.js keeps it open while the pointer is on it,
+   passes a click on it to what it covers, and Esc closes it. */
 .tip {
   position: fixed;
   z-index: 6;
@@ -533,7 +578,6 @@ main {
   padding: 7px 9px 8px;
   background: var(--fg);
   color: var(--bg);
-  pointer-events: none;
 }
 
 .tip-head {
@@ -671,9 +715,20 @@ textarea {
   min-height: 74px;
 }
 
+/* At full strength: faded to 0.8 it made 3.38:1 on the light surface and
+   3.74 on the dark one. It still reads as a placeholder by its muted ink
+   against the field's full ink. */
 textarea::placeholder {
   color: var(--fg-dim);
-  opacity: 0.8;
+  opacity: 1;
+}
+
+/* Said under the field when the caret is in it but the keys are not. */
+.field-hint {
+  margin: 6px 0 0;
+  font-size: 10.5px;
+  line-height: 1.5;
+  color: var(--fg-dim);
 }
 
 /* ------------------------------------------------------------------ chips -- */
@@ -791,6 +846,31 @@ textarea::placeholder {
   opacity: 0.7;
 }
 
+/* One line under the button: why it is held back, or the key that presses
+   it. Muted, since it qualifies the button rather than competing with it. */
+.send-note {
+  margin: 7px 0 0;
+  font-size: 10.5px;
+  line-height: 1.5;
+  color: var(--fg-dim);
+  text-align: center;
+}
+
+.send-note kbd {
+  margin-left: 3px;
+}
+
+/* The frame's shortcut line when nothing is bound: a sentence and a link
+   where the key caps would be. */
+.invite-keys .ghost-link {
+  margin-left: 5px;
+}
+
+.invite-unset {
+  font-size: 10.5px;
+  color: var(--fg-dim);
+}
+
 /* ---------------------------------------------------------------- receipt -- */
 
 .receipt {
@@ -814,6 +894,14 @@ textarea::placeholder {
   line-height: 1.55;
   color: var(--fg-dim);
   word-break: break-all;
+}
+
+/* What the copy could not vouch for, under the paths it is about. */
+.receipt-note {
+  margin: 6px 0 0;
+  font-size: 10.5px;
+  line-height: 1.5;
+  color: var(--fg-dim);
 }
 
 .receipt-acts {

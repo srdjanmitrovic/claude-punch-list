@@ -3,21 +3,23 @@
  * file parses, and the rules in CONTRIBUTING.md that fail silently in Chrome
  * fail loudly here.
  *
- * `npm run build` validates the paths the manifest names. Everything else
- * below, a typo in an injected script's path, a missing stylesheet, a syntax
- * error, would build clean and break at runtime.
+ * `npm run build` makes the same checks on what it packs, which is what git
+ * tracks. These make them on the working tree, so a typo in an injected
+ * script's path, a missing stylesheet or a syntax error fails here before
+ * anything is committed.
  */
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import vm from 'node:vm';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const read = (path) => readFileSync(join(ROOT, path), 'utf8');
+// Read with LF, as the build packs it, whatever line endings the checkout has.
+const read = (path) => readFileSync(join(ROOT, path), 'utf8').replace(/\r\n/g, '\n');
 const exists = (path) => existsSync(join(ROOT, path));
 const manifest = JSON.parse(read('manifest.json'));
 
@@ -63,13 +65,24 @@ test('static: every file panel.html loads exists', () => {
   }
 });
 
-test('static: every relative import resolves', () => {
-  for (const file of MODULES) {
-    for (const [, specifier] of read(file).matchAll(/^\s*import\s[^'"]*['"](\.{1,2}\/[^'"]+)['"]/gm)) {
-      const target = join(dirname(file), specifier);
-      assert.ok(exists(target), `${file} imports ${specifier}, which does not exist`);
-    }
-  }
+// The build's own check, on the working tree: V8 parses and links the
+// modules (never runs them), so an import written without spaces, with a
+// path from the root, or of a name the file does not export fails here as it
+// fails in Chrome. A pattern over the text saw only the first of these, and
+// only with a space before the quote.
+test('static: every import names a file, and every name imported is one it exports', async () => {
+  const { checkImports, INCLUDE } = await import(pathToFileURL(join(ROOT, 'tools', 'build.mjs')).href);
+  const walk = (path) =>
+    statSync(join(ROOT, path)).isDirectory()
+      ? readdirSync(join(ROOT, path)).flatMap((name) => walk(`${path}/${name}`))
+      : [path];
+  const entries = INCLUDE.filter(exists)
+    .flatMap(walk)
+    .map((name) => ({ name, data: readFileSync(join(ROOT, name)) }));
+  const roots = [manifest.background.service_worker, 'sidepanel/panel.js'];
+  const { problems, modules } = checkImports(entries, roots);
+  assert.deepEqual(problems, []);
+  for (const file of MODULES) assert.ok(modules.includes(file), `${file} is not reached from ${roots.join(' or ')}`);
 });
 
 test('static: content scripts compile as classic scripts', () => {
@@ -146,7 +159,9 @@ test('static: the picker masks what it sends, and nothing rewrites the secret wo
   assert.ok(returns.length > 0 && returns.every((value) => /^maskMarkup\(|^masked$/.test(value)), returns.join(', '));
   assert.match(body('maskedStart'), /const masked = maskMarkup\(/);
   assert.match(body('attributes'), /maskAttribute\(/);
-  assert.match(source, /inlineStyle: maskAttribute\('style'/);
+  // The inline style travels only inside the masked markup. It was once sent
+  // a second time as a field of its own, uncapped, that nothing read.
+  assert.doesNotMatch(source, /inlineStyle:/);
   assert.match(source, /text: visibleText\(element\)/);
   for (const file of ['content/picker.js', 'content/collector-main.js', 'shared/prompt-template.js']) {
     const text = read(file);
@@ -167,4 +182,19 @@ test('static: re-injected capture scripts declare nothing a second run would red
       `${file} declares something at the top level with const, let or class`
     );
   }
+});
+
+// A Chrome Web Store listing needs a privacy policy that stands alone and a
+// line saying the extension is not Anthropic's. Both live in PRIVACY.md, and
+// the README points at it, so the policy cannot drift out of reach unnoticed.
+test('static: PRIVACY.md says what is read and kept, that nothing leaves, and who it is not', () => {
+  assert.ok(exists('PRIVACY.md'), 'there is no PRIVACY.md');
+  const policy = read('PRIVACY.md');
+  assert.match(policy, /nothing leaves your computer/i);
+  assert.match(policy, /makes no network requests/);
+  assert.match(policy, /not affiliated with, endorsed by\s+or sponsored by Anthropic/);
+  for (const place of ['Downloads', 'chrome.storage.local', 'clipboard']) assert.ok(policy.includes(place), place);
+  // Every permission the manifest asks for is explained there.
+  for (const permission of manifest.permissions) assert.ok(policy.includes(`\`${permission}\``), permission);
+  assert.match(read('README.md'), /\]\(PRIVACY\.md\)/);
 });
