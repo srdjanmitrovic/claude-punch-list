@@ -16,12 +16,15 @@ jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
+      # Each Node version reports on its own, rather than one failure
+      # cancelling the other.
+      fail-fast: false
       matrix:
         node: ["20", "24"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node }}
 
@@ -38,11 +41,11 @@ jobs:
     if: github.event_name == 'pull_request' && github.base_ref == 'main'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0 # the tags, to compare with the last release
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "20"
 

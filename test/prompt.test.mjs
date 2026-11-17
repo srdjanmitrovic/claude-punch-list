@@ -206,6 +206,33 @@ function timedPrompt(report, limit) {
   return second.took < first.took ? second : first;
 }
 
+// A megabyte of parameters in a request url or a message, the places the
+// screening tests below fill.
+const MEGABYTE_PLACES = [
+  ['request url', (report, query) => report.network.push({ method: 'GET', url: `https://a.test/?${query}`, status: 500, ms: 1, t: 50 })],
+  ['message', (report, query) => report.consoleLines.push({ level: 'warn', text: `GET /x?${query}`, t: 50 })],
+];
+
+/**
+ * A time limit for screening a megabyte in one place, on this machine: the
+ * floor, or three times what a megabyte of plain parameters there takes,
+ * whichever is longer. GitHub's runners take three to four times as long as
+ * a laptop for all of it, so a fixed limit either fails there or passes the
+ * old cost on a laptop; three times plain still fails the costs these tests
+ * guard against, which were three to eight times plain on the same machine.
+ */
+function megabyteBudget(put, floor) {
+  const report = sampleReport('bug');
+  put(report, 'a=1&'.repeat(1 << 18));
+  let best = Infinity;
+  for (let run = 0; run < 3; run += 1) {
+    const started = performance.now();
+    buildPrompt(report);
+    best = Math.min(best, performance.now() - started);
+  }
+  return Math.max(floor, 3 * best);
+}
+
 test('prompt: a parameter name of a million characters is judged by its ends, in bounded time', () => {
   const long = 'aB'.repeat(500000);
   for (const [text, secret] of [[`GET /x?${long}=KEPT 500`, null], [`GET /x?${long}Token=F23A 500`, 'F23A'], [`GET /x?a_${'a_'.repeat(500000)}=KEPT 500`, null]]) {
@@ -246,8 +273,8 @@ test('prompt: text built against the new screening costs one pass', () => {
 
 // V5: JSON keys were judged word by word against every secret word, about
 // 300 ms for a megabyte of distinct long camelCase keys. Each shape here took
-// 180 to 330 ms before, and takes 13 to 80 now; the limit leaves room for a
-// busy machine and still fails the old cost.
+// 180 to 330 ms before, and takes 13 to 80 now; the limit (megabyteBudget)
+// leaves room for a busy or slow machine and still fails the old cost.
 test('prompt: a megabyte of distinct JSON keys is judged in bounded time', () => {
   const MB = 1 << 20;
   const build = (keyOf, perValue) => {
@@ -267,15 +294,14 @@ test('prompt: a megabyte of distinct JSON keys is judged in bounded time', () =>
     // Built to hold a secret word, so that no quick look rules them out.
     'secret word inside': build((index) => 'aB'.repeat(6) + 'xtokenx' + index.toString(36), 400),
   };
+  const budgets = new Map(MEGABYTE_PLACES.map(([place, put]) => [place, megabyteBudget(put, 150)]));
   for (const [shape, query] of Object.entries(shapes)) {
-    for (const [place, put] of [
-      ['request url', (report) => report.network.push({ method: 'GET', url: `https://a.test/?${query}`, status: 500, ms: 1, t: 50 })],
-      ['message', (report) => report.consoleLines.push({ level: 'warn', text: `GET /x?${query}`, t: 50 })],
-    ]) {
+    for (const [place, put] of MEGABYTE_PLACES) {
       const report = sampleReport('bug');
-      put(report);
-      const { took } = timedPrompt(report, 150);
-      assert.ok(took < 150, `${shape} in a ${place} took ${Math.round(took)} ms`);
+      put(report, query);
+      const limit = budgets.get(place);
+      const { took } = timedPrompt(report, limit);
+      assert.ok(took < limit, `${shape} in a ${place} took ${Math.round(took)} ms, over ${Math.round(limit)}`);
     }
   }
 });
@@ -1267,19 +1293,19 @@ test('prompt: data: content still encoded past the layers a value is followed th
 // R5: decodeURIComponent threw on every value with a byte that is no UTF-8,
 // and a megabyte of such values beside an encoded ?, #, @ or quote took 260
 // to 340 ms, most of it in the throws. About 45 to 65 ms now; the limit
-// leaves room for a busy machine and still fails the old cost.
+// (megabyteBudget) leaves room for a busy or slow machine and still fails
+// the old cost.
 test('prompt: a megabyte of values pairing a byte that is no UTF-8 with an encoded mark is screened in bounded time', () => {
   const MB = 1 << 20;
   const fill = (unit) => unit.repeat(Math.ceil(MB / unit.length)).slice(0, MB);
+  const budgets = new Map(MEGABYTE_PLACES.map(([place, put]) => [place, megabyteBudget(put, 150)]));
   for (const unit of ['a=%E9%3F&', 'a=%C0%3F&', 'a=%C0%40&', 'a=%FF%23&', 'a=%E9%22&']) {
-    for (const [place, put] of [
-      ['request url', (report, query) => report.network.push({ method: 'GET', url: `https://a.test/?${query}`, status: 500, ms: 1, t: 50 })],
-      ['message', (report, query) => report.consoleLines.push({ level: 'warn', text: `GET /x?${query}`, t: 50 })],
-    ]) {
+    for (const [place, put] of MEGABYTE_PLACES) {
       const report = sampleReport('bug');
       put(report, fill(unit));
-      const { took } = timedPrompt(report, 150);
-      assert.ok(took < 150, `${unit} in a ${place} took ${Math.round(took)} ms`);
+      const limit = budgets.get(place);
+      const { took } = timedPrompt(report, limit);
+      assert.ok(took < limit, `${unit} in a ${place} took ${Math.round(took)} ms, over ${Math.round(limit)}`);
     }
   }
 });

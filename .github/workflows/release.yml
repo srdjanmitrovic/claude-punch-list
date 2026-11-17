@@ -42,13 +42,13 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # Every tag, and the history to compare the shipped files with the
           # last release.
           fetch-depth: 0
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "20"
 
@@ -75,7 +75,7 @@ jobs:
 
       - name: Publish
         if: steps.plan.outputs.publish == 'true'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           # Creates the tag at that commit when it does not exist yet.
           tag_name: ${{ steps.plan.outputs.tag }}
