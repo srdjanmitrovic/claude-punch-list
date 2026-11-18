@@ -16,6 +16,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { buildPrompt } from '../shared/prompt-template.js';
 import { EXTRA, LONG_SELECTOR, MODES, sampleReport } from '../tools/preview-prompt.mjs';
 
@@ -996,9 +997,9 @@ test('prompt: a request\'s caller frame keeps its position past a secret in its 
 });
 
 test('preview: every golden sample renders by its name, as its golden file holds it (PJ12)', () => {
-  const preview = new URL('../tools/preview-prompt.mjs', import.meta.url);
+  const preview = fileURLToPath(new URL('../tools/preview-prompt.mjs', import.meta.url));
   for (const name of ['vue-and-failures', 'two-origins', 'elsewhere']) {
-    const printed = execFileSync(process.execPath, [preview.pathname, name], { env: { ...process.env, TZ: 'UTC' }, encoding: 'utf8' });
+    const printed = execFileSync(process.execPath, [preview, name], { env: { ...process.env, TZ: 'UTC' }, encoding: 'utf8' });
     const golden = readFileSync(new URL(`${name}.txt`, GOLDEN), 'utf8');
     // The golden file is the prompt and a newline; the preview adds a rule
     // and a count under it.
@@ -1664,15 +1665,16 @@ test('prompt: a megabyte page url in the form Chrome writes, with ten JSON a raw
 // V1-6: splitJson ran its patterns and a second decode on every url printed,
 // and a data: url's content was decoded once more than anything in it could
 // need, so a megabyte message of short urls carrying JSON took 2 to 3 times
-// what 0.6.0 took. On arm64 0.6.0 took 0.5 to 0.8 times the plain a=1&
-// message, and each shape now takes 0.9 to 1.25 times it, within twice
-// 0.6.0. x64 reads the first shape more slowly against the plain message:
-// 1.33 times it in a linux/amd64 container (0.6.0: 0.8) and 1.58 to 1.61 on
-// GitHub's runners, so the limit is 1.5 times the plain message on arm64
-// and 2 times it elsewhere. Each is the best of five, taken in turn so that
-// a slow spell of a shared runner weighs on both, and a shape over the
-// limit is measured once more.
-test('prompt: a megabyte message of short urls carrying JSON costs about what a plain one does (V1-6)', () => {
+// what 0.6.0 took. The decoding is counted, in characters handed to
+// decodeURIComponent, so no machine can move the result: each shape may hand
+// it no more than the plain a=1& message, whose names are decoded. Before the
+// fix the shapes handed it 3.5 to 8.7 times that; now, as in 0.6.0, a quarter
+// at most. The time is held only to megabyteBudget, which catches work that
+// grows out of bounds but not a slowdown under three times plain, such as
+// what the patterns added: a closer ratio of two times differs by CPU (the
+// first shape takes 1.2 to 1.3 times plain on arm64, 1.6 on GitHub's x64
+// runners).
+test('prompt: a megabyte message of short urls carrying JSON is decoded no more than a plain one, in bounded time (V1-6)', () => {
   const MB = 1 << 20;
   const fill = (unit) => unit.repeat(Math.ceil(MB / unit.length)).slice(0, MB);
   const reportOf = (text) => {
@@ -1680,26 +1682,30 @@ test('prompt: a megabyte message of short urls carrying JSON costs about what a 
     report.consoleLines.push({ level: 'warn', text, t: 50 });
     return report;
   };
-  const once = (report) => {
-    const started = performance.now();
-    buildPrompt(report);
-    return performance.now() - started;
+  const decoded = (report) => {
+    const decode = globalThis.decodeURIComponent;
+    let read = 0;
+    globalThis.decodeURIComponent = (part) => {
+      read += String(part).length;
+      return decode(part);
+    };
+    try {
+      buildPrompt(report);
+    } finally {
+      globalThis.decodeURIComponent = decode;
+    }
+    return read;
   };
-  const plainReport = reportOf(`GET /x?${fill('a=1&')}`);
-  const limit = process.arch === 'arm64' ? 1.5 : 2;
+  const plain = decoded(reportOf(`GET /x?${fill('a=1&')}`));
+  assert.ok(plain > 0, 'the plain message had nothing decoded, so the count compares nothing: either the template no longer calls the global decodeURIComponent, or it stopped decoding names that need none, and this test needs another baseline');
+  // The budget times the same plain message, in the message place.
+  const limit = megabyteBudget(MEGABYTE_PLACES[1][1], 150);
   for (const unit of ['/x?s={"a":1}%20 ', '/x?s={"\\u0061":1}%20 ', 'data:,{"a":"b"}%20 ', 'data:,%7B%22a%22:1%7D?x ']) {
     const report = reportOf(fill(unit));
-    let least = null;
-    for (let attempt = 0; attempt < 2 && !(least && least.took < limit * least.plain); attempt += 1) {
-      let plain = Infinity;
-      let took = Infinity;
-      for (let run = 0; run < 5; run += 1) {
-        plain = Math.min(plain, once(plainReport));
-        took = Math.min(took, once(report));
-      }
-      if (!least || took / plain < least.took / least.plain) least = { plain, took };
-    }
-    assert.ok(least.took < limit * least.plain, `${unit} took ${Math.round(least.took)} ms, a plain message ${Math.round(least.plain)}, over ${limit} times`);
+    const read = decoded(report);
+    assert.ok(read <= plain, `${unit} had ${read} characters decoded, a plain message ${plain}`);
+    const { took } = timedPrompt(report, limit);
+    assert.ok(took < limit, `${unit} took ${Math.round(took)} ms, over ${Math.round(limit)}`);
   }
 });
 

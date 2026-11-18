@@ -90,11 +90,16 @@ test('bridge: injected into a page that has run for a while, it still finds the 
   assert.deepEqual(tab.posted, []);
 });
 
+// The forged console holds more entries than the 30 a collector keeps, with
+// text and frames longer than the most a collector sends, so each cut shows.
+// Over the window the bridge waits a second for the answer, on a timer of its
+// world; that timer runs on a clock the test never moves, so the answer is
+// read however long the machine takes to clone it.
 test('bridge: whatever answers in the collector\'s place is rebuilt to the shape the panel reads (CO11)', async () => {
   const hostile = {
-    console: Array.from({ length: 500 }, (_, i) => ({
+    console: Array.from({ length: 40 }, (_, i) => ({
       level: 'error',
-      text: 'x'.repeat(100000),
+      text: 'x'.repeat(10000),
       t: i === 0 ? 'soon' : i,
       seq: Number.NaN,
       caller: ['a'.repeat(1000), 5, 'b', 'c'],
@@ -110,7 +115,7 @@ test('bridge: whatever answers in the collector\'s place is rebuilt to the shape
 
   // Over the window, as a collector of 0.5.0 answers, here a page script
   // answering in its place.
-  const overMessage = world();
+  const overMessage = world({ clock: makeClock() });
   overMessage.realm(`
     window.addEventListener('message', (event) => {
       if (event.data && event.data.__cdr === 'request') {
