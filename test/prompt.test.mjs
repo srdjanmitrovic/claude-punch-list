@@ -1665,26 +1665,37 @@ test('prompt: a megabyte page url in the form Chrome writes, with ten JSON a raw
 // and a data: url's content was decoded once more than anything in it could
 // need, so a megabyte message of short urls carrying JSON took 2 to 3 times
 // what 0.6.0 took. 0.6.0 took 0.55 to 0.75 times the plain a=1& message; each
-// shape now takes 0.9 to 1.25 times it, within twice 0.6.0. The limit, 1.5
-// times the plain message, best of five each, scales with the machine.
+// shape now takes 0.9 to 1.25 times it, within twice 0.6.0 (0.85 to 1.35 on
+// x64). The limit, 1.5 times the plain message, scales with the machine:
+// each is the best of five, taken in turn so that a slow spell of a shared
+// runner weighs on both, and a shape over it is measured once more.
 test('prompt: a megabyte message of short urls carrying JSON costs about what a plain one does (V1-6)', () => {
   const MB = 1 << 20;
   const fill = (unit) => unit.repeat(Math.ceil(MB / unit.length)).slice(0, MB);
-  const best = (text) => {
+  const reportOf = (text) => {
     const report = sampleReport('bug');
     report.consoleLines.push({ level: 'warn', text, t: 50 });
-    let least = Infinity;
-    for (let run = 0; run < 5; run += 1) {
-      const started = performance.now();
-      buildPrompt(report);
-      least = Math.min(least, performance.now() - started);
-    }
-    return least;
+    return report;
   };
-  const plain = best(`GET /x?${fill('a=1&')}`);
+  const once = (report) => {
+    const started = performance.now();
+    buildPrompt(report);
+    return performance.now() - started;
+  };
+  const plainReport = reportOf(`GET /x?${fill('a=1&')}`);
   for (const unit of ['/x?s={"a":1}%20 ', '/x?s={"\\u0061":1}%20 ', 'data:,{"a":"b"}%20 ', 'data:,%7B%22a%22:1%7D?x ']) {
-    const took = best(fill(unit));
-    assert.ok(took < 1.5 * plain, `${unit} took ${Math.round(took)} ms, a plain message ${Math.round(plain)}`);
+    const report = reportOf(fill(unit));
+    let least = null;
+    for (let attempt = 0; attempt < 2 && !(least && least.took < 1.5 * least.plain); attempt += 1) {
+      let plain = Infinity;
+      let took = Infinity;
+      for (let run = 0; run < 5; run += 1) {
+        plain = Math.min(plain, once(plainReport));
+        took = Math.min(took, once(report));
+      }
+      if (!least || took / plain < least.took / least.plain) least = { plain, took };
+    }
+    assert.ok(least.took < 1.5 * least.plain, `${unit} took ${Math.round(least.took)} ms, a plain message ${Math.round(least.plain)}`);
   }
 });
 

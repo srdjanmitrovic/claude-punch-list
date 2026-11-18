@@ -666,6 +666,10 @@ test('bridge: a change its listener failed to take is posted at the next read, w
   assert.deepEqual(panel.posted.at(-1), { type: 'cdr:counts', console: 3, network: 0 }, 'the counts no longer follow the log');
 });
 
+// The page logs from the 1,600 calls nearest the stack's limit on its way
+// back. From the nearest 400 nothing was recorded on x64 (Node 22, Linux),
+// where recording takes more stack than on arm64: the first entries came
+// between 400 and 500 calls from the limit there, and within 400 on arm64.
 test('bridge: a page that logs on its way back from a stack overflow has nothing reported in the tab, and the counts match the log by its next line (F46)', async () => {
   const { tab, clock } = counted();
   const panel = tab.connect('cdr:counts');
@@ -675,7 +679,7 @@ test('bridge: a page that logs on its way back from a stack overflow has nothing
       try {
         sweep();
       } catch {}
-      if (attempts < 400) {
+      if (attempts < 1600) {
         attempts += 1;
         try {
           console.warn('deep');
