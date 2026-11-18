@@ -112,12 +112,14 @@ still supported. They live in `test/`:
 * `test/panel-ui.test.mjs` runs the panel in the same realm, with `panel.html` and `panel.css`
   read as text, and checks what it says and where the keyboard goes: the live regions, the line
   under Copy, the shortcut Chrome has bound, the contrast of muted text in both themes, the row
-  tooltip, the chips and the port that keeps them current, where focus goes after a copy, and the
-  keys handed on to the page while a mode is armed.
+  tooltip, the chips and the port that keeps them current, where focus goes after a copy, the
+  keys handed on to the page while a mode is armed, and the keys and drags that move a row (rows
+  are laid out with `panel.layOutRows()`, and `makeDataTransfer()` stands in for Chrome's).
 * `test/sheet.test.mjs` runs one panel realm per window over one shared storage and one downloads
   list, as the side panels of two windows share them in Chrome, and checks what survives two
-  windows writing at once, which files a discard, a copy or the weekly expiry deletes, and what
-  the panel says about a file it cannot find.
+  windows writing at once, the order of the sheet across windows, reopens and undo, which files a
+  discard, a copy or the weekly expiry deletes, and what the panel says about a file it cannot
+  find.
 * `test/static.test.mjs` checks what would otherwise only fail in Chrome: every file the manifest,
   the worker and the panel name exists, every file parses, the re-injected capture scripts
   declare nothing at the top level, the copies of the secret name blocks agree, and `PRIVACY.md`

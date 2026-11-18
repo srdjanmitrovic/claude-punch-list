@@ -12,7 +12,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { defaultWorker, loadPanel } from './support/panel-realm.mjs';
+import { defaultWorker, loadPanel, makeDataTransfer } from './support/panel-realm.mjs';
 
 const TAB = 7;
 const fromTab = { tab: { id: TAB } };
@@ -1231,8 +1231,11 @@ test('SS6: every item passed to the template carries its number on the sheet', a
 
 // ----------------------------------------------------------------- UX14 --
 
-/** A panel whose chrome.scripting records each key handed to the page. */
-async function armedWithScripting(mode) {
+/**
+ * A panel whose chrome.scripting records each key handed to the page, with
+ * `captures` region captures on the sheet before the mode is armed.
+ */
+async function armedWithScripting(mode, { captures = 0 } = {}) {
   const handed = [];
   const panel = await started({
     setup: (chrome) => {
@@ -1244,6 +1247,7 @@ async function armedWithScripting(mode) {
       };
     },
   });
+  for (let i = 0; i < captures; i += 1) await captureRegion(panel);
   panel.click(mode === 'element' ? 'mode-element' : 'mode-region');
   await panel.flush();
   await panel.flush();
@@ -1299,4 +1303,425 @@ test('UX14: the keys stay in the panel in a text field, on another button, or wi
   realm.document.activeElement = null;
   assert.equal(press(panel, 'ArrowDown'), false, 'a key went to a page with nothing armed');
   assert.deepEqual(handed, []);
+});
+
+/** Make focus() move the realm's document.activeElement, as it does in Chrome. Returns the undo. */
+function trackFocus(panel) {
+  const realm = realmOf(panel);
+  const proto = Object.getPrototypeOf(panel.element('list'));
+  const original = proto.focus;
+  proto.focus = function () {
+    realm.document.activeElement = this;
+  };
+  return () => (proto.focus = original);
+}
+
+/** The items on the sheet, copied out of the panel's realm. */
+function sheet(panel) {
+  return [...panel.internals.state.items];
+}
+
+test('UX14: Alt with the up or down arrow moves the row the keyboard is on, and says where it went', async () => {
+  const panel = await started();
+  for (let i = 0; i < 3; i += 1) await captureRegion(panel);
+  const realm = realmOf(panel);
+  const untrack = trackFocus(panel);
+  try {
+    const [first, second, third] = sheet(panel);
+    const framed = panel.internals.state.selectedId;
+    const said = () => panel.element('announce').textContent;
+
+    realm.document.activeElement = row(panel, 2).pick;
+    assert.equal(press(panel, 'ArrowUp', { altKey: true }), true);
+    assert.deepEqual(sheet(panel), [first, third, second]);
+    assert.equal(said(), 'Item 3 is now item 2 of 3.');
+    assert.equal(realm.document.activeElement, row(panel, 1).pick, 'the keyboard did not stay on the moved row');
+    assert.equal(panel.internals.state.selectedId, framed, 'a move changed the item in the frame');
+
+    // From the row's tick too.
+    realm.document.activeElement = row(panel, 0).node.children[0].children[0];
+    assert.equal(press(panel, 'ArrowDown', { altKey: true }), true);
+    assert.deepEqual(sheet(panel), [third, first, second]);
+    assert.equal(said(), 'Item 1 is now item 2 of 3.');
+    assert.equal(realm.document.activeElement, row(panel, 1).pick);
+
+    // At either end nothing moves, and the status line says why.
+    realm.document.activeElement = row(panel, 0).pick;
+    assert.equal(press(panel, 'ArrowUp', { altKey: true }), true);
+    assert.equal(said(), 'Item 1 is already first.');
+    realm.document.activeElement = row(panel, 2).pick;
+    assert.equal(press(panel, 'ArrowDown', { altKey: true }), true);
+    assert.equal(said(), 'Item 3 is already last.');
+    assert.deepEqual(sheet(panel), [third, first, second]);
+
+    // Another modifier with it, or the keyboard off the sheet: not a move.
+    for (const extra of [{ shiftKey: true }, { ctrlKey: true }, { metaKey: true }, { isComposing: true }]) {
+      realm.document.activeElement = row(panel, 1).pick;
+      assert.equal(press(panel, 'ArrowUp', { altKey: true, ...extra }), false, JSON.stringify(extra));
+    }
+    realm.document.activeElement = panel.element('submit');
+    assert.equal(press(panel, 'ArrowUp', { altKey: true }), false);
+    realm.document.activeElement = row(panel, 1).pick;
+    assert.equal(press(panel, 'ArrowUp'), false, 'an arrow alone moved the row');
+    assert.deepEqual(sheet(panel), [third, first, second]);
+  } finally {
+    untrack();
+  }
+});
+
+test('UX14: with a mode armed, Alt and an arrow move the row the keyboard is on, and from the mode button still go on to the page', async () => {
+  const { panel, handed } = await armedWithScripting('region', { captures: 2 });
+  const realm = realmOf(panel);
+  const [first, second] = sheet(panel);
+  realm.document.activeElement = row(panel, 1).pick;
+  assert.equal(press(panel, 'ArrowUp', { altKey: true }), true);
+  await panel.flush();
+  assert.deepEqual(sheet(panel), [second, first]);
+  assert.deepEqual(handed, [], 'the overlay was nudged by a key that moved a row');
+  assert.deepEqual(panel.lit(), ['region'], 'the move disarmed the mode');
+
+  realm.document.activeElement = panel.element('mode-region');
+  assert.equal(press(panel, 'ArrowUp', { altKey: true }), true);
+  await panel.flush();
+  assert.deepEqual(
+    handed.map(({ tabId, args }) => [tabId, ...args]),
+    [[TAB, 'region', 'ArrowUp', false, true]]
+  );
+  assert.deepEqual(sheet(panel), [second, first]);
+});
+
+test('UX14: a line the status region already holds is said again, not left as it was', async () => {
+  const panel = await started();
+  for (let i = 0; i < 3; i += 1) await captureRegion(panel);
+  const realm = realmOf(panel);
+  const untrack = trackFocus(panel);
+  try {
+    const [first, second, third] = sheet(panel);
+    const said = () => panel.element('announce').textContent;
+    realm.document.activeElement = row(panel, 0).pick;
+    press(panel, 'ArrowUp', { altKey: true });
+    assert.equal(said(), 'Item 1 is already first.');
+    // Pressed again: the region empties and takes the line back a moment
+    // later, a change a screen reader reads, where the same text set again
+    // may not be.
+    press(panel, 'ArrowUp', { altKey: true });
+    assert.equal(said(), '', 'the second press left the region as it was');
+    await panel.clock.advance(99);
+    assert.equal(said(), '');
+    await panel.clock.advance(1);
+    assert.equal(said(), 'Item 1 is already first.');
+
+    // What is said in the meantime is not overwritten by the line on its way
+    // back: a copy's receipt, or a move.
+    press(panel, 'ArrowUp', { altKey: true });
+    realm.announce('Copied 3 items.');
+    await panel.clock.advance(100);
+    assert.equal(said(), 'Copied 3 items.', 'a stale line came back over the receipt');
+    press(panel, 'ArrowUp', { altKey: true });
+    assert.equal(said(), 'Item 1 is already first.', 'a new line waited');
+    press(panel, 'ArrowUp', { altKey: true });
+    press(panel, 'ArrowDown', { altKey: true });
+    assert.equal(said(), 'Item 1 is now item 2 of 3.');
+    await panel.clock.advance(100);
+    assert.equal(said(), 'Item 1 is now item 2 of 3.', 'a stale line came back over a move');
+    assert.deepEqual(sheet(panel), [second, first, third]);
+
+    // Two moves that read alike: the new row 1 goes down too.
+    realm.document.activeElement = row(panel, 0).pick;
+    press(panel, 'ArrowDown', { altKey: true });
+    assert.deepEqual(sheet(panel), [first, second, third]);
+    assert.equal(said(), '');
+    await panel.clock.advance(100);
+    assert.equal(said(), 'Item 1 is now item 2 of 3.');
+  } finally {
+    untrack();
+  }
+});
+
+test('UX14: a row the keys move out of the list\'s view scrolls the list, and only the list, to keep it in view', async () => {
+  const panel = await started();
+  for (let i = 0; i < 6; i += 1) await captureRegion(panel);
+  const realm = realmOf(panel);
+  const list = panel.element('list');
+  const proto = Object.getPrototypeOf(list);
+  const rect = proto.getBoundingClientRect;
+  const scrollIntoView = proto.scrollIntoView;
+  const scrolled = [];
+  // The list shows 0 to 100 of its rows, which are 40 px tall and 4 px apart:
+  // rows 1 and 2 whole, the top of row 3 below them. Rows a rebuild makes
+  // are laid out the same way, by where they stand and how far the list has
+  // scrolled.
+  proto.getBoundingClientRect = function () {
+    if (this === list) return { top: 0, bottom: 100, left: 0, right: 300, width: 300, height: 100 };
+    if (this.parentNode !== list) return rect.call(this);
+    const top = list.children.indexOf(this) * 44 - (list.scrollTop || 0);
+    return { top, bottom: top + 40, left: 0, right: 300, width: 300, height: 40 };
+  };
+  proto.scrollIntoView = function () {
+    scrolled.push(this);
+  };
+  const untrack = trackFocus(panel);
+  try {
+    // The first item in the frame, at the top of the list, which stays in view.
+    row(panel, 0).pick.dispatch('click', { detail: 0 });
+    list.scrollTop = 0;
+    const moved = sheet(panel)[1];
+    realm.document.activeElement = row(panel, 1).pick;
+    press(panel, 'ArrowDown', { altKey: true });
+    assert.equal(sheet(panel)[2], moved);
+    assert.equal(realm.document.activeElement, row(panel, 2).pick);
+    const box = row(panel, 2).node.getBoundingClientRect();
+    assert.ok(box.top >= 0 && box.bottom <= 100, `the moved row is at ${box.top} to ${box.bottom}, out of the list's 0 to 100`);
+    assert.equal(list.scrollTop, 28, 'the list scrolled further than the row needed');
+    assert.deepEqual(scrolled, [], 'scrollIntoView scrolls the panel too');
+  } finally {
+    proto.getBoundingClientRect = rect;
+    proto.scrollIntoView = scrollIntoView;
+    untrack();
+  }
+});
+
+// ------------------------------------------------------------ reordering --
+
+test('reorder: rows carry the keys that move them, and the hint names them, once there are two', async () => {
+  assert.match(HTML, /<p class="sr" id="row-move-hint" hidden><\/p>/);
+  const panel = await started();
+  assert.equal(panel.element('row-move-hint').textContent, 'Alt and the up or down arrow move this item.');
+  await captureRegion(panel);
+  // One item alone has nowhere to go.
+  assert.equal(row(panel, 0).node.draggable, false);
+  assert.equal(row(panel, 0).pick.getAttribute('aria-keyshortcuts'), null);
+  assert.equal(row(panel, 0).pick.getAttribute('aria-describedby'), null);
+  await captureRegion(panel);
+  for (const index of [0, 1]) {
+    const { node, pick } = row(panel, index);
+    assert.equal(node.draggable, true);
+    assert.equal(pick.getAttribute('aria-keyshortcuts'), 'Alt+ArrowUp Alt+ArrowDown');
+    assert.equal(pick.getAttribute('aria-describedby'), 'row-move-hint');
+    // The row drags, not its picture, which would carry its data URL.
+    assert.equal(pick.children[0].children[0].draggable, false);
+  }
+  const mac = await started({ globals: { navigator: { platform: 'MacIntel' } } });
+  assert.equal(mac.element('row-move-hint').textContent, 'Option and the up or down arrow move this item.');
+});
+
+test('reorder: the thumbnail shows the row can be dragged, and a dragged row dims and marks where it lands', () => {
+  const rules = cssRules();
+  assert.equal(decl(rules, '.row[draggable="true"] .row-thumb', 'cursor'), 'grab');
+  assert.equal(decl(rules, '.row.dragging', 'opacity'), '0.45');
+  assert.equal(decl(rules, '.row', 'position'), 'relative');
+  for (const selector of ['.row.drop-before::before', '.row.drop-after::after']) {
+    assert.equal(decl(rules, selector, 'background'), 'var(--fg)', selector);
+    assert.equal(decl(rules, selector, 'height'), '2px', selector);
+    assert.equal(decl(rules, selector, 'pointer-events'), 'none', selector);
+  }
+  // In the gap beside the row, at either end of the list too, which keeps a
+  // gap's room above its first row and below its last. On the row's own edge
+  // the line fell on the 2 px of ink that frame the row in the frame, which
+  // after a capture is the last: a drag to the bottom showed no line at all.
+  assert.equal(decl(rules, '.row.drop-before::before', 'top'), '-4px');
+  assert.equal(decl(rules, '.row.drop-after::after', 'bottom'), '-4px');
+  assert.equal(decl(rules, '.list', 'padding'), '4px 0');
+  assert.equal(decl(rules, '.list', 'gap'), '4px');
+  assert.deepEqual(
+    rules.filter((rule) => /drop-(before|after)/.test(rule.selector)).map((rule) => rule.selector),
+    ['.row.drop-before::before', '.row.drop-after::after', '.row.drop-before::before', '.row.drop-after::after'],
+    'a rule moves the line at an end of the list'
+  );
+});
+
+/** Which drop line each row draws. */
+function marks(panel) {
+  return panel
+    .element('list')
+    .children.map((node) => (node.classList.contains('drop-before') ? 'before' : node.classList.contains('drop-after') ? 'after' : '-'));
+}
+
+/**
+ * Drag row `from` over the list to `y` and drop it there, with the events
+ * Chrome sends. Rows are laid out 40 px tall, 4 px apart.
+ */
+function drag(panel, from, y) {
+  panel.layOutRows();
+  const transfer = makeDataTransfer();
+  const source = row(panel, from).node;
+  source.dispatch('dragstart', { dataTransfer: transfer });
+  const list = panel.element('list');
+  let accepted = false;
+  list.dispatch('dragover', {
+    dataTransfer: transfer,
+    clientY: y,
+    preventDefault() {
+      accepted = true;
+    },
+  });
+  const lines = marks(panel);
+  list.dispatch('drop', { dataTransfer: transfer, clientY: y });
+  source.dispatch('dragend', { dataTransfer: transfer });
+  return { accepted, lines, transfer };
+}
+
+test('reorder: a row dropped on the list moves to the gap under the pointer', async () => {
+  const panel = await started();
+  for (let i = 0; i < 3; i += 1) await captureRegion(panel);
+  const [first, second, third] = sheet(panel);
+  const said = () => panel.element('announce').textContent;
+
+  // Row 3 over the upper half of row 1: the gap above it.
+  let result = drag(panel, 2, 5);
+  assert.equal(result.accepted, true, 'the list refused its own row');
+  assert.deepEqual(result.lines, ['before', '-', '-']);
+  assert.deepEqual(sheet(panel), [third, first, second]);
+  assert.equal(said(), 'Item 3 is now item 1 of 3.');
+  // The drag carries nothing a page could read: an empty string, under a
+  // type of the panel's own.
+  assert.deepEqual([...result.transfer.data], [['application/x-punch-list-row', '']]);
+  assert.equal(result.transfer.effectAllowed, 'move');
+  assert.equal(result.transfer.dropEffect, 'move');
+  assert.deepEqual(marks(panel), ['-', '-', '-'], 'the line stayed after the drop');
+
+  // Below the last row.
+  result = drag(panel, 0, 500);
+  assert.deepEqual(result.lines, ['-', '-', 'after']);
+  assert.deepEqual(sheet(panel), [first, second, third]);
+  assert.equal(said(), 'Item 1 is now item 3 of 3.');
+
+  // On either gap beside the row itself: nothing moves, nothing is said.
+  panel.element('announce').textContent = '';
+  for (const y of [50, 100]) {
+    drag(panel, 1, y);
+    assert.deepEqual(sheet(panel), [first, second, third], `moved by a drop at ${y}`);
+  }
+  assert.equal(said(), '');
+});
+
+test('reorder: the list takes no drag but one of its own rows', async () => {
+  const panel = await started();
+  for (let i = 0; i < 2; i += 1) await captureRegion(panel);
+  const before = sheet(panel);
+  panel.layOutRows();
+  const list = panel.element('list');
+  // A file, and a row dragged from another window's panel, which brings the
+  // type but was not started here.
+  for (const types of [['Files'], ['application/x-punch-list-row']]) {
+    const transfer = makeDataTransfer(types);
+    let accepted = false;
+    const event = {
+      dataTransfer: transfer,
+      clientY: 5,
+      preventDefault() {
+        accepted = true;
+      },
+    };
+    list.dispatch('dragover', event);
+    list.dispatch('drop', event);
+    assert.equal(accepted, false, `took a drag of ${types}`);
+    assert.deepEqual(marks(panel), ['-', '-']);
+  }
+  // A row drag whose end never came, then a file dragged in from the
+  // desktop, which presses nothing in the panel: still not a row.
+  row(panel, 1).node.dispatch('dragstart', { dataTransfer: makeDataTransfer() });
+  let accepted = false;
+  const file = {
+    dataTransfer: makeDataTransfer(['Files']),
+    clientY: 5,
+    preventDefault() {
+      accepted = true;
+    },
+  };
+  list.dispatch('dragover', file);
+  list.dispatch('drop', file);
+  assert.equal(accepted, false, 'a file was taken for the row whose drag was lost');
+  assert.deepEqual(sheet(panel), before);
+});
+
+test('reorder: a dragged row takes the tooltip down, dims once Chrome has its picture, and stays dim through a rebuild', async () => {
+  const panel = await started();
+  for (let i = 0; i < 2; i += 1) await captureRegion(panel);
+  const realm = realmOf(panel);
+  const items = sheet(panel);
+  realm.showTip(row(panel, 1).pick, items[1], 1);
+  assert.equal(panel.element('thumb-tip').hidden, false);
+  const transfer = makeDataTransfer();
+  const source = row(panel, 1).node;
+  source.dispatch('dragstart', { dataTransfer: transfer });
+  assert.equal(panel.element('thumb-tip').hidden, true, 'the tooltip stayed over the drag');
+  assert.equal(source.classList.contains('dragging'), false, 'dimmed before Chrome took the drag image');
+  await panel.clock.advance(1);
+  assert.equal(source.classList.contains('dragging'), true);
+  const list = panel.element('list');
+  panel.layOutRows();
+  list.dispatch('dragover', { dataTransfer: transfer, clientY: 5 });
+  assert.deepEqual(marks(panel), ['before', '-']);
+  // Chrome fires dragover every few milliseconds: over the same gap, no row
+  // is touched.
+  let touched = 0;
+  for (const node of list.children) {
+    const toggle = node.classList.toggle.bind(node.classList);
+    node.classList.toggle = (...args) => (touched += 1, toggle(...args));
+  }
+  list.dispatch('dragover', { dataTransfer: transfer, clientY: 6 });
+  assert.equal(touched, 0, 'a dragover over the same gap rewrote the rows\' classes');
+  // A write from another window rebuilds the list mid drag: the row stays
+  // dim, and the next dragover draws the line on the new rows.
+  realm.renderSheet();
+  assert.equal(row(panel, 1).node.classList.contains('dragging'), true);
+  assert.equal(row(panel, 0).node.classList.contains('dragging'), false);
+  assert.deepEqual(marks(panel), ['-', '-']);
+  panel.layOutRows();
+  list.dispatch('dragover', { dataTransfer: transfer, clientY: 5 });
+  assert.deepEqual(marks(panel), ['before', '-'], 'the line was not drawn again on the rebuilt rows');
+  // Out of the list, the line goes; onto a row inside it, it stays.
+  list.dispatch('dragleave', { dataTransfer: transfer, relatedTarget: row(panel, 0).pick });
+  assert.deepEqual(marks(panel), ['before', '-'], 'moving onto a row inside the list took the line down');
+  list.dispatch('dragleave', { dataTransfer: transfer, relatedTarget: null });
+  assert.deepEqual(marks(panel), ['-', '-']);
+  source.dispatch('dragend', { dataTransfer: transfer });
+  assert.ok(!list.children.some((node) => node.classList.contains('dragging')));
+  assert.deepEqual(sheet(panel), items, 'a drag dropped nowhere moved a row');
+});
+
+test('reorder: a drag whose end never reached its rebuilt row leaves nothing dim past the next press', async () => {
+  const panel = await started();
+  for (let i = 0; i < 2; i += 1) await captureRegion(panel);
+  const realm = realmOf(panel);
+  row(panel, 0).node.dispatch('dragstart', { dataTransfer: makeDataTransfer() });
+  await panel.clock.advance(1);
+  realm.renderSheet();
+  assert.equal(row(panel, 0).node.classList.contains('dragging'), true);
+  panel.documentEvent('pointerdown', { target: panel.document.body });
+  assert.equal(row(panel, 0).node.classList.contains('dragging'), false);
+  realm.renderSheet();
+  assert.equal(row(panel, 0).node.classList.contains('dragging'), false, 'the next rebuild dimmed the row again');
+});
+
+test('reorder: after a move the rows, the frame, the line under Copy and the banner number by the new order', async () => {
+  const panel = await started();
+  for (let i = 0; i < 3; i += 1) await captureRegion(panel);
+  const realm = realmOf(panel);
+  // Item 3, in the frame, has lost its file.
+  realm.markMissing(sheet(panel)[2]);
+  assert.match(panel.banner(), /item 3 on the sheet/);
+  assert.equal(panel.element('preview-meta').textContent, '3/3 · REGION · PNG 50×50 · FILE MISSING');
+  assert.equal(panel.element('description').placeholder, 'What is wrong here, and what should happen instead?');
+
+  realm.document.activeElement = row(panel, 2).pick;
+  press(panel, 'ArrowUp', { altKey: true });
+  assert.equal(panel.element('preview-meta').textContent, '2/3 · REGION · PNG 50×50 · FILE MISSING');
+  assert.match(panel.banner(), /item 2 on the sheet/);
+  assert.match(text(panel.element('submit-note')), /^Item 2's screenshot is no longer on disk/);
+  assert.deepEqual(
+    [0, 1, 2].map((index) => row(panel, index).node.children[1].children[1].children[0].textContent),
+    ['1 · REGION', '2 · REGION · FILE MISSING', '3 · REGION']
+  );
+  assert.equal(row(panel, 1).node.children[0].children[0].getAttribute('aria-label'), 'Include item 2 in the prompt');
+  assert.equal(row(panel, 1).pick.getAttribute('aria-label'), 'Item 2, region, file missing');
+
+  // At the top, the item in the frame is the first, which shows the example.
+  realm.document.activeElement = row(panel, 1).pick;
+  press(panel, 'ArrowUp', { altKey: true });
+  assert.equal(
+    panel.element('description').placeholder,
+    'The total shows NaN once a coupon is applied. It should show the discounted price.'
+  );
 });

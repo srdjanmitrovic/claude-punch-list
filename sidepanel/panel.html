@@ -141,9 +141,10 @@
 
       <section>
         <!-- The sheet, right above the button that sends it: one row per item,
-             in capture order, each with a tick for whether it goes into the
-             next prompt. Clicking a row brings it into the frame and its
-             description into the field. -->
+             in the order of the sheet (capture order until a row is dragged
+             or moved with the keys), each with a tick for whether it goes
+             into the next prompt. Clicking a row brings it into the frame
+             and its description into the field. -->
         <div class="sheet" id="sheet" hidden>
           <div class="sheet-acts">
             <button class="ghost-link" id="new-item" type="button" hidden>+ New item</button>
@@ -158,6 +159,10 @@
           </div>
           <p class="key">On the sheet</p>
           <ul class="list" id="list" aria-label="Captured items"></ul>
+          <!-- The keys that move a row, read as each row's description once
+               the sheet holds two items. Hidden, which a description may be;
+               panel.js names the platform's key. -->
+          <p class="sr" id="row-move-hint" hidden></p>
         </div>
 
         <!-- The last discard, for a few seconds: what went, and Undo. Outside

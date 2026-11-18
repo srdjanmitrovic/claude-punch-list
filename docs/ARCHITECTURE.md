@@ -800,15 +800,21 @@ context read tells it which load of the page the capture belongs to, and the ite
 `armedAt`; a read whose collector started after the capture is ignored, since that load came
 later. When the report is copied, an item whose `armedAt` matches the log's gets the entries
 logged since the capture before it, and entries after the last capture get a section of their
-own. An item from another page, or from another load of the same address, says its entries were
-not read. Another load is not called a reload, because a second tab open on the same address
-looks the same. An item with no `armedAt` (stored by an older build, or captured on a page too
-busy to answer) is judged by its page and its capture time, and only when both are known: the
-panel passes the url it read the log on as `readUrl`, which is compared and never printed, so
-the page toggle off does not leave the template guessing. Before a log that started late (see
+own. The capture before it means before it in time, whichever row of the sheet it now stands
+on: the template sorts the captures by `capturedAt` itself (`splitLog`), because the user can
+reorder the sheet and the items arrive in its order. A moved item so keeps what was logged before
+its own capture, and its log names the capture before it by that capture's number, which can be
+higher than its own ("Logged since item 3:"). The earliest capture is the one whose share is
+headed as logged on this page load before it. An item from another page, or from another load of
+the same address, says its entries were not read. Another load is not called a reload, because a
+second tab open on the same address looks the same. An item with no `armedAt` (stored by an older
+build, or captured on a page too busy to answer) is judged by its page and its capture time, and
+only when both are known: the panel passes the url it read the log on as `readUrl`, which is
+compared and never printed, so the page toggle off does not leave the template guessing. Before
+a log that started late (see
 [A tab that was open before](#a-tab-that-was-open-before)), an item captured earlier says it was
 captured before collection began rather than before the page last loaded, since no reload came
-between, and the first item's share of such a log is headed "Logged since collection began,
+between, and the earliest capture's share of such a log is headed "Logged since collection began,
 before this capture" rather than "on this page load". When a ring dropped entries, each item
 whose stretch of the log starts before the oldest entry that ring kept says its log may be
 incomplete, since a quiet stretch would otherwise read as a clean one.
@@ -824,8 +830,8 @@ nothing logged up to the capture was recorded.
 
 In a list the page block is headed "Page when the report was copied", since it describes the tab
 at that moment and not where each item was captured. When nothing could be read, the page is the
-newest item's own rather than the tab in view, and the block is headed "Page the last item was
-captured on" instead. The items carry the sheet's numbers when every item sends one and they rise
+last listed item's own rather than the tab in view, and the block is headed "Page the last item
+was captured on" instead. The items carry the sheet's numbers when every item sends one and they rise
 in order, and otherwise their places in the prompt, so an item called 3 in the panel is item 3 in
 the prompt when items 1 and 2 were left out. When the extension
 started the collector on a tab that was already open, the page section says from when the log
@@ -1290,8 +1296,9 @@ would be a sentence about nothing. The banner says to capture it again.
 
 **Keys.** `cdrReport` holds `{ items, removed, updatedAt, writer }`. Each stored item keeps `id`,
 `mode`, `width`, `height`, `url`, `title`, `intent`, `description`, `included`, `element`,
-`capturedAt`, `armedAt`, `editedAt`, `wordsAt`, `path` and `downloadId` (`storedForm` in
-`sidepanel/panel.js`); its tab, its thumbnail and whether its file is missing are not stored.
+`capturedAt`, `armedAt`, `rank` (only once it has been moved, see Order below), `editedAt`,
+`wordsAt`, `path` and `downloadId` (`storedForm` in `sidepanel/panel.js`); its tab, its thumbnail
+and whether its file is missing are not stored.
 `cdrThumbs` holds `{ items, writer }`, the thumbnails by id. `cdrIntent` and `cdrInclude` are
 keys of their own, each written only when that setting changes, and every panel adopts both.
 
@@ -1300,20 +1307,46 @@ an older or a newer build wrote it, or something else did. It is validated befor
 and `readReport`): known fields only, ids of at most 100 characters and no two alike, at most 500
 items and 50 000 characters per description, paths without control characters or line breaks
 (the prompt prints each on a line of its own), an unknown mode shown as `other`, element data only
-for element items, stamps capped at the current time, and thumbnails only as base64 WebP, PNG or
-JPEG data URLs, since anything else in an `img` would be a request to the network. Content
-scripts can write an extension's local storage unless it says otherwise, so the worker restricts
-`chrome.storage.local` to trusted contexts at every start.
+for element items, stamps capped at the current time, a rank only as a finite number no further
+than 2^52 from zero (past 2^53 adding one changes nothing, and a capture could no longer land
+after it), and thumbnails only as base64 WebP, PNG or JPEG data URLs, since anything else in an
+`img` would be a request to the network. Content scripts can write an extension's local storage
+unless it says otherwise, so the worker restricts `chrome.storage.local` to trusted contexts at
+every start.
 
 **Merging.** Every panel merges another panel's write into its own sheet item by item, instead of
 replacing the sheet. Each item carries two stamps: `wordsAt` for the description, and `editedAt`
-for the intent and the tick. Each field keeps whichever copy was changed last, and a side holding
-something newer writes it back. Which window has focus decides nothing. When an item leaves the
-sheet through a discard or a copy, its id and time go into `removed`, kept for ten minutes and
-capped at 200 entries, so a write that crossed the removal cannot bring the item back. An edit
-made after the removal, an undo included, does bring it back. A removal of the whole report
-(another panel's weekly expiry) is ignored by a panel that is still showing it. A change that
-keeps the sheet's shape updates rows in place, with no storage read, list rebuild or page read.
+for the intent, the tick and the place on the sheet. Each field keeps whichever copy was changed
+last, and a side holding something newer writes it back. Which window has focus decides nothing.
+When an item leaves the sheet through a discard or a copy, its id and time go into `removed`,
+kept for ten minutes and capped at 200 entries, so a write that crossed the removal cannot bring
+the item back. An edit made after the removal, an undo included, does bring it back. A removal of
+the whole report (another panel's weekly expiry) is ignored by a panel that is still showing it.
+A change that keeps the sheet's shape updates rows in place, with no storage read, list rebuild
+or page read.
+
+**Order.** Every panel sorts the sheet the same way (`bySheetOrder`), at every open and on every
+write it adopts: by each item's place, which is its `rank` once it has been moved and its
+`capturedAt` until then, and two items at one place by `capturedAt`. A sheet nobody reordered
+carries no rank at all, so a sheet stored by an earlier version needs nothing done to it and
+shows in capture order, as it did. The stored array is written in sheet order too, but no panel
+relies on it, and rearranging `state.items` alone does not last: the next write adopted sorts it
+back. A move (`moveItem`, by a drag or by Alt with an up or down arrow) sets the moved item's
+rank halfway between the places of its new neighbours, or one past the place at the end it went
+to, and stamps it with `editedAt`, so another window takes the newer place as it takes the newer
+tick. A move and a tick of the same item in two windows within one crossing write keep only the
+newer of the two, the trade the intent and the tick already make. At today's timestamps a double
+has about twelve halvings between two captures a millisecond apart, so about twelve moves in a
+row into the same gap; when no number is left strictly between the neighbours, or two rows share
+a place, every row takes its index as its rank and is stamped. A capture joins at the end: its
+time puts it there, and when that time is at or below a place already taken (the clock was set
+back, or rows were moved to the end within the same millisecond), it gets the highest place plus
+one. An item still saving is not stored yet, so it keeps its place in this panel's memory
+through writes from other windows, and its rank is stored with it once its file is. The frame's
+item after an open or a copy is the newest capture (`newestItem`), wherever it stands, and the
+page that stands in when nothing was read is the last item listed. A version without `rank`
+ignores it and drops it on its next write, so going back to it puts the sheet in capture order
+again and breaks nothing.
 
 **Files.** Before the panel deletes a screenshot or trusts what Chrome says about whether it
 exists, it looks up the download record and accepts it only if `record.filename` is the item's
@@ -1346,8 +1379,11 @@ files for six seconds so it can be undone. The countdown stops while the Undo co
 the pointer is on it, and starts again from six once both have left. Cmd or Ctrl+Z also undoes, in
 the description field too as long as nothing has been typed there since the discard: focus goes to
 the field after a discard that leaves an item, and the field has nothing of its own to undo yet,
-since a value set by script is not on its undo stack. When the time is up, the files are deleted
-with `downloads.removeFile` and their history entries with `downloads.erase`. On `pagehide` the
+since a value set by script is not on its undo stack. An undo puts an item back at the index it
+left and then sorts the sheet, so when rows were moved in the meantime it goes where its own place
+puts it, as every other panel and the next open put it. Cmd or Ctrl+Z undoes a discard and nothing
+else: a move is undone by moving the row back. When the time is up, the files are deleted with
+`downloads.removeFile` and their history entries with `downloads.erase`. On `pagehide` the
 panel settles the pending discard and takes back any save still in flight by sending `cancel`,
 `removeFile` and `erase` without waiting for them; Chrome completes those calls after the page has
 gone.

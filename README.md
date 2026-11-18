@@ -59,7 +59,9 @@ was collected while you walked. Claude Code opens the images itself.
 ## Features
 
 * **A sheet, not a shot.** Every capture becomes a numbered item with its own screenshot,
-  its own sentence and its own intent. Add as many as the walkthrough needs.
+  its own sentence and its own intent. Add as many as the walkthrough needs. Drag a row, or
+  press <kbd>Alt</kbd> (<kbd>Option</kbd> on a Mac) with the up or down arrow, to change the
+  order. The numbers follow.
 * **Three ways to frame.** Drag a region, click an element, or grab the whole viewport.
   Element captures also bring the node's markup, its computed styles, the React or Vue component
   that rendered it, the handlers bound to it, and a line of search targets, so Claude Code opens
@@ -110,7 +112,8 @@ against a blank frame than against the last one.
 work on the page, and pressed in the panel they go on to the page too, so there is no need to
 click the page after clicking a mode button. In a text field they stay with the field, and
 <kbd>Enter</kbd> goes on only from the lit mode button or with nothing focused, so on any other
-button it still presses that button. With Region, the first arrow key puts a box half the size
+button it still presses that button. On a row of the sheet, <kbd>Alt</kbd> with the up or down
+arrow moves that row instead (see section 2). With Region, the first arrow key puts a box half the size
 of the visible area in its middle. The arrows move it, <kbd>Shift</kbd> with an arrow moves its
 right or bottom edge, <kbd>Alt</kbd> makes each step one pixel, and <kbd>Enter</kbd> captures it.
 With Element, the first arrow key highlights the element that has focus on the page, or else one
@@ -219,6 +222,23 @@ closes it. A double click on the tooltip selects a word instead, as it does in a
 pressing any key calls the waiting pick off. Click a row to bring that item back into the frame,
 with the caret in its sentence, ready to type.
 
+The sheet keeps the order you give it. Once it holds two items, drag a row (over its thumbnail
+the pointer turns into a hand) and drop it where the line between rows shows; near the top or
+bottom of the list, the list scrolls. <kbd>Esc</kbd>, or a drop anywhere else, leaves it where it was.
+From the keyboard, put the focus on a row or its tick and press <kbd>Option</kbd> with the up or
+down arrow on a Mac, or <kbd>Alt</kbd> with it elsewhere, to move it one place. The focus stays
+with the row, and a screen reader hears where it went ("Item 3 is now item 2 of 4."). At the top
+or the bottom it hears that the item is already there, as often as the key is pressed. The keys
+move the row even while Region or Element is armed, since the row has the keyboard. From
+anywhere else in the panel, <kbd>Alt</kbd> with an arrow still goes on to the page, where with
+Region it moves the box one pixel. The numbers on the rows, the frame and the line under Copy
+follow the new order, and the frame stays on the item you are writing. The order is kept when
+the panel closes, and every window's panel shows it as soon as it is changed. A new capture
+always joins at the end. An item brought back with **Undo** goes where it was, or, when rows
+were moved in the meantime, where its own place on the sheet puts it. <kbd>Cmd</kbd><kbd>Z</kbd>
+(<kbd>Ctrl</kbd><kbd>Z</kbd> elsewhere) does not undo a move; moving it back is one key or one
+drag.
+
 The × on the frame discards the item in it. **Discard all**, at the right end of the row above
 the sheet, discards every item. Either can be taken back with **Undo**, in the line under the
 sheet, for six seconds. The countdown waits while the pointer is on Undo or Undo has the keyboard
@@ -244,7 +264,10 @@ page could not be read.
 
 One prompt containing every ticked item lands on your clipboard. You paste once. Claude Code
 reads each screenshot from its path, works through the items, and says which item each change
-belongs to.
+belongs to. The items come in the order of the sheet, with its numbers. What the page logged is
+still shared out by the time of each capture, so a row you moved up keeps what was logged before
+its own capture, and its log can say "Logged since item 3" when the capture before it in time
+now stands lower on the sheet. The prompt does not say that the order was changed.
 
 The ticks decide what goes. Everything is ticked as it is captured, so the usual walkthrough
 is capture, capture, capture, copy. Untick what should wait, or **Clear selection** and tick
@@ -348,8 +371,8 @@ the function that sent the failed request.
 of them and you can check that it did. The opening line says how much of each kind of work
 there is, and the closing line gives the bug instruction and the change instruction side by
 side, because neither alone is right for the other. The log is split by capture: each item
-carries what the page logged since the capture before it, in the order it happened, so the
-request that failed, the warning naming the missing coupon and the line that threw sit under
+carries what the page logged since the capture before it in time, in the order it happened, so
+the request that failed, the warning naming the missing coupon and the line that threw sit under
 the screenshot of the broken total, and the two suggestions carry nothing they did not cause.
 Anything logged after the last capture gets a section of its own at the end. So does an entry
 that carries no time, which only an older collector writes: it is headed as logged at a time not

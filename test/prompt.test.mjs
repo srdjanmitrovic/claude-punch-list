@@ -771,6 +771,53 @@ test('prompt: a list is numbered as the sheet numbers it, when every item says (
   assert.match(buildPrompt(elsewhere), /Items 2, 5 and 7 were captured elsewhere/);
 });
 
+// A sheet the user reordered lists its items in the order of the sheet. The
+// split went by that order, and gave each entry to the first row captured
+// after it: with the newest row moved to the top, every entry printed under
+// item 1, headed as logged before it on this page load.
+test('prompt: a reordered list splits the log by capture time, and names the capture before by its number', () => {
+  const report = sampleReport('mixed');
+  const [a, b, c] = report.items;
+  // All three captured on the load the log was read on.
+  Object.assign(c, { url: a.url, armedAt: report.armedAt });
+  const at = (item, offset) => item.capturedAt - report.armedAt + offset;
+  report.consoleLines = [
+    { level: 'warn', text: 'before A', t: at(a, -1000) },
+    { level: 'warn', text: 'between A and B', t: at(b, -1000) },
+    { level: 'warn', text: 'between B and C', t: at(c, -1000) },
+    { level: 'warn', text: 'after C', t: at(c, 1000) },
+  ];
+  report.errors = [];
+  report.network = [];
+  // A warning was dropped before the oldest one kept, so the stretch of the
+  // log up to the earliest capture may be incomplete.
+  report.dropped = { warnings: 1 };
+  report.items = [c, a, b];
+  report.items.forEach((item, index) => (item.number = index + 1));
+  const prompt = buildPrompt(report);
+  const sections = prompt.split(/\n(?=## )/);
+  const item = (number) => sections.find((section) => section.startsWith(`## ${number}. `));
+  const incomplete = 'the collector had already dropped older entries, so this log may be incomplete.';
+
+  assert.match(item(1), /\nLogged since item 3:\n```\n[^\n]* \[warn\] between B and C\n```/);
+  assert.ok(!item(1).includes(incomplete), 'the first row was taken for the earliest capture');
+  assert.match(item(2), /\nLogged on this page load before this capture:\n```\n[^\n]* \[warn\] before A\n```/);
+  assert.ok(item(2).includes(incomplete), 'the earliest capture lost its note');
+  assert.match(item(3), /\nLogged since item 2:\n```\n[^\n]* \[warn\] between A and B\n```/);
+  assert.ok(!item(3).includes(incomplete));
+  const after = sections.find((section) => section.startsWith('## Logged after the last capture on this page'));
+  assert.match(after, /\[warn\] after C/);
+  for (const text of ['before A', 'between A and B', 'between B and C', 'after C']) {
+    assert.equal(prompt.split(text).length, 2, `${text} printed ${prompt.split(text).length - 1} times`);
+  }
+  // In capture order, the same report prints as it always has.
+  report.items = [a, b, c];
+  report.items.forEach((each, index) => (each.number = index + 1));
+  const plain = buildPrompt(report);
+  assert.match(plain, /## 1\. [^\n]*\n[\s\S]*Logged on this page load before this capture:/);
+  assert.match(plain, /## 3\. [^\n]*\n[\s\S]*Logged since item 2:\n```\n[^\n]* \[warn\] between B and C/);
+});
+
 test('prompt: with the page toggle off, a log from another page or load is still cautioned (RO3)', () => {
   const single = buildPrompt(EXTRA['page-off-elsewhere']());
   assert.match(single, /\n## Console and network\n(?:Clock times[^\n]*\n)?CAUTION: the screenshot was taken on another page than the one the console and network entries below were read on, so they may not correspond to the image\.\n/);

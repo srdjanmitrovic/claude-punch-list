@@ -116,6 +116,7 @@ const el = {
   previewMeta: document.getElementById('preview-meta'),
   sheet: document.getElementById('sheet'),
   list: document.getElementById('list'),
+  rowMoveHint: document.getElementById('row-move-hint'),
   newItem: document.getElementById('new-item'),
   selectAll: document.getElementById('select-all'),
   clearSelection: document.getElementById('clear-selection'),
@@ -179,9 +180,15 @@ const el = {
  * @property {boolean} included     Ticked: goes into the next prompt.
  * @property {Object|null} element  Payload from picker.js, element mode only.
  * @property {number}  capturedAt   Epoch ms.
- * @property {number}  editedAt     Epoch ms of the last change to the intent or
- *                                  the tick, from any panel. A merge of two
- *                                  panels' sheets keeps the newer of each.
+ * @property {number=} rank         The item's place on the sheet once it has
+ *                                  been moved (see moveItem). Absent, it stands
+ *                                  at capturedAt, so a sheet nobody reordered
+ *                                  carries none. Merged with the intent and the
+ *                                  tick, under editedAt.
+ * @property {number}  editedAt     Epoch ms of the last change to the intent,
+ *                                  the tick or the place, from any panel. A
+ *                                  merge of two panels' sheets keeps the newer
+ *                                  of each.
  * @property {number=} wordsAt      The same for the description. Apart from
  *                                  editedAt, so a tick written by a panel that
  *                                  had not yet seen the latest words does not
@@ -313,6 +320,28 @@ function showBanner(message, kind = 'warn', scope = 'capture') {
  */
 function announce(message) {
   el.announce.textContent = message;
+}
+
+/** The timer that puts announceAnew's line back, see there. */
+let announceTimer = null;
+
+/**
+ * Announce a line that may be the one the status region already holds, as
+ * "Item 1 is already first." is on a second press at the top. A screen
+ * reader may not read a region set to the text it has, so the region is
+ * emptied and the line put back a moment later, unless something else was
+ * said in between. Any other line is announced at once, as announce() does.
+ */
+function announceAnew(message) {
+  clearTimeout(announceTimer);
+  if (el.announce.textContent !== message) {
+    announce(message);
+    return;
+  }
+  announce('');
+  announceTimer = setTimeout(() => {
+    if (!el.announce.textContent) announce(message);
+  }, 100);
 }
 
 function setCount(node, value) {
@@ -708,6 +737,12 @@ function selectedItem() {
   return state.items.find((item) => item.id === state.selectedId) || null;
 }
 
+/**
+ * Show the item in the frame. Called again whenever anything about the sheet
+ * changes, a move of any row and every write adopted from another window
+ * included, so it sets what the item says and nothing more: called twice
+ * with nothing changed, it leaves the frame as it was.
+ */
 function renderFrame() {
   const item = selectedItem();
   // Kept with the item rather than only in the shared banner, which other
@@ -1046,11 +1081,75 @@ function fillRowText(row, item, index) {
   row.querySelector('.row-pick').setAttribute('aria-label', describeRow(item, index));
 }
 
-function renderSheet() {
+/**
+ * The row being dragged to another place on the sheet, by its item's id,
+ * while that drag is under way.
+ *
+ * A drag carries a type of the panel's own and no data (see renderSheet), so
+ * a drop on the page, or anywhere but the list, gets nothing it can read. The
+ * list takes no drag but one of its own rows: not a file, not the frame's
+ * image, and not a row dragged from another window's panel, whose `dragged`
+ * is that panel's.
+ */
+let dragged = null;
+const ROW_DRAG = 'application/x-punch-list-row';
+/** The gap the drop line is drawn in now, see markSlot. */
+let dropMarked = null;
+
+function ownDrag(event) {
+  return dragged != null && Array.from(event.dataTransfer?.types || []).includes(ROW_DRAG);
+}
+
+/**
+ * The gap under the pointer, counted in rows: 0 above the first row, the row
+ * count below the last. The upper half of a row is the gap above it.
+ */
+function dropSlot(y) {
+  const rows = [...el.list.children];
+  const index = rows.findIndex((row) => {
+    const box = row.getBoundingClientRect();
+    return y < box.top + box.height / 2;
+  });
+  return index === -1 ? rows.length : index;
+}
+
+/**
+ * Draw the line where the row would land: above the row at `slot`, or below
+ * the last row, or nowhere for null. Classes change only when the gap does,
+ * so a dragover, which Chrome fires every few milliseconds, costs no style
+ * work while the pointer stays over one gap.
+ */
+function markSlot(slot) {
+  if (slot === dropMarked) return;
+  dropMarked = slot;
+  const rows = [...el.list.children];
+  rows.forEach((row, index) => {
+    row.classList.toggle('drop-before', index === slot);
+    row.classList.toggle('drop-after', slot === rows.length && index === rows.length - 1);
+  });
+}
+
+/** The drag is over, dropped or not: nothing stays dimmed or marked. */
+function endDrag() {
+  dragged = null;
+  markSlot(null);
+  for (const row of el.list.children) row.classList.remove('dragging');
+}
+
+/**
+ * Build the sheet's rows afresh. `focus` is the item whose row gets the
+ * keyboard back if a row had it: the one in the frame, unless a move took
+ * the row the keys were on elsewhere.
+ */
+function renderSheet({ focus = state.selectedId } = {}) {
   // The rebuild destroys the button that has focus. Putting focus back on the
   // row in the frame keeps a keyboard user where they were.
   const hadFocus = el.list.contains(document.activeElement);
   hideTip();
+  // The new rows carry no drop line; the next dragover draws it again.
+  dropMarked = null;
+  // One item alone has nowhere to go.
+  const movable = state.items.length > 1;
 
   el.sheet.hidden = state.items.length === 0;
   el.list.replaceChildren(
@@ -1060,6 +1159,9 @@ function renderSheet() {
       row.classList.toggle('on', item.id === state.selectedId);
       row.classList.toggle('included', item.included);
       row.classList.toggle('missing', Boolean(item.missing));
+      // A write from another window can rebuild the list mid drag.
+      row.classList.toggle('dragging', item.id === dragged);
+      row.draggable = movable;
 
       const tick = document.createElement('label');
       tick.className = 'row-tick';
@@ -1086,11 +1188,20 @@ function renderSheet() {
       pick.type = 'button';
       pick.className = 'row-pick';
       pick.setAttribute('aria-pressed', String(item.id === state.selectedId));
+      // The keys that move the row (see the keydown listener), and the one
+      // hint that names them on this platform.
+      if (movable) {
+        pick.setAttribute('aria-keyshortcuts', 'Alt+ArrowUp Alt+ArrowDown');
+        pick.setAttribute('aria-describedby', 'row-move-hint');
+      }
 
       const thumb = document.createElement('span');
       thumb.className = 'row-thumb';
       const img = document.createElement('img');
       img.alt = '';
+      // The row drags, not the picture: an image dragged on its own carries
+      // its data URL, and a drop on the page would hand the page the pixels.
+      img.draggable = false;
       if (item.thumb) img.src = item.thumb;
       thumb.append(img);
 
@@ -1131,6 +1242,20 @@ function renderSheet() {
         if (!tipPressed()) hideTip();
       });
 
+      row.addEventListener('dragstart', (event) => {
+        dragged = item.id;
+        hideTip();
+        // The panel's own type and no data, see `dragged`.
+        event.dataTransfer?.setData(ROW_DRAG, '');
+        if (event.dataTransfer) event.dataTransfer.effectAllowed = 'move';
+        // Dimmed a moment later, once Chrome has taken the drag image from
+        // the row as it looks now.
+        setTimeout(() => {
+          if (dragged === item.id) row.classList.add('dragging');
+        }, 0);
+      });
+      row.addEventListener('dragend', endDrag);
+
       row.append(tick, pick);
       fillRowText(row, item, index);
       return row;
@@ -1139,7 +1264,11 @@ function renderSheet() {
 
   const on = el.list.querySelector('.row.on');
   if (on) revealRow(on);
-  if (hadFocus) on?.querySelector('.row-pick').focus({ preventScroll: true });
+  // The row the keys were on, wherever a move took it. For every other
+  // rebuild that is the row in the frame, revealed above.
+  const kept = el.list.children[state.items.findIndex((item) => item.id === focus)];
+  if (kept && kept !== on) revealRow(kept);
+  if (hadFocus) kept?.querySelector('.row-pick').focus({ preventScroll: true });
 }
 
 /**
@@ -1186,6 +1315,102 @@ function touch(item, { words = false } = {}) {
 /** When anything about an item last changed, in any panel. */
 function lastChange(item) {
   return Math.max(item.editedAt || 0, item.wordsAt || 0);
+}
+
+/** Where an item stands on the sheet: where it was moved to, else when it was captured. */
+function sheetKey(item) {
+  return Number.isFinite(item.rank) ? item.rank : item.capturedAt || 0;
+}
+
+/**
+ * The order of the sheet, the same in every panel, so that "item 3" is one
+ * item: by place, and two items at one place by when they were captured.
+ */
+function bySheetOrder(a, b) {
+  return sheetKey(a) - sheetKey(b) || (a.capturedAt || 0) - (b.capturedAt || 0);
+}
+
+/**
+ * The item captured last, wherever it stands now: the one most likely to
+ * still need its sentence. On a sheet nobody reordered it is the last row,
+ * and of two captured in the same millisecond, the later row.
+ */
+function newestItem() {
+  let newest = null;
+  for (const item of state.items) {
+    if (!newest || (item.capturedAt || 0) >= (newest.capturedAt || 0)) newest = item;
+  }
+  return newest;
+}
+
+/**
+ * The rank a capture needs to land last, or undefined when its time already
+ * puts it there. It does unless the clock went back, or a row was moved to
+ * the end within the same millisecond: past every key on the sheet, by one.
+ */
+function rankAtEnd(capturedAt) {
+  if (!state.items.length) return undefined;
+  const highest = Math.max(...state.items.map(sheetKey));
+  return capturedAt > highest ? undefined : highest + 1;
+}
+
+/**
+ * Move an item to another place on the sheet, by a drag or by the keys.
+ *
+ * Only its rank changes: halfway between the keys of its new neighbours, or
+ * one past the key at the end it went to. One number on one item, stamped
+ * with touch() and so merged under editedAt like the tick: a window that
+ * hears of the move takes the newer place as it takes the newer tick, and
+ * every panel sorts by it (adoptStored). At today's timestamps a double holds
+ * about twelve halvings of the gap between two captures a millisecond apart,
+ * so about twelve moves in a row into one gap. Past that, or between two rows
+ * at one place, every row takes its index as its rank.
+ *
+ * Not a selection: the frame and the field stay on the item being written.
+ *
+ * @returns {boolean} whether anything moved
+ */
+function moveItem(id, to) {
+  const from = state.items.findIndex((item) => item.id === id);
+  if (from === -1) return false;
+  const count = state.items.length;
+  to = Math.max(0, Math.min(count - 1, to));
+  if (to === from) return false;
+  const [item] = state.items.splice(from, 1);
+  state.items.splice(to, 0, item);
+  const before = state.items[to - 1];
+  const after = state.items[to + 1];
+  const rank = !before
+    ? sheetKey(after) - 1
+    : !after
+      ? sheetKey(before) + 1
+      : (sheetKey(before) + sheetKey(after)) / 2;
+  if ((!before || sheetKey(before) < rank) && (!after || rank < sheetKey(after))) {
+    item.rank = rank;
+    touch(item);
+  } else {
+    state.items.forEach((each, index) => {
+      if (each.rank === index) return;
+      each.rank = index;
+      touch(each);
+    });
+  }
+  persist();
+  renderFrame();
+  renderSheet({ focus: id });
+  // The worked example shows under the first item alone, and a move can
+  // change which item that is.
+  const selected = selectedItem();
+  if (selected) showIntent(selected.intent, { example: state.items.indexOf(selected) === 0 });
+  updateSubmitState();
+  // The banner about a missing file names it by its number.
+  if (state.bannerScope === 'missing') {
+    showBanner(null);
+    sayMissing();
+  }
+  // Two moves can read alike: row 1 down, then the new row 1 down too.
+  announceAnew(`Item ${from + 1} is now item ${to + 1} of ${count}.`);
+  return true;
 }
 
 /**
@@ -1280,6 +1505,7 @@ async function addItem(capture) {
     showBanner(INCOGNITO_RESTRICTION, 'error', 'page');
     return;
   }
+  const capturedAt = Number.isFinite(capture.takenAt) ? capture.takenAt : Date.now();
   /** @type {Item} */
   const item = {
     id: makeId(),
@@ -1294,7 +1520,11 @@ async function addItem(capture) {
     included: true,
     // An element payload only belongs to the capture it was picked with.
     element: capture.mode === 'element' ? capture.element || null : null,
-    capturedAt: Number.isFinite(capture.takenAt) ? capture.takenAt : Date.now(),
+    capturedAt,
+    // A capture goes to the end of the sheet, in every panel and after a
+    // reopen, which sort by place. Its time puts it there, unless that is at
+    // or below a place already taken.
+    rank: rankAtEnd(capturedAt),
     editedAt: Date.now(),
     // The full capture stands in until the thumbnail exists, so the frame is
     // never briefly empty. It is replaced before anything is persisted.
@@ -1601,6 +1831,9 @@ function undoDiscard() {
     state.items.splice(Math.min(index, state.items.length), 0, item);
     restored.push(item);
   }
+  // Where its place puts it, which is where it was unless rows were moved
+  // since, and where every other panel and the next reopen put it too.
+  state.items.sort(bySheetOrder);
   restoreReceipt(trash);
   if (!restored.length) return;
   selectItem(restored.at(-1).id);
@@ -1700,7 +1933,8 @@ function resetAfterCopy(copied) {
   }
   state.handCopy = null;
   el.clearCopied.hidden = true;
-  selectItem(state.items.at(-1)?.id ?? null);
+  // The newest capture left, wherever it stands on the sheet.
+  selectItem(newestItem()?.id ?? null);
   persist({ thumbs: true });
   updateSubmitState();
   // A missing file reported while the clipboard was written raised a banner
@@ -2477,7 +2711,7 @@ function assembleReport(items, read, numbers = items.map((item) => state.items.i
   // Whether the prompt says anything about the log at all. With both toggles
   // off, a caution or a reason about entries nobody asked for is noise.
   const wantedLog = el.incConsole.checked || el.incNetwork.checked;
-  const newest = items.at(-1);
+  const last = items.at(-1);
   return {
     items: items.map((item, index) => ({
       // The number the sheet shows. With an earlier row unticked, the prompt
@@ -2495,10 +2729,11 @@ function assembleReport(items, read, numbers = items.map((item) => state.items.i
       armedAt: item.armedAt,
       element: el.incElement.checked ? item.element : null,
     })),
-    // With nothing read, the newest item's own page stands in. Each item
-    // recorded it at capture, and without it the prompt named no page at all.
+    // With nothing read, the last item listed has its own page stand in, as
+    // the prompt's heading for it says. Each item recorded its page at
+    // capture, and without it the prompt named no page at all.
     page: includePage
-      ? context?.page || (newest?.url ? { url: newest.url, title: newest.title || '' } : null)
+      ? context?.page || (last?.url ? { url: last.url, title: last.title || '' } : null)
       : null,
     // Warnings come from a ring of their own; the template merges every line
     // into the order it was logged in anyway.
@@ -2580,8 +2815,10 @@ async function copyReport() {
     // discarded while the page was read loses its file when the undo lapses,
     // and the prompt would send Claude Code to it. By id, as resetAfterCopy
     // goes, whatever a write adopted from another window did to the objects.
+    // In the order of the sheet now, too: a row moved during the read is
+    // listed where it went, and the numbers rise, as the template needs.
     const place = (item) => state.items.findIndex((candidate) => candidate.id === item.id) + 1;
-    const items = ticked.filter((item) => place(item) > 0);
+    const items = ticked.filter((item) => place(item) > 0).sort((a, b) => place(a) - place(b));
     if (!items.length) return;
     if (blocked(items)) {
       sayMissing();
@@ -2937,6 +3174,9 @@ async function checkFiles(items = state.items) {
 const STORED_MODES = ['region', 'element', 'visible'];
 const MAX_STORED_ITEMS = 500;
 const MAX_DESCRIPTION = 50000;
+// A place further out than this could not be passed: beyond 2^53 adding one
+// changes nothing, and a capture would no longer land after it (rankAtEnd).
+const MAX_RANK = 2 ** 52;
 
 /** The fields of an item that are stored, and none a panel keeps for itself. */
 function storedForm(item) {
@@ -2953,6 +3193,8 @@ function storedForm(item) {
     element: item.element,
     capturedAt: item.capturedAt,
     armedAt: item.armedAt,
+    // Absent, as for every item nobody moved, it is left out of the write.
+    rank: item.rank,
     editedAt: item.editedAt,
     wordsAt: item.wordsAt || 0,
     path: item.path,
@@ -3087,6 +3329,7 @@ function readItem(raw) {
     mode === 'element' && raw.element && typeof raw.element === 'object' && !Array.isArray(raw.element)
       ? raw.element
       : null;
+  const rank = number(raw.rank);
   return {
     id: raw.id,
     mode,
@@ -3101,6 +3344,7 @@ function readItem(raw) {
     element,
     capturedAt: number(raw.capturedAt) ?? 0,
     armedAt: number(raw.armedAt) ?? undefined,
+    rank: rank != null && Math.abs(rank) <= MAX_RANK ? rank : undefined,
     editedAt: Math.min(number(raw.editedAt) ?? 0, Date.now()),
     wordsAt: Math.min(number(raw.wordsAt) ?? 0, Date.now()),
     thumb: null,
@@ -3155,8 +3399,8 @@ function thumbFrom(thumbs, id) {
  *   panel holds that the writer had not seen yet is written back, so storage
  *   holds it too.
  * - An item on both sides takes the newer words (wordsAt) and the newer
- *   intent and tick (editedAt), each from whichever side changed it last. A
- *   side that holds something newer writes it back.
+ *   intent, tick and place (editedAt), each from whichever side changed it
+ *   last. A side that holds something newer writes it back.
  * - Which window has focus decides nothing. The old rule kept the sentence of
  *   whichever panel had its field focused, and the field stays the active
  *   element of a window that has lost focus: a panel in the background
@@ -3205,6 +3449,7 @@ function adoptStored(report, thumbs, { initial = false } = {}) {
     if (theirs.editedAt > (mine.editedAt || 0)) {
       mine.intent = theirs.intent;
       mine.included = theirs.included;
+      mine.rank = theirs.rank;
       mine.editedAt = theirs.editedAt;
       changed.add(mine);
     } else if ((mine.editedAt || 0) > theirs.editedAt) {
@@ -3234,9 +3479,11 @@ function adoptStored(report, thumbs, { initial = false } = {}) {
     next.push(mine);
     writeBack = true; // the writer had not seen it yet
   }
-  // Capture order, the same in every panel, so that "item 3" is one item.
-  // The sort is stable, so a sheet already in order stays as it is.
-  next.sort((a, b) => (a.capturedAt || 0) - (b.capturedAt || 0));
+  // The order of the sheet, the same in every panel: where an item was moved
+  // to, else when it was captured. An item still saving here stands at its
+  // place in this panel's memory, so a move made while it saved holds. The
+  // sort is stable, so a sheet already in order stays as it is.
+  next.sort(bySheetOrder);
 
   const reshaped = next.length !== state.items.length || next.some((item, i) => item !== state.items[i]);
   const wasEmpty = state.items.length === 0;
@@ -3249,7 +3496,7 @@ function adoptStored(report, thumbs, { initial = false } = {}) {
     // elsewhere. A frame emptied on purpose (New item) stays empty.
     const keep = state.items.some((item) => item.id === state.selectedId);
     const fallback =
-      initial || wasEmpty || state.selectedId != null ? (state.items.at(-1)?.id ?? null) : null;
+      initial || wasEmpty || state.selectedId != null ? (newestItem()?.id ?? null) : null;
     selectItem(keep ? state.selectedId : fallback);
   } else {
     for (const item of changed) refreshRow(item);
@@ -3558,6 +3805,37 @@ el.refreshContext.addEventListener('click', refreshContext);
 // the list and the panel both scroll under a hovering pointer.
 el.list.addEventListener('scroll', hideTip, { passive: true });
 document.addEventListener('scroll', hideTip, { passive: true, capture: true });
+
+// A row dragged over the list shows where it would land, and is moved there
+// when dropped. Anything else dragged here is refused as before, by leaving
+// the event alone (see ownDrag). Near the list's top or bottom edge Chrome
+// scrolls the list itself.
+el.list.addEventListener('dragover', (event) => {
+  if (!ownDrag(event)) return;
+  event.preventDefault();
+  event.dataTransfer.dropEffect = 'move';
+  markSlot(dropSlot(event.clientY));
+});
+el.list.addEventListener('drop', (event) => {
+  if (!ownDrag(event)) return;
+  event.preventDefault();
+  const id = dragged;
+  const slot = dropSlot(event.clientY);
+  endDrag();
+  // The gap above the row's own place, or below it, moves nothing.
+  const from = state.items.findIndex((item) => item.id === id);
+  if (from !== -1) moveItem(id, slot > from ? slot - 1 : slot);
+});
+// Out of the list, the line goes; a drop there, or Esc, moves nothing.
+el.list.addEventListener('dragleave', (event) => {
+  if (ownDrag(event) && !el.list.contains(event.relatedTarget)) markSlot(null);
+});
+// A press means no drag is under way: Chrome sends no pointer events during
+// one. So a drag whose end never reached its row, rebuilt meanwhile, leaves
+// nothing dimmed past the next press.
+document.addEventListener('pointerdown', () => {
+  if (dragged != null) endDrag();
+});
 // Open while the pointer is on it, so it can be read at length.
 el.tip.addEventListener('mouseenter', cancelHideTip);
 el.tip.addEventListener('mouseleave', scheduleHideTip);
@@ -3762,6 +4040,31 @@ document.addEventListener('keydown', (event) => {
     cancelArmed();
     return;
   }
+  // Alt (Option on a Mac) with the up or down arrow moves the row the
+  // keyboard is on, on its button or its tick, one place. Checked before the
+  // keys an armed mode takes: the row has the keyboard, and a one pixel nudge
+  // of the region's box, or a step of the element highlight (the picker pays
+  // no heed to Alt), is not what was meant. From anywhere else in the panel
+  // the keys still go on to the page.
+  if (
+    event.altKey &&
+    !event.metaKey &&
+    !event.ctrlKey &&
+    !event.shiftKey &&
+    !event.isComposing &&
+    (event.key === 'ArrowUp' || event.key === 'ArrowDown')
+  ) {
+    const index = [...el.list.children].findIndex((row) => row.contains(document.activeElement));
+    if (index !== -1) {
+      event.preventDefault();
+      const to = index + (event.key === 'ArrowUp' ? -1 : 1);
+      // Said again on every press at either end, see announceAnew.
+      if (to < 0) announceAnew(`Item ${index + 1} is already first.`);
+      else if (to >= state.items.length) announceAnew(`Item ${index + 1} is already last.`);
+      else moveItem(state.items[index].id, to);
+      return;
+    }
+  }
   if (forwardsKey(event)) {
     event.preventDefault();
     handKeyToPage(event);
@@ -3777,7 +4080,8 @@ const PAGE_KEYS = ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Enter'];
  * the arrows and Enter go on to the page while a mode is armed: not from a
  * text field, where they move the caret, and Enter only from the lit mode
  * button or from nowhere in particular, so that Enter on another button still
- * presses it.
+ * presses it. Alt with the up or down arrow on a row of the sheet never gets
+ * here: it moves the row (see the keydown listener).
  */
 function forwardsKey(event) {
   if (!PAGE_KEYS.includes(event.key) || event.isComposing) return false;
@@ -3830,6 +4134,9 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 
 el.version.textContent = `v${chrome.runtime.getManifest().version}`;
 showShortcut();
+// What every row's description says about the keys that move it, named as
+// this platform's keyboard names them.
+el.rowMoveHint.textContent = `${onMac() ? 'Option' : 'Alt'} and the up or down arrow move this item.`;
 
 // Startup. Declared last so it runs after every listener is wired, but consumed
 // by the onMessage handler above, which defers until this settles rather than

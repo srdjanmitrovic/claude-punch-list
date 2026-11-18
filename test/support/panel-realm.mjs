@@ -149,6 +149,29 @@ class FakeImage {
   }
 }
 
+/**
+ * A DataTransfer as a drag event carries one: setData adds a type, and types
+ * lists them, as Chrome lets the page read during a dragover. `types` is what
+ * a drag from elsewhere brings, such as ['Files'] for a file.
+ */
+export function makeDataTransfer(types = []) {
+  const data = new Map(types.map((type) => [type, '']));
+  return {
+    data,
+    effectAllowed: 'uninitialized',
+    dropEffect: 'none',
+    get types() {
+      return [...data.keys()];
+    },
+    setData(type, value) {
+      data.set(String(type).toLowerCase(), String(value));
+    },
+    getData(type) {
+      return data.get(String(type).toLowerCase()) ?? '';
+    },
+  };
+}
+
 /** Answers the way the worker does when everything goes to plan. */
 export function defaultWorker(message) {
   switch (message.type) {
@@ -166,10 +189,11 @@ export function defaultWorker(message) {
 }
 
 /**
- * @param {{ worker?: (message: object) => any, tab?: object, setup?: (chrome: object) => void }} options
+ * @param {{ worker?: (message: object) => any, tab?: object, setup?: (chrome: object) => void, globals?: object }} options
  *   worker answers each runtime.sendMessage: a value, a promise of one, or a
  *   throw for a worker that did not answer. setup can change the chrome fake
- *   before the panel loads.
+ *   before the panel loads. globals are more names in the panel's global
+ *   scope from its first line, such as a navigator.
  */
 export function loadPanel({
   worker = defaultWorker,
@@ -178,6 +202,7 @@ export function loadPanel({
   // The panel's fetch, in place before panel.js runs, so what it asks for
   // at load is seen too.
   fetch = async () => ({ blob: async () => ({}) }),
+  globals = {},
 } = {}) {
   const clock = makeClock();
   const elements = new Map();
@@ -329,6 +354,7 @@ export function loadPanel({
     fetch,
     setTimeout: clock.setTimeout,
     clearTimeout: clock.clearTimeout,
+    ...globals,
   });
 
   // Same line count as the import it replaces, so stack traces point at the
@@ -372,6 +398,18 @@ export function loadPanel({
     /** Fire the document's own listeners for `type` with `event`. */
     documentEvent(type, event = {}) {
       for (const listener of documentListeners.get(type) || []) listener(event);
+    },
+    /**
+     * Lay the sheet's rows out for getBoundingClientRect, each `height` px
+     * tall and `gap` px below the one before, from the top of the list, as
+     * Chrome reports them; the stub lays nothing out by itself. A rebuild of
+     * the list makes new rows, which need laying out again.
+     */
+    layOutRows({ height = 40, gap = 4 } = {}) {
+      element('list').children.forEach((row, index) => {
+        const top = index * (height + gap);
+        row.getBoundingClientRect = () => ({ left: 0, right: 300, width: 300, top, bottom: top + height, height });
+      });
     },
     /** A broadcast, from a content script on `tabId` or from the worker. */
     broadcast(message, sender = {}) {

@@ -383,9 +383,9 @@ main {
 /* ------------------------------------------------------------------ sheet -- */
 
 /* The punch list itself, laid out right above the button that sends it. One
-   row per item, in capture order: a tick for whether it goes into the next
-   prompt, a thumbnail, and the sentence. Past a handful of rows the list
-   scrolls rather than pushing the button out of reach. */
+   row per item, in the order of the sheet: a tick for whether it goes into
+   the next prompt, a thumbnail, and the sentence. Past a handful of rows the
+   list scrolls rather than pushing the button out of reach. */
 .sheet {
   margin-bottom: 12px;
 }
@@ -422,12 +422,15 @@ main {
   border: 0;
 }
 
+/* The padding is the 4 px gap between rows, above the first and below the
+   last too, so the line that shows where a dragged row lands has room at
+   either end (see .drop-before). */
 .list {
   display: flex;
   flex-direction: column;
   gap: 4px;
   margin: 0;
-  padding: 0;
+  padding: 4px 0;
   max-height: 268px;
   overflow-y: auto;
   list-style: none;
@@ -435,6 +438,7 @@ main {
 }
 
 .row {
+  position: relative;
   display: grid;
   grid-template-columns: auto 1fr;
   gap: 6px;
@@ -446,6 +450,40 @@ main {
 
 .row:hover {
   border-color: var(--rule-strong);
+}
+
+/* Rows drag to another place once there are two. The cursor is the only sign
+   of it: the row has no width to spare for a grip, and the README names the
+   gesture. */
+.row[draggable="true"] .row-thumb {
+  cursor: grab;
+}
+
+.row.dragging {
+  opacity: 0.45;
+}
+
+/* Where a dragged row would land: an ink line in the 4 px gap above or below
+   a row. Not on the row's own edge, even at either end of the list: the row
+   in the frame draws its edge 2 px thick in the same ink, and a line over it
+   could not be seen. */
+.row.drop-before::before,
+.row.drop-after::after {
+  content: "";
+  position: absolute;
+  left: -1px;
+  right: -1px;
+  height: 2px;
+  background: var(--fg);
+  pointer-events: none;
+}
+
+.row.drop-before::before {
+  top: -4px;
+}
+
+.row.drop-after::after {
+  bottom: -4px;
 }
 
 /* The row in the frame is ink, not magenta. Which item is being edited is a

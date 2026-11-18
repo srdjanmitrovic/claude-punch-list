@@ -548,6 +548,18 @@ EXTRA['sheet-numbers'] = () => {
   return report;
 };
 
+// The walkthrough with its first two rows swapped on the sheet: the bug was
+// moved to the top. Listed and numbered as the sheet now stands, while the
+// log still goes by capture time, so the bug's share of it is what was logged
+// since the capture now numbered 2.
+EXTRA.reordered = () => {
+  const report = sampleReport('mixed');
+  const [first, second, third] = report.items;
+  report.items = [second, first, third];
+  report.items.forEach((item, index) => (item.number = index + 1));
+  return report;
+};
+
 // The page toggle off, one capture on /checkout, the log read on /cart.
 EXTRA['page-off-elsewhere'] = () => {
   const report = sampleReport('bug');

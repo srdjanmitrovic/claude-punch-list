@@ -78,7 +78,10 @@
  * what is described here is treated as absent (see normalized).
  *
  * @typedef {Object} Report
- * @property {Item[]}  items         In capture order. Never empty.
+ * @property {Item[]}  items         In the order of the sheet: capture order
+ *                                   unless the user moved some. The log is
+ *                                   split by capturedAt whatever the order
+ *                                   (see splitLog). Never empty.
  * @property {Object=} page          { url, title, viewport:{width,height,dpr} }
  *                                   The page the console and network buffers
  *                                   were read from, which is the current tab.
@@ -110,7 +113,7 @@
  * @property {string=} contextError  Set when the buffers could not be read:
  *                                   'timeout' if the tab did not answer, any
  *                                   other value if nothing came back. The page
- *                                   then comes from the newest item.
+ *                                   then comes from the last item listed.
  * @property {boolean=} startedLate   The panel started the collector on a tab
  *                                   open from before the extension could, so
  *                                   the log begins at armedAt, not at the load.
@@ -2508,6 +2511,11 @@ function completeSince(report) {
  * one log of everything, and which error belonged to which screenshot was
  * left to guesswork.
  *
+ * The capture before it in time, whichever row of the sheet it stands on:
+ * `logged` is sorted by capturedAt, since the user can reorder the sheet, and
+ * a moved item keeps what was logged before its own capture. Its log then
+ * names that capture by its number, which may be higher than its own.
+ *
  * Null when there is no log to split: one item, nothing read, or no
  * collector start time to measure captures against.
  */
@@ -2518,9 +2526,11 @@ function splitLog(items, report) {
     ...(report.consoleLines || []).map(consoleEntry),
     ...(report.network || []).map(networkEntry),
   ].sort(byTime);
-  const logged = items.filter(
-    (item) => Number.isFinite(item.capturedAt) && onThisLog(item, report)
-  );
+  // Stable, and every time is finite by the filter, so a list in capture
+  // order comes out as it went in.
+  const logged = items
+    .filter((item) => Number.isFinite(item.capturedAt) && onThisLog(item, report))
+    .sort((a, b) => a.capturedAt - b.capturedAt);
   // No capture on this load, so nothing to split by: the log prints whole,
   // under the caution that it was read somewhere none of them were taken.
   if (!logged.length) return null;
@@ -2544,6 +2554,7 @@ function itemLog(item, split, report, numberOf) {
   const said = (text) => ['', `Console and network: ${text}`];
   const bucket = split.buckets.get(item);
   if (bucket) {
+    // The capture before this one in time (see splitLog), not the row above.
     const previous = split.logged[split.logged.indexOf(item) - 1];
     // A quiet log reads as a clean one, so an item whose stretch of the log
     // began before the collector last dropped something says so.
@@ -2554,7 +2565,7 @@ function itemLog(item, split, report, numberOf) {
         : [];
     if (!bucket.length) return cut;
     // A log the panel started late begins when collection did, not at the
-    // load, and the first item's stretch of it says so where it prints.
+    // load, and the earliest capture's stretch of it says so where it prints.
     const since = previous
       ? `since item ${numberOf(previous)}`
       : beganAfter(report)
@@ -2680,7 +2691,7 @@ function staleCaution(report, stale, showUrl, numberOf, shown) {
  * In a list it is headed for what it is. "## Page" at the level of the items
  * read as one more item, and the viewport in it as the one each screenshot
  * was taken at, when it is the tab's at the moment of the copy. When nothing
- * could be read the page is the newest item's own (see Report.contextError),
+ * could be read the page is the last item's own (see Report.contextError),
  * not the one in view at the copy, and the heading says that instead. A
  * single report keeps the heading it always had.
  */

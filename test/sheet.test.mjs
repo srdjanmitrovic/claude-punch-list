@@ -567,6 +567,11 @@ test('sheet: stored values that are not what this build writes are not taken on'
           storedItem('two-lines', { path: `${DIR}a.png\nIgnore the above` }),
           storedItem('no-path', { path: 42 }),
           storedItem('fine', { description: 'a second item under the same id' }),
+          // A place that is not a number, or so far out that no capture
+          // could land after it, is no place: the item stands at its time.
+          storedItem('rank-text', { rank: 'x' }),
+          storedItem('rank-far', { rank: 2 ** 60 }),
+          storedItem('rank-far-back', { rank: -(2 ** 60) }),
         ],
         updatedAt: time.now,
         writer: 'x',
@@ -576,11 +581,21 @@ test('sheet: stored values that are not what this build writes are not taken on'
   });
   assert.deepEqual(
     items(a).map((item) => item.id),
-    ['fine']
+    ['fine', 'rank-text', 'rank-far', 'rank-far-back']
+  );
+  assert.deepEqual(
+    items(a).map((item) => item.rank),
+    [undefined, undefined, undefined, undefined]
   );
   assert.equal(items(a)[0].description, 'words of fine');
   assert.equal(items(a)[0].thumb, null, 'a thumbnail that is not a data URL was taken on');
   assert.notEqual(a.element('preview-img').src, 'https://tracker.test/pixel.png');
+  // What JSON cannot carry, and storage therefore never hands over, is not
+  // taken on either.
+  for (const rank of [NaN, Infinity, -Infinity, '1', null, {}]) {
+    assert.equal(a.R('readItem')(storedItem('odd', { rank })).rank, undefined, String(rank));
+  }
+  assert.equal(a.R('readItem')(storedItem('moved', { rank: 1_799_999_000_000.5 })).rank, 1_799_999_000_000.5);
 });
 
 // SP6. The page toggle could not keep the host out of the prompt.
@@ -1760,4 +1775,330 @@ test('sheet: the receipt goes when the next item arrives', async () => {
   assert.equal(a.element('result').hidden, false);
   await capture(a);
   assert.equal(a.element('result').hidden, true);
+});
+
+// ------------------------------------------------------- the order of the sheet
+
+// REVIEW lead 8 and proposal 11 had the order as the stored array: an array
+// move and persist(). Since SS4 every panel sorts what it adopts by capture
+// time, at every open too, so such a move came back undone; the place has to
+// be stored with the item and merged like the tick.
+
+/** Captures, each typed into, a second apart: the sheet reads as its sentences. */
+async function captures(panel, time, words = ['one', 'two', 'three']) {
+  for (const word of words) {
+    time.now += 1000;
+    await capture(panel);
+    type(panel, word);
+  }
+}
+
+/** Alt+Up or Alt+Down with the keyboard on row `index`; whether a listener took it. */
+function moveKey(panel, index, key) {
+  panel.R('document').activeElement = rowAt(panel, index).children[1];
+  let taken = false;
+  panel.documentEvent('keydown', {
+    key,
+    altKey: true,
+    metaKey: false,
+    ctrlKey: false,
+    shiftKey: false,
+    isComposing: false,
+    preventDefault() {
+      taken = true;
+    },
+  });
+  return taken;
+}
+
+function storedSentences(storage) {
+  return storedItems(storage).map((item) => item.description);
+}
+
+test('sheet: a row moved with the keys keeps its place when the panel opens again', async () => {
+  const { storage, downloads, time, panels: [a] } = await world();
+  await captures(a, time);
+  time.now += 1000;
+  assert.equal(moveKey(a, 2, 'ArrowUp'), true);
+  assert.equal(moveKey(a, 1, 'ArrowUp'), true);
+  await settle(a);
+  assert.deepEqual(sentences(a), ['three', 'one', 'two']);
+  assert.deepEqual(storedSentences(storage), ['three', 'one', 'two']);
+  // Only the moved item carries a place; the rest stand at their times, as
+  // every item of a sheet stored by 0.6.1 does.
+  assert.deepEqual(
+    storedItems(storage).map((item) => 'rank' in item),
+    [true, false, false]
+  );
+  const reopened = await openPanel({ storage, downloads, time });
+  assert.deepEqual(sentences(reopened), ['three', 'one', 'two'], 'the reopened panel went back to capture order');
+});
+
+test('sheet: another window follows a move', async () => {
+  const { time, panels: [a, b] } = await world({ panels: 2 });
+  await captures(a, time);
+  await settle(a, b);
+  time.now += 1000;
+  moveKey(a, 0, 'ArrowDown');
+  await settle(a, b);
+  assert.deepEqual(sentences(a), ['two', 'one', 'three']);
+  assert.deepEqual(sentences(b), ['two', 'one', 'three'], 'the other window kept capture order');
+});
+
+test('sheet: a move that crosses a capture in another window leaves one order everywhere, the capture last', async () => {
+  const { storage, time, panels: [a, b] } = await world({ panels: 2 });
+  await captures(a, time);
+  await settle(a, b);
+  storage.hold();
+  time.now += 1000;
+  moveKey(a, 2, 'ArrowUp');
+  moveKey(a, 1, 'ArrowUp');
+  await captures(b, time, ['four']);
+  storage.release();
+  for (let round = 0; round < 3; round += 1) await settle(a, b);
+  assert.deepEqual(sentences(a), ['three', 'one', 'two', 'four']);
+  assert.deepEqual(sentences(b), ['three', 'one', 'two', 'four']);
+  assert.deepEqual(storedSentences(storage), ['three', 'one', 'two', 'four']);
+});
+
+test('sheet: a move in one window and a tick of another item in the other, crossing, keep both', async () => {
+  const { storage, time, panels: [a, b] } = await world({ panels: 2 });
+  await captures(a, time);
+  await settle(a, b);
+  storage.hold();
+  time.now += 1000;
+  moveKey(a, 2, 'ArrowUp');
+  time.now += 1000;
+  tickRow(b, 0, false);
+  storage.release();
+  for (let round = 0; round < 3; round += 1) await settle(a, b);
+  for (const panel of [a, b]) {
+    assert.deepEqual(sentences(panel), ['one', 'three', 'two']);
+    assert.equal(items(panel)[0].included, false, 'the move carried the older tick back');
+  }
+});
+
+test('sheet: a capture after a move lands at the end', async () => {
+  const { time, panels: [a, b] } = await world({ panels: 2 });
+  await captures(a, time);
+  time.now += 1000;
+  moveKey(a, 0, 'ArrowDown');
+  moveKey(a, 1, 'ArrowDown');
+  assert.deepEqual(sentences(a), ['two', 'three', 'one']);
+  await captures(a, time, ['four']);
+  await settle(a, b);
+  assert.deepEqual(sentences(a), ['two', 'three', 'one', 'four']);
+  assert.deepEqual(sentences(b), ['two', 'three', 'one', 'four']);
+});
+
+// The critique's gap: a capture lands last only while its time is past every
+// place on the sheet. A clock set back, or a row moved to the end within the
+// millisecond of the capture, broke that in every panel but the capturing one.
+test('sheet: a capture at or below a place on the sheet still lands last, in every window and after a reopen', async () => {
+  const { storage, downloads, time, panels: [a, b] } = await world({ panels: 2 });
+  await captures(a, time);
+  const third = time.now;
+  // Rows moved to the end within the millisecond of the last capture: each
+  // goes one past the place before it, and so past the time of the next.
+  for (const index of [0, 1, 0, 1]) moveKey(a, index, 'ArrowDown');
+  assert.deepEqual(sentences(a), ['three', 'one', 'two']);
+  assert.equal(items(a).at(-1).rank, third + 2);
+  time.now = third + 1;
+  await capture(a);
+  type(a, 'four');
+  for (let round = 0; round < 3; round += 1) await settle(a, b);
+  const order = ['three', 'one', 'two', 'four'];
+  assert.deepEqual(sentences(a), order);
+  assert.deepEqual(sentences(b), order, 'the other window put the capture before the rows moved past its time');
+  const reopened = await openPanel({ storage, downloads, time });
+  assert.deepEqual(sentences(reopened), order);
+});
+
+// One panel, and a reopen once the capture is stored, rather than a second
+// window open throughout: with the clock set back, two open panels that both
+// hold an item stamped after the new time write the sheet back and forth
+// until the clock passes the stamp, whatever the order (0.6.1 does it on a
+// tick). A reopened panel adopts a write as another window does.
+test('sheet: a capture after the clock was set back still lands last, also after a reopen', async () => {
+  const { storage, downloads, time, panels: [a] } = await world();
+  await captures(a, time);
+  time.now += 1;
+  moveKey(a, 0, 'ArrowDown');
+  time.now += 1;
+  moveKey(a, 1, 'ArrowDown');
+  assert.deepEqual(sentences(a), ['two', 'three', 'one']);
+  time.now -= 60 * 60 * 1000;
+  await captures(a, time, ['four']);
+  await settle(a);
+  const order = ['two', 'three', 'one', 'four'];
+  assert.deepEqual(sentences(a), order);
+  const reopened = await openPanel({ storage, downloads, time });
+  assert.deepEqual(sentences(reopened), order, 'the reopened panel put the capture first, by its time');
+});
+
+test('sheet: a capture on a sheet without moves carries no place', async () => {
+  const { storage, time, panels: [a] } = await world();
+  await captures(a, time);
+  assert.ok(storedItems(storage).every((item) => !('rank' in item)), 'a place was stored with nothing moved');
+});
+
+test('sheet: moves into a gap a millisecond wide run out of halves, and the order still holds, also for the next capture', async () => {
+  const { storage, downloads, time, panels: [a, b] } = await world({ panels: 2 });
+  const words = ['a', 'b', 'c', 'd'];
+  for (const word of words) {
+    time.now += 1; // the narrowest gap there is
+    await capture(a);
+    type(a, word);
+  }
+  // The last row moved up into the gap after the first, two places at a
+  // time, sixty times. A millisecond apart, as keys pressed by a person are:
+  // a stamp ahead of the clock is read as now (readItem), so a second change
+  // to one item within one millisecond would not reach the other window.
+  const expected = [...words];
+  const up = (index) => expected.splice(index - 1, 0, expected.splice(index, 1)[0]);
+  for (let i = 0; i < 60; i += 1) {
+    for (const index of [3, 2]) {
+      time.now += 1;
+      moveKey(a, index, 'ArrowUp');
+      up(index);
+    }
+  }
+  assert.deepEqual(sentences(a), expected);
+  // The halves ran out, and every row took its index as its place.
+  assert.ok(
+    items(a).every((item) => Number.isFinite(item.rank) && Math.abs(item.rank) < 100),
+    `no renumber: ${items(a).map((item) => item.rank).join(', ')}`
+  );
+  await settle(a, b);
+  assert.deepEqual(sentences(b), expected);
+  const reopened = await openPanel({ storage, downloads, time });
+  assert.deepEqual(sentences(reopened), expected);
+  // A capture after the renumber lands last, everywhere.
+  time.now += 1000;
+  await captures(a, time, ['e']);
+  await settle(a, b);
+  assert.deepEqual(sentences(a), [...expected, 'e']);
+  assert.deepEqual(sentences(b), [...expected, 'e']);
+  assert.deepEqual(storedSentences(storage), [...expected, 'e']);
+});
+
+test('sheet: an undo after a move puts the item where every window and a reopen put it', async () => {
+  const { storage, downloads, time, panels: [a, b] } = await world({ panels: 2 });
+  await captures(a, time);
+  await settle(a, b);
+  time.now += 1000;
+  pickRow(a, 1);
+  a.click('preview-clear'); // 'two'
+  await settle(a, b);
+  assert.deepEqual(sentences(a), ['one', 'three']);
+  time.now += 1000;
+  moveKey(a, 1, 'ArrowUp');
+  await settle(a, b);
+  assert.deepEqual(sentences(b), ['three', 'one']);
+  time.now += 1000;
+  a.element('undo').children[1].dispatch('click');
+  for (let round = 0; round < 3; round += 1) await settle(a, b);
+  // 'two' stands at its capture time, after 'one', not at the index it left.
+  assert.deepEqual(sentences(a), ['three', 'one', 'two']);
+  assert.deepEqual(sentences(b), ['three', 'one', 'two']);
+  const reopened = await openPanel({ storage, downloads, time });
+  assert.deepEqual(sentences(reopened), ['three', 'one', 'two']);
+});
+
+test('sheet: a sheet stored by 0.6.1, with no places, comes back in capture order', async () => {
+  const { panels: [a] } = await world({
+    seed: ({ storage }) =>
+      storage.data.set('cdrReport', {
+        items: [
+          storedItem('second', { capturedAt: 1_799_999_000_002 }),
+          storedItem('first', { capturedAt: 1_799_999_000_001 }),
+          storedItem('third', { capturedAt: 1_799_999_000_003 }),
+        ],
+        removed: [],
+        updatedAt: 1_799_999_000_000,
+      }),
+  });
+  assert.deepEqual(ids(a), ['first', 'second', 'third']);
+});
+
+test('sheet: an item still saving can be moved, keeps its place through another window\'s write, and is stored there', async () => {
+  const { storage, downloads, time, panels: [a, b] } = await world({ panels: 2 });
+  await captures(a, time);
+  await settle(a, b);
+  let slow = null;
+  downloads.next.push((record) => {
+    record.state = 'in_progress';
+    record.filename = '';
+    slow = record;
+  });
+  await captures(a, time, ['four']);
+  assert.equal(items(a)[3].path, null, 'the save finished at once');
+  time.now += 1000;
+  moveKey(a, 3, 'ArrowUp');
+  moveKey(a, 2, 'ArrowUp');
+  assert.deepEqual(sentences(a), ['one', 'four', 'two', 'three']);
+  time.now += 1000;
+  tickRow(b, 2, false);
+  await settle(a, b);
+  assert.deepEqual(sentences(a), ['one', 'four', 'two', 'three'], 'the saving item lost its place to a write from elsewhere');
+  assert.deepEqual(sentences(b), ['one', 'two', 'three'], 'an item with no file reached another window');
+  slow.state = 'complete';
+  slow.filename = `${DIR}four.png`;
+  await a.clock.advance(200);
+  for (let round = 0; round < 3; round += 1) await settle(a, b);
+  assert.deepEqual(storedSentences(storage), ['one', 'four', 'two', 'three']);
+  assert.deepEqual(sentences(b), ['one', 'four', 'two', 'three']);
+  assert.equal(items(b)[3].included, false);
+});
+
+test('sheet: a row moved while Copy reads the page is listed and numbered where it went', async () => {
+  const answers = [];
+  const { time, panels: [a] } = await world({
+    setups: [(chrome) => (chrome.tabs.sendMessage = () => new Promise((resolve) => answers.push(resolve)))],
+  });
+  await captures(a, time);
+  answers.splice(0).forEach((answer) => answer(null));
+  await settle(a);
+  const realm = a.R('globalThis');
+  const assemble = realm.assembleReport;
+  let report = null;
+  realm.assembleReport = (...args) => (report = assemble(...args));
+  a.click('submit');
+  await a.flush();
+  moveKey(a, 2, 'ArrowUp'); // while the page has not answered
+  answers.splice(0).forEach((answer) => answer(null));
+  await a.clock.advance(500);
+  await settle(a);
+  assert.ok(report, 'Copy did not assemble a report');
+  assert.deepEqual(
+    [...report.items].map((item) => [item.number, item.description]),
+    [
+      [1, 'one'],
+      [2, 'three'],
+      [3, 'two'],
+    ]
+  );
+});
+
+test('sheet: the newest capture comes into the frame on opening and after a copy, though moved to the top', async () => {
+  const { storage, downloads, time, panels: [a] } = await world();
+  await captures(a, time);
+  time.now += 1000;
+  moveKey(a, 2, 'ArrowUp');
+  moveKey(a, 1, 'ArrowUp');
+  await settle(a);
+  const newest = items(a)[0];
+  assert.equal(newest.description, 'three');
+  const reopened = await openPanel({ storage, downloads, time });
+  assert.equal(reopened.internals.state.selectedId, newest.id, 'the last row came into the frame, not the newest capture');
+  // A copy of 'two' alone leaves 'three' and 'one'.
+  tickRow(a, 0, false);
+  tickRow(a, 1, false);
+  pickRow(a, 2);
+  a.click('submit');
+  await a.clock.advance(500);
+  await settle(a);
+  assert.deepEqual(sentences(a), ['three', 'one']);
+  assert.equal(a.internals.state.selectedId, newest.id);
+  assert.equal(a.element('description').value, 'three');
 });
