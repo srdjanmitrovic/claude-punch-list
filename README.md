@@ -63,7 +63,8 @@ was collected while you walked. Claude Code opens the images itself.
 * **Three ways to frame.** Drag a region, click an element, or grab the whole viewport.
   Element captures also bring the node's markup, its computed styles, the React or Vue component
   that rendered it, the handlers bound to it, and a line of search targets, so Claude Code opens
-  a file instead of grepping class names.
+  a file instead of grepping class names. While you hover, the highlight already names that
+  component, so you know what you are about to pick.
 * **Failed requests name their caller.** A 500 in the console tells you what broke. The prompt
   also tells you which function sent it, and from which file and line.
 * **Bugs and suggestions on the same sheet.** Each item is either. The prompt opens with
@@ -150,6 +151,17 @@ in the screenshot. The rest of that press, and the second press of a double clic
 the page for about a second after the pick, and a press that begins in that second is kept from
 it until the button comes up (five seconds at most). If you pick with <kbd>Enter</kbd> and keep it
 held, its repeats and its release are kept from the page until you let go.
+
+**The name on the highlight.** On a React or Vue page, the tag over the highlight gives the
+element, its size and the component that rendered it, the name the item's Component line will start
+with, and it follows the highlight as the arrow keys move it. A name the bundler made up shows as
+`<A> minified`, since it appears nowhere in your source. Over an element in a closed shadow root
+the tag names the component of the root's host, and over a frame, the component that rendered the
+frame. The name is read in the page once for each element the highlight goes to, by the pointer,
+Tab or the arrow keys, with nothing written into the page and nothing posted to it, and it is kept
+nowhere. On a page with no component, on a site you keep the collector off, and in a tab left open
+across an update or reload of the extension (whose old collector may not know the question) until
+you reload the tab, the tag gives the element and its size alone.
 
 **Frames and shadow roots.** A frame (an iframe, embed or object) is picked as a whole: nothing
 inside it can be picked, and no click goes into it while Element is armed. Frames let the pointer
@@ -861,9 +873,13 @@ announce that channel to each other only until it is in use, which at page load 
 page has run a line, and the collector sends and reads those events through functions it took
 before the page ran, so a getter a page script later puts on an event's or an object's prototype
 never runs while it answers. Even so, a script written against this extension can still tell it
-is installed (by the probe event a running collector answers, or a stack through one of its
-wrappers), open a channel of its own and read the log over it, lines logged before it ran
-included, or open eight and push the panel's channel out, so the panel reads nothing there. On a
+is installed (by the probe event a running collector answers, the event it answers with a
+component's name, or a stack through one of its wrappers), open a channel of its own and read the
+log over it, lines logged before it ran included, or open eight and push the panel's channel out,
+so the panel reads nothing there. While you pick an element, it can also tell which element the
+highlight is on, the arrow keys' included, from the question the picker asks for its
+component's name, and answer that question with a name of its own or keep the answer back. That
+changes the name on the highlight and nothing else, since that name goes into no prompt. On a
 tab that was already open, where the extension starts the collector after the page's own scripts
 are running, it can also overhear the panel's channel and answer in the collector's place, or
 hold the live counts on the chips back until the panel next reads the log, and that collector

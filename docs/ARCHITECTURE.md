@@ -29,6 +29,7 @@ sidepanel/panel.js ......... orchestrates everything. Captures the tab, crops
         ^                             and posts the counts on a port to the panel.
         | channel events              |
         | (the log, the counts)       | window.postMessage (inspect, from the picker)
+        |                             | an event on the node (the name, while hovering)
         v                             v
        content/collector-main.js .... MAIN world, always on. Wraps console,
                                       fetch and XHR from document_start, and
@@ -102,10 +103,14 @@ and push the live bridge's channel out, which leaves the page's log unread and t
 the reload advice. And when the extension starts on a tab that was already open (see
 [A tab that was open before](#a-tab-that-was-open-before)), the bridge has to announce its
 channel where a page listener can hear it, and a script listening then can read every snapshot
-over it and answer in the collector's place. None of this lets it put anything into a prompt that
-it could not put there by logging made up lines, which any page can do, and what it can read is
-the page's own console and network activity, which it could record anyway by wrapping the same
-functions.
+over it and answer in the collector's place. It can send `__cdr_name` on a node of its own and
+learn from the reply that the extension is there, hear the picker's `__cdr_name` while Element is
+armed and learn which element is highlighted (the arrow keys' included), and answer it before the
+collector does or keep the answer back (see [The name while hovering](#the-name-while-hovering)),
+which changes the name on the tag and nothing else. None of this lets it put anything into a
+prompt that it could not put there by logging made up lines, which any page can do, and what it
+can read is the page's own console and network activity, which it could record anyway by
+wrapping the same functions.
 
 While the side panel is open and shown on a tab, it also holds a port to that tab's bridge,
 `cdr:counts`, opened with `chrome.tabs.connect` to the top frame once a read has found the
@@ -287,6 +292,40 @@ selector costs an element of the light DOM. So 300 roots of 1,000 elements each 
 512 roots of 2,000 elements each 58.9 ms, where 0.6.0 took 0.1 and 0.2 ms. A budget of elements
 shared by the roots would cap that, but one root of 10,000 elements or more, such as a data grid,
 would then hide a password field in every root after it.
+
+#### The name while hovering
+
+While Element is armed, the tag over the highlight names the component as well, and that question
+takes another road than a pick's, because it is asked as often as once a frame for as long as the
+pointer moves. It writes nothing into the page and posts nothing. The picker sends a `__cdr_name`
+event on the highlighted node itself (on the outermost closed host through `reachOf`, as at a
+pick), composed, so that it gets out of an open shadow root, and not bubbling. The collector hears
+it in a capture listener on the window and answers with `__cdr_name:reply` on the window:
+`{ name, renamed }`, or `null` when no component is found. Dispatch is synchronous and crosses the
+two worlds, so the reply is in before the picker's `dispatchEvent` returns, in the frame the box
+is drawn in, and its detail reaches the picker as a copy its world makes as it reads it. The
+collector reads the node off `composedPath()[0]`, through the native it took at `document_start`,
+because the target a listener on the window sees is the shadow host. The picker asks once for
+each element an arm highlights (a `WeakMap`), asks before it draws, so page code that runs during
+the answer cannot leave the box and the tag on different elements, and stops asking for the rest
+of the arm when no reply comes at all (a tab with no collector, or a collector of 0.6.1 or earlier
+left from before an update).
+
+The name comes from `componentOf(node, true)`, the brief path, whose contract is stated on the
+function and in CONTRIBUTING.md: the walk a pick makes for the names, and nothing after it. No
+props, so none of the guard's look through the document and its shadow roots for secret fields,
+and no owner or call site. A pick's round trip, guard included, took 1.24 ms at 20 000 elements
+and 8.5 ms at 100 000 (Chrome 157), and a name about 4 microseconds, at 20 000 elements or
+100 000. The two can disagree in one case: the hover reaches a node in an open shadow root
+wherever it is, while a pick looks for its marked node there with `findMarked`, which gives up
+after 20 000 elements, so on a very large page the tag can name a component the pick then does
+not report.
+
+The type is public, not one of the bridge's random channels, on purpose. Page code can run while
+the name is read (a getter on a fiber's type, or on `Element.prototype.parentElement`), and while
+it runs `window.event` is the request. On a channel it would hand the page the channel's name,
+and with it the log. What crosses on `__cdr_name` is the name of one of the page's own
+components, and a request sent from inside an answer gets none.
 
 #### A tab that was open before
 
@@ -535,6 +574,17 @@ and a script that answered every unknown action with the snapshot would hand the
 buffer to present as a component. The bridge, when it falls back to an old collector, and the
 picker keep their ids apart by type, numbers from the bridge and strings from the picker, so
 each ignores the other's replies on a window they both listen to.
+
+While Element is armed the picker asks one thing more, with a pair of DOM events rather than
+messages (see [The name while hovering](#the-name-while-hovering)):
+
+| Event | Sent on | Purpose |
+| :--- | :--- | :--- |
+| `__cdr_name` | the highlighted node, by the picker, composed and not bubbling | Asks for the name of the component behind the node. No detail |
+| `__cdr_name:reply` | the window, by the collector, before the request's dispatch returns | `{ name, renamed }`: the nearest component's name, and `renamed: true` when a bundler made it up, or `null` when there is none. The picker takes the first reply, cuts the name to 60 characters and writes it as text |
+
+Both are public by design. A page can send, answer or stop them (see the end of
+`collector-main.js`), and what it changes is the name on the tag, which reaches no prompt.
 
 A few things about the first table are load bearing.
 
@@ -1452,7 +1502,9 @@ screen is the actual code; only the platform is faked. What it does not reproduc
   there. Every script runs in the page's own JavaScript world, because
   there is no isolated world here: the bridge, the overlay and the picker share globals and
   prototypes with the page and with the collector. A picker that read a React fiber off a node
-  by itself would work on the stage and find nothing in Chrome.
+  by itself would work on the stage and find nothing in Chrome. The name the picker asks for
+  while hovering crosses no world here either: its reply's detail is the collector's own object,
+  not the copy Chrome makes, so a reply that would not survive that copy still shows there.
 * **Messages.** A broadcast from the page reaches the panel synchronously, inside the call that
   sent it, and the panel receives the very object that was sent. Chrome serialises every message
   and delivers it in a later task, so a value that does not survive serialisation, or code that

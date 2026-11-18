@@ -42,6 +42,12 @@ you are picking an element or have just picked one: it reads, keeps and sends no
 wherever the collector is set to run, in pages loaded since the extension was installed or
 enabled.
 
+While you are picking an element, the extension also reads, in the page, the name of the React
+or Vue component behind the highlighted element, and shows it beside the highlight. It does so
+each time the highlight moves to another element, by the pointer, Tab or the arrow keys, keeps
+nothing of it and sends nothing. The name goes into an item only if you pick that element, as
+part of what Element takes, below.
+
 **When you capture something** with Region, Element or Screen, the extension takes:
 
 * a screenshot of the visible part of the tab, cropped to what you framed;

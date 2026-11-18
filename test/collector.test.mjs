@@ -363,6 +363,33 @@ function arm({ fetch, before, dom = false, loading = false } = {}) {
     for (const listener of listeners.get(type) || []) listener(event);
   }
 
+  /**
+   * The picker's question while it hovers, sent on node (see the name
+   * request in collector-main.js), through the page's dispatchEvent: the
+   * reply's detail, plain, null for a reply that names nothing, or
+   * undefined when nothing answered. This window has no Event, so the
+   * collector reads the node off event.target.
+   */
+  function name(node) {
+    let heard = false;
+    let detail;
+    const take = (event) => {
+      heard = true;
+      detail = event.detail;
+    };
+    // Straight into the list, as the picker's listener in its own world is
+    // out of reach of what the page replaces in this one.
+    if (!listeners.has('__cdr_name:reply')) listeners.set('__cdr_name:reply', []);
+    listeners.get('__cdr_name:reply').push(take);
+    try {
+      page.dispatchEvent({ type: '__cdr_name', target: node });
+    } finally {
+      listeners.set('__cdr_name:reply', listeners.get('__cdr_name:reply').filter((one) => one !== take));
+    }
+    if (!heard) return undefined;
+    return detail === null ? null : plain(detail);
+  }
+
   return {
     page,
     self,
@@ -371,6 +398,7 @@ function arm({ fetch, before, dom = false, loading = false } = {}) {
     run,
     request,
     dispatch,
+    name,
     snapshot: () => request('snapshot'),
     realm: (code) => vm.runInContext(code, page),
     posted,
@@ -4731,4 +4759,239 @@ test('collector: its frames carry an address of its own scheme, not the extensio
   page.realm('sameName').finish(500, 'Internal Server Error', ['readystatechange', 'load']);
   const same = page.snapshot().network.find((one) => one.url === '/api/same');
   assert.equal(same.caller[0], 'sendFromSameName (http://localhost/assets/collector-main.js:1:69)');
+});
+
+// ------------------------------------------------------ the name on hover --
+// While Element is armed, the picker's tag names the component behind the
+// highlighted element, asked with an event sent on the node and answered on
+// the window (the name request at the end of collector-main.js), through
+// componentOf(node, true). Each test below holds that answer to the brief
+// contract in componentOf's comment, or to the name a pick reports.
+
+/** A plain node, as the bare realm's elements are, with a fiber or Vue's expandos on it. */
+const nodeWith = (expandos = {}, parentElement = null) => ({ removeAttribute() {}, parentElement, ...expandos });
+
+/** A React development tree: a host fiber under the named component fibers given, nearest first. */
+function devFibers(...types) {
+  let parent = null;
+  for (const type of [...types].reverse()) {
+    parent = { tag: 0, type, memoizedProps: {}, return: parent, _debugOwner: null };
+  }
+  return { tag: 5, type: 'button', memoizedProps: {}, return: parent, _debugOwner: parent };
+}
+
+test('collector: a name asked for while hovering is the name a pick reports, and says when the bundler made it up', () => {
+  const page = arm();
+  const named = (name, extra = {}) => Object.assign({ [name]: function () {} }[name], extra);
+  const forwardRef = { $$typeof: Symbol.for('react.forward_ref'), render: function SaveButton() {} };
+  const Row = function Row() {};
+  const memo = { $$typeof: Symbol.for('react.memo'), type: Row };
+  const provider = named('TooltipProviderProvider', { displayName: 'TooltipProviderProvider' });
+  // Production: no _debug* key on any fiber.
+  const production = (...types) => {
+    let parent = null;
+    for (const type of [...types].reverse()) parent = { tag: 0, type, memoizedProps: {}, return: parent };
+    return { tag: 5, type: 'div', memoizedProps: {}, return: parent };
+  };
+  const cases = {
+    'a development component': nodeWith({ __reactFiber$t: devFibers(named('Total'), named('CartSummary')) }),
+    'a Provider folded into its component': nodeWith({ __reactFiber$t: devFibers(provider, named('TooltipProvider'), named('App')) }),
+    'forwardRef': nodeWith({ __reactFiber$t: devFibers(forwardRef, named('Toolbar')) }),
+    'memo over its function': nodeWith({ __reactFiber$t: devFibers(memo, Row, named('List')) }),
+    'a bundler\'s name': nodeWith({ __reactFiber$t: production(named('A'), named('tN'), named('App')) }),
+    'a production Provider folded': nodeWith({ __reactFiber$t: production(provider, named('TooltipProvider')) }),
+    // A node from dangerouslySetInnerHTML: no fiber of its own, one up.
+    'found by climbing': nodeWith({}, nodeWith({ __reactFiber$t: devFibers(named('Markdown')) })),
+    'Vue 3': nodeWith({ __vnode: { ctx: { type: { name: 'CartSummary' }, props: {}, parent: null } } }),
+    'Vue 3 slot content, named for whoever wrote it': nodeWith({
+      __vnode: { ctx: { type: { __name: 'CheckoutPage' }, props: {}, parent: null } },
+      __vueParentComponent: { type: { name: 'Card' }, props: {}, parent: null },
+    }),
+    'Vue 3 named by its file': nodeWith({ __vnode: { ctx: { type: { __file: '/src/components/PriceTag.vue' }, props: {}, parent: null } } }),
+  };
+  const expected = {
+    'a development component': { name: 'Total', renamed: false },
+    'a Provider folded into its component': { name: 'TooltipProvider', renamed: false },
+    'forwardRef': { name: 'SaveButton', renamed: false },
+    'memo over its function': { name: 'Row', renamed: false },
+    'a bundler\'s name': { name: 'A', renamed: true },
+    'a production Provider folded': { name: 'TooltipProvider', renamed: false },
+    'found by climbing': { name: 'Markdown', renamed: false },
+    'Vue 3': { name: 'CartSummary', renamed: false },
+    'Vue 3 slot content, named for whoever wrote it': { name: 'CheckoutPage', renamed: false },
+    'Vue 3 named by its file': { name: 'PriceTag', renamed: false },
+  };
+  const names = {};
+  for (const [label, node] of Object.entries(cases)) {
+    names[label] = page.name(node);
+    assert.deepEqual(names[label], expected[label], label);
+  }
+  assert.deepEqual(page.posted, [], 'a name went to window.postMessage');
+  for (const [label, node] of Object.entries(cases)) {
+    page.page.document.querySelector = () => node;
+    const { component } = page.request('inspect', { marker: 'pick1' });
+    assert.equal(names[label].name, component.names[0], `${label}: not the name the pick reports`);
+    assert.equal(names[label].renamed, component.renamed === true, `${label}: renamed differs from the pick's`);
+  }
+});
+
+test('collector: a name asked for while hovering reads no prop, no owner, no call site and nothing of the document', () => {
+  const page = arm({
+    dom: true,
+    // Counted from before the collector starts, since it takes these then.
+    before: `
+      globalThis.documentWork = [];
+      const count = (proto, key) => {
+        const native = proto[key];
+        proto[key] = function (...args) { documentWork.push(key); return native.apply(this, args); };
+      };
+      count(Document.prototype, 'querySelectorAll');
+      count(Document.prototype, 'getElementsByTagName');
+      count(DocumentFragment.prototype, 'querySelectorAll');
+      count(DocumentFragment.prototype, 'querySelector');
+      const shadow = Object.getOwnPropertyDescriptor(Element.prototype, 'shadowRoot');
+      Object.defineProperty(Element.prototype, 'shadowRoot', {
+        configurable: true,
+        get() { documentWork.push('shadowRoot'); return shadow.get.call(this); },
+      });
+    `,
+  });
+  const reads = [];
+  const watch = (object, keys) => {
+    for (const key of keys) {
+      const value = object[key];
+      Object.defineProperty(object, key, {
+        configurable: true,
+        enumerable: true,
+        get() {
+          reads.push(key);
+          return value;
+        },
+      });
+    }
+    return object;
+  };
+  // A password field on the page, which a pick's guard reads.
+  const secret = new page.page.HTMLInputElement('input', { type: 'password' });
+  secret.value = 'hunter2';
+  const Total = function Total() {};
+  const component = watch({ tag: 0, type: Total, memoizedProps: { amount: 5 }, return: null, _debugOwner: null }, ['memoizedProps', 'alternate']);
+  const host = watch(
+    { tag: 5, type: 'button', memoizedProps: { id: 'pay' }, return: component, _debugOwner: component },
+    ['memoizedProps', '_debugOwner', '_debugSource', '_debugStack']
+  );
+  const button = new page.page.Element('button', { id: 'pay' });
+  button.__reactFiber$t = host;
+  const field = new page.page.Element('input', {});
+  const instance = watch(
+    { type: watch({ name: 'CouponField', __file: '/src/CouponField.vue' }, ['__file']), props: { modelValue: 'x' }, parent: null, appContext: {}, subTree: null },
+    ['props', 'appContext', 'subTree']
+  );
+  field.__vnode = { ctx: instance, props: {} };
+
+  assert.deepEqual(page.name(button), { name: 'Total', renamed: false });
+  assert.deepEqual(page.name(field), { name: 'CouponField', renamed: false });
+  assert.deepEqual(reads, [], 'read for the name');
+  assert.deepEqual(plain(page.realm('documentWork')), [], 'the document was searched for the name');
+
+  // A pick reads all of it, so the counts above can see it.
+  for (const node of [button, field]) {
+    page.page.document.querySelector = () => node;
+    page.request('inspect', { marker: 'pick1' });
+  }
+  assert.ok(reads.includes('memoizedProps') && reads.includes('_debugOwner') && reads.includes('props'), reads.join());
+  assert.ok(page.realm('documentWork').includes('querySelectorAll'), 'a pick searched nothing either');
+});
+
+test('collector: a name asked for in a deep tree with no component climbs a bounded number of elements', () => {
+  const page = arm();
+  let climbed = 0;
+  let node = null;
+  for (let depth = 0; depth < 10000; depth += 1) {
+    const parent = node;
+    node = {};
+    Object.defineProperty(node, 'parentElement', {
+      get() {
+        climbed += 1;
+        return parent;
+      },
+    });
+  }
+  // node is the deepest, 10,000 elements from the top.
+  assert.equal(page.name(node), null);
+  // CLIMB_LIMIT (500) up for React, and as many again for Vue.
+  assert.ok(climbed <= 1000, `${climbed} elements climbed`);
+});
+
+test('collector: a name asked for on a page with no component is answered with null, and one that throws too', () => {
+  const page = arm();
+  assert.equal(page.name(nodeWith()), null);
+  assert.equal(page.name(null), null);
+  const throwing = {
+    'a fiber whose return throws': nodeWith({
+      __reactFiber$t: {
+        tag: 5,
+        type: 'div',
+        get return() {
+          throw new Error('the page refuses');
+        },
+      },
+    }),
+    'an element whose parent throws': {
+      get parentElement() {
+        throw new Error('the page refuses');
+      },
+    },
+  };
+  for (const [label, node] of Object.entries(throwing)) {
+    let reply;
+    assert.doesNotThrow(() => {
+      reply = page.name(node);
+    }, label);
+    assert.equal(reply, null, label);
+  }
+  // And it still answers after.
+  assert.deepEqual(page.name(nodeWith({ __reactFiber$t: devFibers(function Total() {}) })), { name: 'Total', renamed: false });
+});
+
+test('collector: a name asked for again from inside an answer, by a getter of the page, gets none and does not recurse', () => {
+  const page = arm();
+  const other = nodeWith({ __reactFiber$t: devFibers(function Other() {}) });
+  let calls = 0;
+  let inner = 'not asked';
+  const Total = function Total() {};
+  Object.defineProperty(Total, 'displayName', {
+    get() {
+      calls += 1;
+      inner = page.name(other);
+      return undefined;
+    },
+  });
+  assert.deepEqual(page.name(nodeWith({ __reactFiber$t: devFibers(Total) })), { name: 'Total', renamed: false });
+  assert.equal(inner, undefined, 'the request sent from inside the answer was answered');
+  assert.equal(calls, 1);
+  assert.deepEqual(page.name(other), { name: 'Other', renamed: false });
+});
+
+test('collector: the name is answered through the natives taken at document_start, and a page whose addEventListener throws sees nothing thrown', () => {
+  const page = arm();
+  // Replaced after the collector started: the reply does not go through them.
+  page.realm(`
+    globalThis.sent = [];
+    const dispatch = window.dispatchEvent;
+    window.dispatchEvent = function (event) { sent.push(event.type); return dispatch.call(this, event); };
+    window.addEventListener = function () { throw new Error('patched'); };
+    CustomEvent = function () { throw new Error('patched'); };
+  `);
+  const node = nodeWith({ __reactFiber$t: devFibers(function Total() {}) });
+  assert.deepEqual(page.name(node), { name: 'Total', renamed: false });
+  assert.deepEqual(plain(page.realm('sent')), ['__cdr_name'], 'the reply went through the page\'s dispatchEvent');
+
+  // Started late, where the page's own addEventListener throws: no answer,
+  // and nothing thrown into the page.
+  let late;
+  assert.doesNotThrow(() => {
+    late = arm({ before: "addEventListener = function () { throw new Error('the page refuses'); };" });
+  });
+  assert.equal(late.name(node), undefined);
 });

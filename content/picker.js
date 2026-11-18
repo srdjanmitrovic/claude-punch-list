@@ -838,6 +838,10 @@
     let shadow = null;
     let box = null;
     let tag = null;
+    // The tag's two parts: the element with its size, and the component
+    // behind it (see componentLabel()).
+    let what = null;
+    let who = null;
     let hint = null;
     let shields = null;
     let active = false;
@@ -1015,6 +1019,21 @@
     // costs the lookup for at most that one arm.
     let mainWorldSilent = false;
     let pingId = null;
+    // The tag's component names this arm, by element, so that an element
+    // highlighted again (tick() draws a moving one again every frame) is not
+    // asked again; and whether the page answered nothing, which it does with
+    // no collector, or one of 0.6.1 or earlier, so that the rest of the arm
+    // asks no more (see componentLabel()).
+    let labels = new WeakMap();
+    let namesSilent = false;
+    // Set while a name is asked. Page code can run during the answer, and a
+    // focus it moves there highlights another element from inside it (see
+    // componentLabel()).
+    let asking = false;
+    // The question the tag asks the MAIN world (see askName()), and the most
+    // of a name it shows.
+    const NAME_REQUEST = '__cdr_name';
+    const NAME_ROOM = 60;
 
     /**
      * Replies from the MAIN world collector.
@@ -1219,6 +1238,91 @@
     }
 
     /**
+     * The MAIN world's answer to what component is behind a node, for the
+     * tag: NAME_REQUEST sent on the node itself, which the collector hears
+     * on its window and answers on the window before dispatchEvent returns
+     * (see the name request in collector-main.js). Nothing is written into
+     * the page and nothing is posted, unlike inspect(). Composed, or a node
+     * in an open shadow root would not reach the collector's listener. The
+     * reply's detail comes from the other world as a copy, which Chrome
+     * makes as it is read, and one a page made can throw there.
+     *
+     * Only a reply heard during the dispatch counts, and only the first.
+     * Returns its detail, or undefined when none came.
+     */
+    function askName(node) {
+      let heard = false;
+      let detail;
+      const take = (event) => {
+        if (heard) return;
+        heard = true;
+        try {
+          detail = event.detail;
+        } catch {
+          detail = null;
+        }
+      };
+      window.addEventListener(`${NAME_REQUEST}:reply`, take, true);
+      asking = true;
+      try {
+        node.dispatchEvent(new CustomEvent(NAME_REQUEST, { composed: true }));
+      } catch {
+        /* nothing asked: as a page with no collector */
+      } finally {
+        asking = false;
+        window.removeEventListener(`${NAME_REQUEST}:reply`, take, true);
+      }
+      return heard ? detail : undefined;
+    }
+
+    /**
+     * A reply rebuilt as the tag shows it: `<Name>`, cut to NAME_ROOM
+     * characters, with ` minified` after it when the bundler made the name
+     * up (the item's Component line says so too, and searching the source
+     * for it finds nothing). Anything else, a null reply included, is ''.
+     */
+    function adoptName(reply) {
+      if (!reply || typeof reply !== 'object') return '';
+      let name;
+      let renamed;
+      try {
+        name = reply.name;
+        renamed = reply.renamed === true;
+      } catch {
+        return '';
+      }
+      if (typeof name !== 'string' || !name) return '';
+      if (name.length > NAME_ROOM) name = `${name.slice(0, NAME_ROOM - 1)}…`;
+      return renamed ? `<${name}> minified` : `<${name}>`;
+    }
+
+    /**
+     * What the tag says of the component behind an element, or '': asked
+     * once for each element in an arm, about the node the page's world can
+     * reach (see reachOf()), so inside a closed shadow root about its
+     * outermost host, as the item will be. With no answer at all, the rest
+     * of the arm asks no more.
+     */
+    function componentLabel(element) {
+      if (namesSilent) return '';
+      if (labels.has(element)) return labels.get(element);
+      // Highlighted from inside another element's answer, by page code that
+      // ran there and moved the focus. The collector answers one request at
+      // a time, so this one would go unanswered and be taken for a page with
+      // no collector. The highlight that asked first draws over this one
+      // anyway, so it goes without a name, and is not kept as having none.
+      if (asking) return '';
+      const reply = askName(reachOf(element).node);
+      if (reply === undefined) {
+        namesSilent = true;
+        return '';
+      }
+      const label = adoptName(reply);
+      labels.set(element, label);
+      return label;
+    }
+
+    /**
      * A component and handlers read from the host of a closed shadow root
      * (see reachOf()), put as the host's: counted from the picked element,
      * up through the host, and named after it, as the collector names an
@@ -1322,12 +1426,20 @@
             padding: 4px 7px;
             border-radius: 3px;
             display: none;
+            gap: 1ch;
+            align-items: baseline;
             pointer-events: none;
             white-space: nowrap;
             max-width: 60vw;
             overflow: hidden;
-            text-overflow: ellipsis;
           }
+          /* Short of room, the element gives way first, down to its first
+             three characters and the ellipsis (never wider than it is: the
+             shortest reads "p  0×0"), and the component's name only after
+             it. */
+          .what { flex: 0 100000 auto; min-width: 4ch; overflow: hidden; text-overflow: ellipsis; }
+          .who { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; font-weight: 500; }
+          .who:empty { display: none; }
           .hint {
             position: fixed;
             left: 50%;
@@ -1353,6 +1465,12 @@
       tag = shadow.querySelector('.tag');
       hint = shadow.querySelector('.hint');
       shields = shadow.querySelector('.shields');
+      // Made here and only ever given text: what goes in the second comes
+      // from the page.
+      what = tag.appendChild(document.createElement('span'));
+      what.className = 'what';
+      who = tag.appendChild(document.createElement('span'));
+      who.className = 'who';
     }
 
     function describe(element) {
@@ -1366,6 +1484,11 @@
     }
 
     function highlight(element) {
+      // Asked before anything is drawn. Page code can run while the page's
+      // world answers (a getter on a fiber), and whatever it sets off in
+      // here, a focus that highlights another element, is then drawn over
+      // and not left with the box on one element and the tag on another.
+      const label = componentLabel(element);
       current = element;
       const r = element.getBoundingClientRect();
       placed = `${r.left},${r.top},${r.width},${r.height}`;
@@ -1375,11 +1498,15 @@
       box.style.width = r.width + 'px';
       box.style.height = r.height + 'px';
 
-      tag.style.display = 'block';
-      tag.textContent = describe(element);
+      what.textContent = describe(element);
+      who.textContent = label;
+      tag.style.display = 'flex';
       const above = r.top - 26;
       tag.style.top = (above < 4 ? Math.min(r.bottom + 6, window.innerHeight - 26) : above) + 'px';
-      tag.style.left = Math.max(4, Math.min(r.left, window.innerWidth - 200)) + 'px';
+      // Measured, since a component's name can make it wider than the 200
+      // pixels once assumed. The page was laid out for the box just above,
+      // so this lays out only the picker's own parts.
+      tag.style.left = Math.max(4, Math.min(r.left, window.innerWidth - (tag.offsetWidth || 200) - 4)) + 'px';
     }
 
     /**
@@ -3757,6 +3884,10 @@
       pointer = null;
       scrolled = false;
       if (mainWorldSilent) ping();
+      // A page silent last arm may have a collector by now, and a name read
+      // before hydration, or before a rename, is read again.
+      labels = new WeakMap();
+      namesSilent = false;
       taken.clear();
       hint.style.display = 'block';
       shields.style.display = 'block';

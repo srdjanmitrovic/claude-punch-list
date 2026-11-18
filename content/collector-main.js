@@ -65,6 +65,15 @@
     const returned = dispatchWindowEvent(window, event);
     return eventCancelled ? eventCancelled(event) === true : !returned;
   };
+  // The node the picker asked a component's name of (see answerName, at the
+  // end of this file), read through the native as well: a page that later
+  // replaced composedPath (a polyfill, a framework's patch of Event) could
+  // otherwise make every answer throw, or name another node. Every Chrome
+  // this runs in has it; where a world has none, event.target is read.
+  const eventPath =
+    NativeEvent && typeof NativeEvent.prototype.composedPath === 'function'
+      ? uncurry(NativeEvent.prototype.composedPath)
+      : null;
 
   /**
    * A CustomEvent of this world's own. Its init dictionary has no prototype
@@ -3397,7 +3406,12 @@
     return false;
   }
 
-  function reactSummary(node) {
+  /**
+   * The React component behind a node. With `brief` (see componentOf), the
+   * summary ends once the names are known: the walk that builds them is the
+   * same either way, so names[0] and `renamed` are what a pick reports.
+   */
+  function reactSummary(node, brief) {
     const found = fiberOf(node);
     if (!found) return null;
     const host = found.fiber;
@@ -3462,6 +3476,11 @@
     // appears anywhere in the source, which changes what the reader should do
     // with it: correlate it with React DevTools, do not grep for it.
     if (nearest) summary.renamed = true;
+    // No owner, call site or props: the owner and the call site are read
+    // from what React keeps for its own DevTools, the props are guarded by a
+    // look through the document (reactGuard), and none of it is shown on
+    // hover.
+    if (brief) return summary;
 
     try {
       // Read from the HOST fiber, and do not go looking for the owner in the
@@ -3972,8 +3991,11 @@
    * enumerable, so the key scan the React side does would never see it. Vue
    * also only sets it under __DEV__ or __FEATURE_PROD_DEVTOOLS__, so a plain
    * production build offers nothing and null is the honest answer.
+   *
+   * With `brief` (see componentOf), the summary ends once the names are
+   * known, as reactSummary's does.
    */
-  function vueSummary(node) {
+  function vueSummary(node, brief) {
     let element = node;
     let hops = 0;
     let instance = null;
@@ -4024,6 +4046,9 @@
       names,
       hops,
     };
+    // No build, file, props (vueGuard looks through the document) or
+    // version.
+    if (brief) return summary;
 
     // Vue cannot be asked which build it is, only which build it is not.
     //
@@ -4096,6 +4121,42 @@
     return null;
   }
 
+  /**
+   * The component behind a node, nearest first, or null: the one place the
+   * framework readers are listed. inspect() asks it at a pick, and
+   * answerName() at each element the picker highlights while Element is
+   * armed (see the end of this file). A reader for another framework goes
+   * in here, in the order it is to be tried, and answers null for a node it
+   * does not know.
+   *
+   * With `brief`, every reader keeps to what the hover can afford, asked as
+   * often as once a frame for as long as the pointer moves:
+   *
+   *   It reads names only: `framework`, `names` and, where it applies,
+   *   `renamed`. No props, so no guard (reactGuard, vueGuard) and none of
+   *   its look through the document and its shadow roots for secret
+   *   fields: a pick's round trip, guard included, took 1.24 ms at 20,000
+   *   elements and 8.5 ms at 100,000 (Chrome 157), and a name about 4
+   *   microseconds.
+   *   It does no work across the whole document: no querySelectorAll or
+   *   getElementsByTagName of it, and no walk of its shadow roots.
+   *   It calls no function of the page's or of its framework's. A read can
+   *   still run a getter the page planted, as it can at a pick.
+   *   It looks at a fixed number of nodes, however large the page is:
+   *   CLIMB_LIMIT elements up from the node, CLIMB_LIMIT steps up the
+   *   framework's own tree, and at most SUBTREE_LIMIT nodes of a walk down
+   *   the component's own render tree, as Vue 2's reader walks its vnodes
+   *   to learn which component wrote an element.
+   *   Its names[0] and `renamed` are the ones it gives without `brief`, so
+   *   the tag shows the name the item's Component line will start with.
+   *
+   * A reader that cannot keep to this answers null when `brief` is set, and
+   * so is simply not asked while hovering.
+   */
+  function componentOf(node, brief) {
+    return reactSummary(node, brief) || vueSummary(node, brief);
+  }
+
   function inspect(marker) {
     try {
       if (typeof marker !== 'string' || !marker) return null;
@@ -4118,7 +4179,7 @@
       // exception must not leave the extension's attribute on the user's page.
       node.removeAttribute('data-cdr-pick');
 
-      const component = reactSummary(node) || vueSummary(node);
+      const component = componentOf(node, false);
       // Which build this is was decided from the fiber by reactSummary(), so
       // the fiber is not looked up a second time to ask again. No component
       // means no handler bodies are read, which is the same outcome as a
@@ -4420,6 +4481,73 @@
     /* the picker then finds no component, as on a page with none */
   }
 
+  // While Element is armed, the picker's tag names the component behind the
+  // element it highlights, the name the item's Component line will start
+  // with. It asks once for each element it highlights in an arm, with
+  // NAME_REQUEST sent on that node itself, and this answers with
+  // NAME_REQUEST + ':reply' on the window: { name, renamed } from
+  // componentOf(node, true), or null when no component is found. Dispatch is
+  // synchronous and crosses the two worlds, so the answer is in before the
+  // picker's dispatchEvent returns, in the frame the box is drawn in, with
+  // nothing written into the page and nothing posted. The picker sends it
+  // composed, so that it reaches this listener from inside an open shadow
+  // root, without bubbling, which is why this listens in the capture phase;
+  // the node is read off the event's path, since the target seen from the
+  // window is the shadow host's. A node in a closed root is never asked
+  // about: the picker asks about the root's host instead, as it does at a
+  // pick.
+  //
+  // The type is public, and not one of the bridge's channels, on purpose.
+  // Page code can run while the name is read (a getter on a fiber's type, or
+  // on Element.prototype.parentElement), and while it does window.event is
+  // this request: on a channel it would read the channel's name off it, and
+  // then the log. What crosses here is the name of a component of the page's
+  // own, which the page can read for itself.
+  const NAME_REQUEST = '__cdr_name';
+  // Set while a request is answered, so that one a page getter sends from
+  // inside the answer gets none, rather than a recursion.
+  let naming = false;
+
+  /** The node a name request was sent on, as this world sees it. */
+  function requestedNode(event) {
+    if (eventPath) {
+      // An array of this world's own, so its length and its first index are
+      // its own properties, and no accessor on Array.prototype is consulted.
+      const path = eventPath(event);
+      return path.length > 0 ? path[0] : null;
+    }
+    return event.target;
+  }
+
+  function answerName(event) {
+    if (naming) return;
+    naming = true;
+    try {
+      let reply = null;
+      try {
+        const node = requestedNode(event);
+        const found = node ? componentOf(node, true) : null;
+        const name = found ? found.names[0] : null;
+        if (typeof name === 'string' && name) reply = { name, renamed: found.renamed === true };
+      } catch {
+        // A throwing getter on a fiber or an element: no name, and the
+        // picker shows the element alone.
+        reply = null;
+      }
+      dispatchWindowEvent(window, newEvent(NAME_REQUEST + ':reply', reply, false));
+    } catch {
+      /* no CustomEvent: the picker hears nothing, and asks no more this arm */
+    } finally {
+      naming = false;
+    }
+  }
+
+  try {
+    addWindowListener(window, NAME_REQUEST, answerName, true);
+  } catch {
+    /* the tag then shows the element alone, as on a page with no collector */
+  }
+
   // snapshot() deliberately stays inside this closure, and no global marks
   // the collector: a page could read one to tell the extension is
   // installed. Being honest about the limit of this: code running in the
@@ -4439,6 +4567,18 @@
   // the page's own console and network activity, which the first script
   // the page runs could wrap for itself; a script that runs later can read,
   // through this, what came before it.
+  //
+  // The name request is open to it too. It can send NAME_REQUEST on a node
+  // of its own and be told the name of the component behind it, which it
+  // could read from its own framework, and which also tells it the
+  // extension is installed, as the probe does. It can hear the picker's
+  // requests, and so learn which element the highlight is on, also one
+  // reached with the keys (the pointer's moves reach it anyway). And it can
+  // stop the reply, put one of its own in its place (a capture listener for
+  // the reply added before the picker's, which is added for each request,
+  // runs first), or answer where no collector runs. None of that goes
+  // further than the tag: the picker rebuilds the reply to a name of at most
+  // 60 characters, writes it as text, and never puts it in a prompt.
 })();
 
 // The address V8 gives this file, in stacks, in console messages and in CSP

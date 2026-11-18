@@ -28,7 +28,11 @@
  * out again at each frame, at a hit test and at a read of any style, the
  * whole page at once; a change the page makes waits for that, and a fade it
  * asks for (opacity, display allow-discrete) begins there, cut short by a
- * sheet that holds discrete transitions back at that moment.
+ * sheet that holds discrete transitions back at that moment. An event sent on
+ * an element meets window's capture listeners at once, before dispatchEvent
+ * returns, and its bubbling ones only if it bubbles; from inside a shadow
+ * root it gets out only if composed (seen in Chrome 157 with the picker's
+ * name question, which got no answer from inside an open root without it).
  *
  * Time is a fake clock the test moves, a frame at a time.
  */
@@ -218,6 +222,10 @@ class FakeElement extends FakeNode {
   // events.
   addEventListener() {}
   removeEventListener() {}
+  /** An event sent on this element, as the realm routes it (see makeRealm's onDispatch). */
+  dispatchEvent(event) {
+    return this.ownerDocument.onDispatch(this, event);
+  }
   /** As Chrome answers it: display, then opacity 0 up the tree, then the visibility it inherits. */
   checkVisibility(options = {}) {
     if (!this.ownerDocument.rendered(this)) return false;
@@ -461,12 +469,13 @@ class FakeDocument extends FakeNode {
     // Transient user activation: until when it lasts, and whether the page
     // ever had it (sticky activation, never withdrawn).
     this.activation = { until: 0, sticky: false };
-    // Set by the realm: the clock, a timer on it, a popover's toggle, and a
-    // transition event the page hears.
+    // Set by the realm: the clock, a timer on it, a popover's toggle, a
+    // transition event the page hears, and an event sent on an element.
     this.now = () => 0;
     this.later = () => {};
     this.onToggle = () => {};
     this.onTransition = () => {};
+    this.onDispatch = () => true;
   }
   /**
    * A restyle, as Chrome makes one at each frame, at a hit test and at a
@@ -896,6 +905,8 @@ function makeRealm() {
   // What reached the page's own listeners, what went into a frame, and the
   // transition events the page heard.
   const page = { seen: [], framed: [], events: [], transitions: [] };
+  // Every event sent on an element, { type, node }, in order.
+  const sentOn = [];
   doc.now = () => clock.now;
   doc.later = (fn, ms) => clock.setTimeout(fn, ms);
   doc.onTransition = (type) => page.transitions.push(type);
@@ -911,6 +922,26 @@ function makeRealm() {
         for (const entry of root.listeners.filter((one) => one.type === 'toggle')) entry.fn.call(root, event);
       }
     }, 0);
+  // An event sent on an element reaches window's capture listeners, and its
+  // bubbling ones only if it bubbles. One not composed stays in the shadow
+  // root it was sent in, and one sent on an element in no document goes
+  // nowhere: in Chrome a request sent in an open root without composed got
+  // no answer from the page's world. It is not a press, and the page's
+  // count of what it saw leaves it out.
+  doc.onDispatch = (node, event) => {
+    sentOn.push({ type: event.type, node });
+    if (!node.isConnected) return true;
+    if (!event.composed && node.getRootNode() !== doc) return true;
+    const seen = deliver(event.type, {
+      target: doc.retarget(node, doc),
+      deep: node,
+      detail: event.detail,
+      composed: Boolean(event.composed),
+      quiet: true,
+      captureOnly: !event.bubbles,
+    });
+    return !seen.defaultPrevented;
+  };
 
   const window = {
     document: doc,
@@ -997,6 +1028,22 @@ function makeRealm() {
     postMessage(data) {
       setImmediate(() => deliver('message', { data }));
     },
+    // Enough of one for the picker's question while it hovers: a type and
+    // the init dictionary's detail, bubbles and composed.
+    CustomEvent: class CustomEvent {
+      constructor(type, init = {}) {
+        this.type = String(type);
+        this.detail = init.detail === undefined ? null : init.detail;
+        this.bubbles = Boolean(init.bubbles);
+        this.composed = Boolean(init.composed);
+      }
+    },
+    // An event sent on the window, by the picker's world or the page's:
+    // heard at once by every listener for its type.
+    dispatchEvent(event) {
+      const seen = deliver(event.type, { detail: event.detail, quiet: true });
+      return !seen.defaultPrevented;
+    },
     chrome: {
       // A content script's way to a closed shadow root. Chrome refuses
       // anything but an HTML element.
@@ -1072,6 +1119,9 @@ function makeRealm() {
         return path;
       },
     };
+    // A detail whose read throws, as one copied out of another world can
+    // (a page's object Chrome cannot clone).
+    if (init.lazyDetail) Object.defineProperty(event, 'detail', { get: init.lazyDetail });
     const run = (capture) => {
       for (const entry of listeners.filter((one) => one.type === type && one.capture === capture)) {
         if (immediate) return;
@@ -1083,7 +1133,9 @@ function makeRealm() {
       page.seen.push(type);
       page.events.push(event);
     }
-    if (!stopped) run(false);
+    // An event sent on an element that does not bubble meets window's
+    // listeners only on its way down.
+    if (!stopped && !init.captureOnly) run(false);
     return event;
   }
 
@@ -1208,6 +1260,32 @@ function makeRealm() {
     part(name) {
       const host = realm.host();
       return host ? host.attached.children.find((element) => element.className === name) : null;
+    },
+    /**
+     * A MAIN world collector's answer to the name the picker asks for while
+     * it hovers, as collector-main.js gives it: heard by a capture listener
+     * on window, with the node read off the event's path, and answered on
+     * the window before the picker's dispatchEvent returns. answer(node)
+     * gives the reply's detail, or undefined for no reply at all. Returns
+     * the nodes asked about, in order.
+     */
+    namer(answer) {
+      const asked = [];
+      window.addEventListener(
+        '__cdr_name',
+        (event) => {
+          const node = event.composedPath()[0];
+          asked.push(node);
+          const detail = answer(node);
+          if (detail !== undefined) deliver('__cdr_name:reply', { detail, quiet: true });
+        },
+        true
+      );
+      return asked;
+    },
+    /** The elements the picker sent its name question on, in order, answered or not. */
+    asks() {
+      return sentOn.filter((entry) => entry.type === '__cdr_name').map((entry) => entry.node);
     },
     /** A MAIN world collector that answers every request with reply(data). */
     collector(reply) {
@@ -3174,4 +3252,366 @@ test('picker events: a frame in skipped content at the arm and scrolled into vie
   await realm.idle(500);
   assert.deepEqual(realm.page.transitions, [], 'the page heard transition events');
   assert.equal(later.layouts || 0, 0, 'the frame was laid out while skipped');
+});
+
+// ------------------------------------------------------ the name on hover --
+// The tag names the component behind the highlighted element, asked of the
+// page's world with an event sent on the node and answered before the
+// dispatch returns (see askName() in picker.js and the name request in
+// collector-main.js). Lead 8 and proposal 15 of the review.
+
+/** The tag's text, and its two parts. */
+function tagOf(realm) {
+  const tag = realm.part('tag');
+  const [what, who] = tag.children;
+  return { text: tag.textContent, what: what?.textContent, who: who?.textContent, shown: tag.style.display };
+}
+
+test('picker events: the tag names the component under the pointer, in the move that draws the box', async () => {
+  const realm = makeRealm();
+  const card = realm.add('div', { class: 'card' }, [100, 100, 200, 100]);
+  realm.add('p', { class: 'aside' }, [600, 100, 120, 40]);
+  realm.namer((node) => (node === card ? { name: 'Card', renamed: false } : null));
+  realm.arm();
+  await realm.frame();
+  realm.move(150, 150);
+  // No frame has run since the move.
+  assert.equal(realm.part('box').style.display, 'block');
+  assert.deepEqual(tagOf(realm), { text: 'div.card  200×100<Card>', what: 'div.card  200×100', who: '<Card>', shown: 'flex' });
+  assert.equal(tagOf(realm).text.split(' ')[0], 'div.card');
+  // An element with no component shows as it always did.
+  realm.move(650, 120);
+  assert.deepEqual(tagOf(realm), { text: 'p.aside  120×40', what: 'p.aside  120×40', who: '', shown: 'flex' });
+  realm.key('Escape');
+});
+
+test('picker events: hovering writes no attribute into the page and posts nothing', async () => {
+  const realm = makeRealm();
+  const one = realm.add('button', { id: 'one' }, [100, 100, 100, 40]);
+  const two = realm.add('button', { id: 'two' }, [300, 100, 100, 40]);
+  realm.namer((node) => ({ name: node === one ? 'Save' : 'Cancel' }));
+  realm.arm();
+  await realm.frame();
+  const written = [];
+  const posted = [];
+  const setAttribute = FakeElement.prototype.setAttribute;
+  const postMessage = realm.window.postMessage;
+  FakeElement.prototype.setAttribute = function (name, value) {
+    if (!realm.doc.inPicker(this) && !this.hasAttribute('data-cdr-picker')) written.push(name);
+    return setAttribute.call(this, name, value);
+  };
+  realm.window.postMessage = (data) => {
+    posted.push(data);
+    return postMessage(data);
+  };
+  try {
+    for (const [x, y] of [[150, 120], [350, 120], [150, 120]]) {
+      realm.move(x, y);
+      await realm.frame();
+    }
+    realm.key('ArrowUp');
+  } finally {
+    FakeElement.prototype.setAttribute = setAttribute;
+    realm.window.postMessage = postMessage;
+  }
+  assert.deepEqual(realm.asks(), [one, two]);
+  assert.deepEqual(written, []);
+  assert.deepEqual(posted, []);
+  assert.equal([one, two].some((node) => node.hasAttribute('data-cdr-pick')), false);
+  realm.key('Escape');
+});
+
+test('picker events: each element is asked once an arm, however often it is highlighted, and a moving one is not asked every frame', async () => {
+  const realm = makeRealm();
+  const still = realm.add('button', { id: 'still' }, [100, 100, 100, 40]);
+  let shift = 0;
+  const moving = realm.add('button', { id: 'moving' }, () => [300 + shift, 100, 100, 40]);
+  const asked = realm.namer((node) => ({ name: node === still ? 'Still' : 'Moving' }));
+  realm.arm();
+  await realm.frame();
+  for (const x of [150, 350, 150, 350]) {
+    realm.move(x, 120);
+    await realm.frame();
+  }
+  // tick() draws the box again wherever the element has gone.
+  for (let index = 0; index < 10; index += 1) {
+    shift += 1;
+    await realm.frame();
+  }
+  assert.equal(realm.part('box').style.left, '310px', 'the box did not follow the element');
+  assert.equal(tagOf(realm).who, '<Moving>');
+  assert.deepEqual(asked, [still, moving]);
+  assert.deepEqual(realm.asks(), [still, moving]);
+  realm.key('Escape');
+});
+
+test('picker events: with nothing to answer, the tag is as it was, and the arm asks once', async () => {
+  const realm = makeRealm();
+  const one = realm.add('button', { id: 'one', class: 'save' }, [100, 100, 100, 40]);
+  const two = realm.add('button', { id: 'two' }, [300, 100, 100, 40]);
+  realm.arm();
+  await realm.frame();
+  realm.move(150, 120);
+  assert.deepEqual(tagOf(realm), { text: 'button#one.save  100×40', what: 'button#one.save  100×40', who: '', shown: 'flex' });
+  realm.move(350, 120);
+  realm.key('ArrowUp');
+  realm.move(150, 120);
+  await realm.frame(3);
+  assert.equal(tagOf(realm).text, 'button#one.save  100×40');
+  assert.deepEqual(realm.asks(), [one], 'a silent page was asked again in the same arm');
+  // The next arm asks again, and a collector that has come meanwhile is heard.
+  realm.key('Escape');
+  realm.namer(() => ({ name: 'SaveButton' }));
+  realm.arm();
+  await realm.frame();
+  realm.move(152, 120);
+  assert.equal(tagOf(realm).text, 'button#one.save  100×40<SaveButton>');
+  assert.deepEqual(realm.asks(), [one, one]);
+  realm.key('Escape');
+});
+
+test('picker events: an element the page\'s world finds no component for shows as it was, and the arm goes on asking', async () => {
+  const realm = makeRealm();
+  const plain = realm.add('div', { id: 'plain' }, [100, 100, 100, 40]);
+  const card = realm.add('div', { id: 'card' }, [300, 100, 100, 40]);
+  realm.namer((node) => (node === card ? { name: 'Card' } : null));
+  realm.arm();
+  await realm.frame();
+  realm.move(150, 120);
+  assert.equal(tagOf(realm).text, 'div#plain  100×40');
+  realm.move(350, 120);
+  assert.equal(tagOf(realm).text, 'div#card  100×40<Card>');
+  realm.move(150, 120);
+  assert.deepEqual(realm.asks(), [plain, card]);
+  realm.key('Escape');
+});
+
+test('picker events: the name is asked of the outermost closed host inside a closed root, of the element inside an open one, and of a frame itself', async () => {
+  const realm = makeRealm();
+  const doc = realm.doc;
+  const sealed = realm.add('x-sealed', { id: 'sealed' }, [100, 100, 300, 100]);
+  const pay = sealed.attachShadow({ mode: 'closed' }).appendChild(new FakeElement(doc, 'button', { class: 'pay' }));
+  pay.rect = [120, 120, 80, 30];
+  const card = realm.add('x-card', {}, [100, 300, 300, 100]);
+  const save = card.attachShadow({ mode: 'open' }).appendChild(new FakeElement(doc, 'button', { class: 'save' }));
+  save.rect = [120, 320, 80, 30];
+  realm.add('div', { id: 'under' }, [500, 100, 400, 300]);
+  const frame = realm.add('iframe', { id: 'fr', src: '/embed' }, [550, 150, 300, 200]);
+  const names = new Map([[sealed, 'PaymentCard'], [save, 'SaveButton'], [frame, 'Embed']]);
+  const asked = realm.namer((node) => (names.has(node) ? { name: names.get(node) } : null));
+  realm.arm();
+  await realm.frame();
+  realm.move(150, 130);
+  assert.equal(tagOf(realm).text, 'button.pay  80×30<PaymentCard>');
+  realm.move(150, 330);
+  assert.equal(tagOf(realm).text, 'button.save  80×30<SaveButton>');
+  realm.move(700, 250);
+  await realm.frame();
+  assert.equal(tagOf(realm).text, 'iframe#fr  300×200<Embed>');
+  assert.deepEqual(asked, [sealed, save, frame]);
+  // Sent on the host, not inside its closed root, where the component's own
+  // listeners would have heard it.
+  assert.deepEqual(realm.asks(), [sealed, save, frame]);
+  assert.equal(realm.asks().filter(insideClosed).length, 0, 'asked inside a closed root');
+  realm.key('Escape');
+});
+
+test('picker events: a reply that is not a name is dropped or rebuilt, and nothing it does throws', async () => {
+  const realm = makeRealm();
+  const replies = [
+    ['long', { name: 'N'.repeat(10000) }, `<${'N'.repeat(59)}…>`],
+    ['a number', 42, ''],
+    ['an object with no name', { label: 'Card' }, ''],
+    ['an array', ['Card'], ''],
+    ['a name that is not a string', { name: { toString: () => 'Card' } }, ''],
+    ['a name behind a getter that throws', { get name() { throw new Error('DataCloneError'); } }, ''],
+    ['renamed that is not true', { name: 'Card', renamed: 'yes' }, '<Card>'],
+    ['markup', { name: '<img src=x onerror=alert(1)>' }, '<<img src=x onerror=alert(1)>>'],
+  ];
+  const nodes = replies.map(([label], index) => realm.add('div', { id: `r${index}`, title: label }, [index * 110 + 10, 100, 100, 40]));
+  // A detail that cannot be read, and two replies to one request.
+  const unreadable = realm.add('div', { id: 'unreadable' }, [10, 300, 100, 40]);
+  const twice = realm.add('div', { id: 'twice' }, [200, 300, 100, 40]);
+  realm.window.addEventListener(
+    '__cdr_name',
+    (event) => {
+      const node = event.composedPath()[0];
+      const index = nodes.indexOf(node);
+      if (index !== -1) realm.deliver('__cdr_name:reply', { detail: replies[index][1], quiet: true });
+      if (node === unreadable) {
+        realm.deliver('__cdr_name:reply', { quiet: true, lazyDetail: () => { throw new Error('DataCloneError'); } });
+      }
+      if (node === twice) {
+        realm.deliver('__cdr_name:reply', { detail: { name: 'First' }, quiet: true });
+        realm.deliver('__cdr_name:reply', { detail: { name: 'Second' }, quiet: true });
+      }
+    },
+    true
+  );
+  realm.arm();
+  await realm.frame();
+  replies.forEach(([label, , shown], index) => {
+    assert.doesNotThrow(() => realm.move(index * 110 + 60, 120), label);
+    assert.equal(tagOf(realm).who, shown, label);
+    assert.ok(tagOf(realm).who.length <= NAME_SHOWN_MAX, label);
+  });
+  realm.move(60, 320);
+  assert.equal(tagOf(realm).who, '');
+  realm.move(250, 320);
+  assert.equal(tagOf(realm).who, '<First>');
+  realm.key('Escape');
+
+  // A reply that comes after the dispatch has returned is no reply: the
+  // tag shows the element alone, and the arm asks no more.
+  const late = makeRealm();
+  const one = late.add('div', { id: 'one' }, [100, 100, 100, 40]);
+  late.add('div', { id: 'two' }, [300, 100, 100, 40]);
+  late.window.addEventListener(
+    '__cdr_name',
+    () => setImmediate(() => late.deliver('__cdr_name:reply', { detail: { name: 'Late' }, quiet: true })),
+    true
+  );
+  late.arm();
+  await late.frame();
+  late.move(150, 120);
+  await late.frame();
+  assert.equal(tagOf(late).text, 'div#one  100×40');
+  late.move(350, 120);
+  await late.frame();
+  assert.equal(tagOf(late).text, 'div#two  100×40');
+  assert.deepEqual(late.asks(), [one]);
+  late.key('Escape');
+});
+
+// The most a name takes in the tag: NAME_ROOM characters, the brackets and
+// the word for a bundler's name.
+const NAME_SHOWN_MAX = 60 + 2 + ' minified'.length;
+
+test('picker events: the arrow keys, on the page and from the panel, show the parent\'s name', async () => {
+  const realm = makeRealm();
+  const form = realm.add('form', { class: 'coupon' }, [100, 100, 400, 200]);
+  const input = realm.add('input', { id: 'coupon' }, [120, 120, 200, 40], form);
+  const names = new Map([[form, 'CouponForm'], [input, 'CouponField']]);
+  realm.namer((node) => (names.has(node) ? { name: names.get(node) } : null));
+  realm.arm();
+  await realm.frame();
+  realm.move(150, 130);
+  assert.equal(tagOf(realm).text, 'input#coupon  200×40<CouponField>');
+  realm.key('ArrowUp');
+  assert.equal(tagOf(realm).text, 'form.coupon  400×200<CouponForm>');
+  realm.key('ArrowDown');
+  assert.equal(tagOf(realm).who, '<CouponField>');
+  realm.key('Escape');
+  realm.arm();
+  await realm.frame();
+  realm.move(152, 130);
+  assert.equal(realm.picker.key('ArrowUp'), true);
+  assert.equal(tagOf(realm).text, 'form.coupon  400×200<CouponForm>');
+  realm.key('Escape');
+});
+
+test('picker events: a name the bundler made up says so, and a tag as wide as a long name is kept inside the viewport', async () => {
+  const realm = makeRealm();
+  const edge = realm.add('button', { id: 'edge' }, [900, 100, 90, 40]);
+  realm.add('button', { id: 'left' }, [10, 100, 90, 40]);
+  realm.namer((node) => (node === edge ? { name: 'A', renamed: true } : { name: 'Toolbar', renamed: false }));
+  realm.arm();
+  await realm.frame();
+  // As Chrome measures it, once it holds both parts.
+  realm.part('tag').offsetWidth = 360;
+  realm.move(940, 120);
+  assert.equal(tagOf(realm).text, 'button#edge  90×40<A> minified');
+  assert.equal(realm.part('tag').style.left, `${1000 - 360 - 4}px`);
+  realm.move(50, 120);
+  assert.equal(tagOf(realm).who, '<Toolbar>');
+  assert.equal(realm.part('tag').style.left, '10px');
+  realm.key('Escape');
+});
+
+test('picker events: the pick sends what it always sent, and the tag is gone before the screenshot', async () => {
+  const realm = makeRealm();
+  const card = realm.add('div', { class: 'card' }, [100, 100, 200, 100]);
+  realm.text(card, 'Hello');
+  realm.namer(() => ({ name: 'Card' }));
+  realm.collector((data) => (data.action === 'inspect' ? { component: { framework: 'react', names: ['Card'], hops: 0 }, handlers: null } : null));
+  realm.arm();
+  await realm.frame();
+  realm.move(150, 150);
+  assert.equal(tagOf(realm).who, '<Card>');
+  // Held, since the host leaves the page at the pick.
+  const tag = realm.part('tag');
+  realm.press(150, 150);
+  realm.release(150, 150);
+  assert.equal(tag.style.display, 'none', 'the tag was still shown at the pick');
+  await realm.idle(1000);
+  const [pick] = realm.picks();
+  assert.deepEqual(pick.element.component, { framework: 'react', names: ['Card'], hops: 0 });
+  assert.equal(pick.element.html, '<div class="card">Hello</div>');
+});
+
+// Page code can run while the page's world reads a name (a getter on a
+// fiber's type), and focus() it calls there sends a trusted focusin, which
+// the picker follows. Drawn before the name was asked, the box stayed on
+// the focused element under the tag of the one hovered. And the question
+// that nested highlight asked, which the collector leaves unanswered while
+// it answers another, was taken for a page with no collector, so the rest
+// of the arm showed no name.
+test('picker events: a focus the page moves while a name is read leaves the box and the tag on one element', async () => {
+  const realm = makeRealm();
+  const card = realm.add('div', { id: 'card' }, [100, 100, 200, 100]);
+  const field = realm.add('input', { id: 'field' }, [500, 100, 200, 40]);
+  const note = realm.add('p', { id: 'note' }, [100, 400, 200, 40]);
+  const names = new Map([[card, 'Card'], [field, 'Field'], [note, 'Note']]);
+  let naming = false;
+  realm.window.addEventListener(
+    '__cdr_name',
+    (event) => {
+      // As the collector does, a request sent while one is answered gets none.
+      if (naming) return;
+      naming = true;
+      try {
+        const node = event.composedPath()[0];
+        if (node === card) realm.deliver('focusin', { target: field, quiet: true });
+        realm.deliver('__cdr_name:reply', { detail: { name: names.get(node) }, quiet: true });
+      } finally {
+        naming = false;
+      }
+    },
+    true
+  );
+  realm.arm();
+  await realm.frame();
+  realm.move(150, 150);
+  assert.equal(tagOf(realm).text, 'div#card  200×100<Card>');
+  assert.equal(realm.part('box').style.left, '100px', 'the box is on another element than the tag');
+  assert.deepEqual(realm.asks(), [card], 'the highlight the focus set off asked a question of its own');
+  // And the element the keys move from is the one drawn, named as any other.
+  realm.key('ArrowRight');
+  assert.equal(tagOf(realm).what, 'input#field  200×40');
+  assert.equal(tagOf(realm).who, '<Field>', 'the arm stopped asking after the focus');
+  realm.move(150, 420);
+  assert.equal(tagOf(realm).text, 'p#note  200×40<Note>');
+  assert.deepEqual(realm.asks(), [card, field, note]);
+  realm.key('Escape');
+});
+
+// The names are kept for one arm only: one read before the page hydrated,
+// or before Fast Refresh renamed a component, is read again at the next.
+test('picker events: a name is read again at the next arm, not kept from the last', async () => {
+  const realm = makeRealm();
+  const card = realm.add('div', { id: 'card' }, [100, 100, 200, 100]);
+  let hydrated = false;
+  realm.namer((node) => (hydrated && node === card ? { name: 'Card' } : null));
+  realm.arm();
+  await realm.frame();
+  realm.move(150, 150);
+  assert.equal(tagOf(realm).text, 'div#card  200×100');
+  realm.key('Escape');
+  hydrated = true;
+  realm.arm();
+  await realm.frame();
+  realm.move(152, 150);
+  assert.equal(tagOf(realm).text, 'div#card  200×100<Card>');
+  assert.deepEqual(realm.asks(), [card, card]);
+  realm.key('Escape');
 });
