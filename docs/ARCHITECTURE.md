@@ -33,7 +33,8 @@ sidepanel/panel.js ......... orchestrates everything. Captures the tab, crops
         v                             v
        content/collector-main.js .... MAIN world, always on. Wraps console,
                                       fetch and XHR from document_start, and
-                                      reads React and Vue internals on request.
+                                      reads React, Vue, Svelte and Angular
+                                      internals on request.
 ```
 
 ## Three decisions worth understanding
@@ -161,9 +162,10 @@ again when it is shown.
 
 The picker still asks what rendered a node over `window.postMessage`, and that answer is about
 the node alone. The same boundary is why the element picker cannot read a React fiber itself.
-React hangs the fiber off the DOM node as a `__reactFiber$<random>` property and Vue hangs
-`__vueParentComponent`, and those properties live on each world's own wrapper of the node, so
-an isolated world script sees a node with none of them. The DOM itself **is** shared, which is
+React hangs the fiber off the DOM node as a `__reactFiber$<random>` property, Vue 3 hangs
+`__vnode` and `__vueParentComponent`, Vue 2 `__vue__` and Svelte `__svelte_meta`, and those
+properties live on each world's own wrapper of the node, so an isolated world script sees a node
+with none of them. The same goes for the `window.ng` Angular publishes. The DOM itself **is** shared, which is
 what the handoff uses: the picker sets a random `data-cdr-pick` attribute on the clicked
 element, asks for it by that value, and the main world finds the node with `querySelector`, and
 inside open shadow roots when that finds nothing (`findMarked`, which walks at most 20 000
@@ -192,6 +194,54 @@ event dispatch reads them back from there, and Vue keeps the same names on `__vn
 Neither is the fiber, so the two lookups climb independently and their hop counts can differ.
 That is why the prompt never presents them as one number.
 
+The component comes from `componentOf`, which asks one reader per framework in turn: React, Vue
+3, Vue 2, Svelte, then Angular. Each answers null for a node it does not know, and each reads only
+what the framework itself keeps in the page, with no code of the extension's left behind.
+
+* **Vue 2** puts `__vue__`, the instance, on the element each component's render made its root,
+  in a production build too. An element inside the root carries nothing, so `vue2Summary` climbs
+  to the nearest root, passes through any component that renders another as its own root (both
+  share the element, and the outer one holds it) to the innermost, and walks that instance's
+  render tree, at most `SUBTREE_LIMIT` vnodes and never into a child component, for the vnode of
+  the element nearest the picked one. That vnode's `context` is the instance whose template made
+  it, which is how slot content is credited to the template that wrote it, as Vue 3's
+  `__vnode.ctx` is. A walk that stops short of the picked element names the root's component with
+  no steps counted, rather than an element two up that is no answer. A development build is told
+  from a production one by `_renderProxy`, a `Proxy` in the first and the instance itself in the
+  second, and only the first is claimed.
+* **Svelte**'s development build puts `__svelte_meta` on each element it creates from a template:
+  where the element is written (`loc`, from Svelte 3), the blocks and components it was rendered
+  inside (`parent`, from 5.36), and the context of the component that rendered it (`component`,
+  with its props as `s` and its function, from 5.58). Svelte 5 also defines `__svelte_meta` as
+  null on `Element.prototype`, so only a meta the element holds itself counts. The component is
+  named after its file, as the compiler names it, and printed as where the element is written
+  (`Element written at`); Svelte 3 and 4 count lines from 0, so the reader adds one to theirs.
+  Props are read only when the context's function was compiled from the element's own file (its
+  `Symbol('filename')`, found by description, since the symbol is not exported), because a
+  snippet's element is written in one file and rendered with another component's context.
+* **Angular** keeps nothing on an element that says which component rendered it, so
+  `angularSummary` calls the functions a development build publishes for Angular DevTools on
+  `window.ng` (`getOwningComponent`, `getHostElement`, `getDirectiveMetadata`, `isSignal`). It is
+  the one reader that runs the page's code, every call goes through `ask()` in a try, and only an
+  object answer is kept. `getOwningComponent` and `getHostElement` go through Angular's
+  `getLContext`, which caches what it finds in `__ngContext__`, a property of Angular's own that it
+  reads back in either form: on each element asked about that Angular rendered, and on each
+  component instance asked about and its host element. Angular DevTools leaves the same. A
+  component instance has held its view's number there since it was made, and after a pick holds an
+  object that refers back to the instance and to its host, so the page's own code that serialises
+  the instance (`JSON.stringify(this)`) meets a cycle it did not meet before. The name and the file
+  and line come from the `debugInfo` the compiler gives a component's definition from Angular 17.1,
+  read only when `ɵcmp` is a value of the class's own; a component compiled in the browser has a
+  getter there that compiles it, which is not called, so it is named by its class with no file.
+  The version is the root host's `ng-version`, and the props are the inputs `getDirectiveMetadata`
+  lists, a signal input called for its value and one that throws (a required input not yet set)
+  left out. An input has two names, the one a template binds and its class property, and is filed
+  under the first unless only the second looks secret (`@Input('value') password`), so that the
+  name rule withholds it.
+
+A production build of Svelte or Angular leaves nothing to read, and no reader guesses: the item
+has no component, as on a page with no framework.
+
 Whether a handler's body is worth printing is decided by the text itself rather than by the build
 label. The test is whether the author's own names survived: an identifier of four characters or
 more, outside a string, that is not one a minifier keeps, and not read after a dot unless what it
@@ -207,7 +257,13 @@ has a minified body behind a real name.
 Props are printed unless they could carry a secret (`summariseProps`). A prop whose own name is a
 secret name is withheld. When a component is inspected, the collector also reads the live values of
 the page's secret controls (`reactGuard`, `vueGuard`): the controls the component renders, up to
-3,000 nodes, and the document's own (`documentValues`). Those are elements of type password,
+3,000 nodes, and the document's own (`documentValues`). Svelte, Vue 2 and Angular keep no tree of
+what a component rendered that this file reads, so for them `domGuard` takes the elements under the
+component's element in the page instead, through the native `getElementsByTagName` and no further
+than 3,000: Vue 2's `$el`, Angular's host, or, for Svelte, whose component has no element of its
+own, the first ancestor it did not render, counting under it only what the component or one inside
+it rendered (by the meta's context chain) and what has no meta, as `{@html}` writes. A field such a
+component renders outside that element, in an overlay or a portal, is not counted as its own. Those are elements of type password,
 elements whose autocomplete says `current-password`, `new-password`, `one-time-code`, `cc-number`
 or `cc-csc`, and form controls whose name or id is a secret name such as `csrf_token`. In the
 document it reads at most 32 of each kind, judging the names of the first 256 inputs, text areas
@@ -314,7 +370,12 @@ left from before an update).
 The name comes from `componentOf(node, true)`, the brief path, whose contract is stated on the
 function and in CONTRIBUTING.md: the walk a pick makes for the names, and nothing after it. No
 props, so none of the guard's look through the document and its shadow roots for secret fields,
-and no owner or call site. A pick's round trip, guard included, took 1.24 ms at 20 000 elements
+and no owner or call site. Svelte's brief path is the climb to the nearest meta and its file's
+name. Vue 2's keeps the render tree walk, bounded at `SUBTREE_LIMIT` vnodes, since without it the
+name would be the root's and not the one the pick reports, and skips the build, the file, the
+version and the props. Angular's reader is not asked at all: it can learn nothing without calling
+`window.ng`, once for each element climbed, so `componentOf` answers null for it and the tag on an
+Angular page gives the element alone. A pick's round trip, guard included, took 1.24 ms at 20 000 elements
 and 8.5 ms at 100 000 (Chrome 157), and a name about 4 microseconds, at 20 000 elements or
 100 000. The two can disagree in one case: the hover reaches a node in an open shadow root
 wherever it is, while a pick looks for its marked node there with `findMarked`, which gives up
@@ -563,7 +624,7 @@ the main world answers exactly one action per request.
 
 | Action | From | Purpose |
 | :--- | :--- | :--- |
-| `inspect` | picker | Return the React or Vue component behind a marked node, and the handlers bound to it |
+| `inspect` | picker | Return the React, Vue, Svelte or Angular component behind a marked node, and the handlers bound to it |
 
 `snapshot` and `clear` go over the bridge's channel instead. Over `window.postMessage` they
 answer `null`, like any action this build does not recognise (the picker's `ping` among them,

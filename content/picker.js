@@ -1105,14 +1105,23 @@
         .map((entry) => entry.slice(0, 200));
     }
 
+    // The frameworks the collector reads, Vue 2 and Vue 3 both as 'vue'.
+    const FRAMEWORKS = ['react', 'vue', 'svelte', 'angular'];
+
     function adoptComponent(payload) {
       if (!payload || typeof payload !== 'object') return null;
 
       const names = strings(payload.names, 5);
       if (!names.length) return null;
+      // A framework no collector sends drops the component, rather than
+      // printing it with another framework's wording: every value other than
+      // 'vue' once became 'react', and a Svelte component then read as a React
+      // one, its markup line as a call site. Every collector ever shipped
+      // sends one of these, so no real reply is lost.
+      if (!FRAMEWORKS.includes(payload.framework)) return null;
 
       const component = {
-        framework: payload.framework === 'vue' ? 'vue' : 'react',
+        framework: payload.framework,
         names,
         hops: Number.isFinite(payload.hops) && payload.hops > 0 ? Math.floor(payload.hops) : 0,
       };
@@ -1165,13 +1174,15 @@
     }
 
     /**
-     * Ask the MAIN world which React or Vue component rendered this node, and
-     * which event handlers it or a near ancestor carries.
+     * Ask the MAIN world which React, Vue, Svelte or Angular component rendered
+     * this node, and which event handlers it or a near ancestor carries.
      *
-     * The picker runs in the ISOLATED world, where React's __reactFiber$ and
-     * Vue's __vueParentComponent are invisible: expando properties live on each
-     * world's own wrapper of a node. The DOM itself is shared, which is why the
-     * node is handed over as an attribute rather than in the message.
+     * The picker runs in the ISOLATED world, where React's __reactFiber$, Vue's
+     * __vueParentComponent and __vue__ and Svelte's __svelte_meta are
+     * invisible: expando properties live on each world's own wrapper of a
+     * node. So is Angular's window.ng, a global of the page's world. The DOM
+     * itself is shared, which is why the node is handed over as an attribute
+     * rather than in the message.
      *
      * Resolves to a rebuilt { component, handlers }, either of which can be
      * null, or to null on timeout rather than hanging, so a page where the MAIN

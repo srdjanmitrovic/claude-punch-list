@@ -411,6 +411,10 @@
     }
   }
   const typedLength = nativeGetter(prototypeOf(Uint8Array.prototype), 'length');
+  // A symbol's description, by which Svelte's FILENAME symbol on a component
+  // is found (see svelteFileOf): read off the symbol, not looked up on a
+  // Symbol.prototype the page can change.
+  const symbolDescription = nativeGetter(Symbol.prototype, 'description');
   const NativeElement = typeof Element === 'function' ? Element : null;
   // Taken now, like everything else here: a page can replace window.Error,
   // and a global looked up per value is also the slowest read in the walk.
@@ -2305,9 +2309,9 @@
 
   // ---------------------------------------------------------------- inspect --
   // The element picker runs in the ISOLATED world, where the framework internals
-  // React and Vue hang off DOM nodes as expando properties are invisible. It
-  // marks the node the user clicked with an attribute and asks this script to
-  // describe it.
+  // React, Vue and Svelte hang off DOM nodes as expando properties are
+  // invisible, as is the window.ng Angular publishes. It marks the node the
+  // user clicked with an attribute and asks this script to describe it.
   //
   // Everything here formats as well as reads. The reply crosses postMessage, so
   // it has to survive structured clone: plain strings, numbers and arrays only,
@@ -2318,6 +2322,51 @@
   const NAME_LIMIT = 5; // components reported, nearest first
   const PROP_LIMIT = 12; // props reported for the nearest component
   const PROP_MAX_STRING = 60; // characters kept from a string prop
+
+  /**
+   * holder[key] when it is a value of holder's own, and undefined when it is
+   * absent, behind a getter, or holder is no object or throws to be asked:
+   * memberOf, with the getter never called. Every read of what Svelte, Vue 2
+   * and Angular keep goes through this or inheritedData, so a getter a page
+   * planted on any of it never runs, and an answer of the wrong shape is
+   * simply nothing found.
+   */
+  function ownData(holder, key) {
+    if (holder === null || (typeof holder !== 'object' && typeof holder !== 'function')) return undefined;
+    try {
+      const value = memberOf(holder, key);
+      return value === ABSENT || value === GETTER ? undefined : value;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * The same for a value holder has from its prototypes, as Vue 2's $options
+   * has its name and file from its component's options: the nearest own
+   * value up the chain, short of Object.prototype, and undefined at the
+   * first getter.
+   */
+  function inheritedData(holder, key) {
+    let current = holder;
+    try {
+      for (let depth = 0; depth < 8 && current !== null && current !== OBJECT_PROTO; depth += 1) {
+        if (typeof current !== 'object' && typeof current !== 'function') return undefined;
+        const value = memberOf(current, key);
+        if (value === GETTER) return undefined;
+        if (value !== ABSENT) return value;
+        current = prototypeOf(current);
+      }
+    } catch {
+      /* nothing found */
+    }
+    return undefined;
+  }
+
+  /** An element's parent element, through the native where this world has one. */
+  function parentOf(element) {
+    return nodeParent ? nodeParent(element) : element.parentElement;
+  }
 
   /**
    * One prop value as a short display string.
@@ -2460,6 +2509,13 @@
   const DOCUMENT_PROTO = typeof Document === 'function' ? Document.prototype : null;
   const queryAllIn = nativeMethod(DOCUMENT_PROTO, 'querySelectorAll');
   const tagsIn = nativeMethod(DOCUMENT_PROTO, 'getElementsByTagName');
+  // An element's own live list of what is under it, which domGuard reads
+  // only as far as it needs, as documentValues reads the document's.
+  const tagsUnder = nativeMethod(ELEMENT_PROTO, 'getElementsByTagName');
+  // The step up the readers of Svelte, Vue 2 and Angular climb by, so that a
+  // parentElement a page defined on its own elements is not run by them.
+  const NODE_PROTO = typeof Node === 'function' ? Node.prototype : null;
+  const nodeParent = nativeGetter(NODE_PROTO, 'parentElement');
   const nodeListLength = typeof NodeList === 'function' ? nativeGetter(NodeList.prototype, 'length') : null;
   const collectionItem = typeof HTMLCollection === 'function' ? nativeMethod(HTMLCollection.prototype, 'item') : null;
   // Any element, a design system's own included, whose type or autocomplete
@@ -3048,6 +3104,34 @@
         const fallback = vnode.ssFallback;
         if (content !== active && content !== waiting) more(content);
         if (fallback !== active && fallback !== waiting) more(fallback);
+      }
+    } catch {
+      /* what was noted so far */
+    }
+    documentValues(guard);
+    return guard;
+  }
+
+  /**
+   * The same for a Svelte, Vue 2 or Angular pick, whose components keep no
+   * tree of host props this file reads: the element, then root and the
+   * elements under it in the document, at most SUBTREE_LIMIT of them, read
+   * through the native live list only as far as that. root is the
+   * component's own element (Vue 2's $el, Angular's host), or for Svelte,
+   * whose component has no element of its own, the element its elements sit
+   * in; owns, when given, says which of what is under root the component
+   * rendered.
+   */
+  function domGuard(node, root, owns) {
+    const guard = { field: false, password: false, digits: false, values: [] };
+    noteControl(guard, node, null, '', true);
+    try {
+      if (root && (!owns || owns(root))) noteControl(guard, root, null, '', false);
+      const under = root && tagsUnder ? tagsUnder(root, '*') : null;
+      for (let i = 0; under && i < SUBTREE_LIMIT; i += 1) {
+        const element = itemAt(under, i);
+        if (element === null) break;
+        if (!owns || owns(element)) noteControl(guard, element, null, '', false);
       }
     } catch {
       /* what was noted so far */
@@ -3968,6 +4052,29 @@
     }
   }
 
+  /**
+   * A file's name without its folders or its extension, or null: what a
+   * component compiled from a file of its own is called when nothing else
+   * names it (Vue), or always (Svelte, whose compiler names a component after
+   * its file). Read by index, so nothing the page replaces takes part.
+   */
+  function baseName(path) {
+    if (typeof path !== 'string' || !path) return null;
+    let start = 0;
+    for (let i = 0; i < path.length; i += 1) {
+      if (path[i] === '/' || path[i] === '\\') start = i + 1;
+    }
+    // A dot that starts the name (.env) is part of it, not an extension.
+    let end = path.length;
+    for (let i = path.length - 1; i > start; i -= 1) {
+      if (path[i] === '.') {
+        end = i;
+        break;
+      }
+    }
+    return sliceString(path, start, end) || null;
+  }
+
   function vueName(type) {
     try {
       if (!type) return null;
@@ -3975,10 +4082,7 @@
       // Single file components compiled by the Vue plugin carry __name, which
       // survives a production build where the options name does not exist.
       if (typeof type.__name === 'string' && type.__name) return type.__name;
-      if (typeof type.__file !== 'string' || !type.__file) return null;
-      const base = type.__file.split(/[\\/]/).pop() || '';
-      const dot = base.lastIndexOf('.');
-      return (dot > 0 ? base.slice(0, dot) : base) || null;
+      return baseName(type.__file);
     } catch {
       return null;
     }
@@ -4091,6 +4195,630 @@
     return summary;
   }
 
+  // ------------------------------------------------------------------ vue 2 --
+  // Vue 2 (to 2.7.16) puts __vue__, the instance, on the element each
+  // component's render made its root, in a production build as in a
+  // development one (Vue.prototype._update). An element inside the root has
+  // nothing of its own, so the component whose template wrote it is found in
+  // the instance's render tree: each vnode holds its element (elm), its
+  // children, and context, the instance that was rendering when it was made.
+  // Every field read is a plain value Vue assigns to the vnode or the
+  // instance; VNode's one accessor (child) is not touched.
+
+  const HOC_LIMIT = 20; // components that render another component as their root, passed through to the innermost
+  const VUE2_NAME_KEYS = ['name', '__name', '_componentTag'];
+
+  /** Whether value is a Vue 2 instance: _isVue, set true on each in _init. */
+  function isVue2(value) {
+    return ownData(value, '_isVue') === true;
+  }
+
+  /**
+   * What a Vue 2 instance is called, in the order Vue's own warnings name it
+   * (getComponentName and formatComponentName): its options' name, the
+   * __name Vue 2.7's script setup compiles in, the tag its parent wrote it
+   * as, or its file's name. Each may sit on the options' prototype, which
+   * is its constructor's options (initInternalComponent).
+   */
+  function vue2Name(instance) {
+    const options = ownData(instance, '$options');
+    const keys = VUE2_NAME_KEYS;
+    for (let i = 0; i < keys.length; i += 1) {
+      const name = inheritedData(options, keys[i]);
+      if (typeof name === 'string' && name) return name;
+    }
+    const file = inheritedData(options, '__file');
+    return typeof file === 'string' ? baseName(cleanPath(file)) : null;
+  }
+
+  /**
+   * The vnode of the element nearest the picked one, in the render tree of
+   * the instance whose root holds it: path maps each element from the
+   * picked one up to that root to its distance from the picked one. At most
+   * SUBTREE_LIMIT vnodes are looked at, and the walk does not go into a child
+   * component, whose elements are under a __vue__ of their own. Answers the
+   * vnode and its element's distance, and whether the walk stopped short.
+   */
+  function vue2Vnode(instance, path) {
+    let best = null;
+    let distance = -1;
+    let truncated = false;
+    // A stack kept by hand: Array.prototype's push and pop are the page's.
+    const stack = [ownData(instance, '_vnode')];
+    let depth = 1;
+    let looked = 0;
+    try {
+      while (depth > 0) {
+        depth -= 1;
+        const vnode = stack[depth];
+        if (vnode === null || typeof vnode !== 'object') continue;
+        if (looked >= SUBTREE_LIMIT) {
+          truncated = true;
+          break;
+        }
+        looked += 1;
+        const elm = ownData(vnode, 'elm');
+        const at = elm ? mapGet(path, elm) : undefined;
+        if (at !== undefined && (distance < 0 || at < distance)) {
+          best = vnode;
+          distance = at;
+          if (at === 0) break;
+        }
+        const children = ownData(vnode, 'children');
+        let count = isArray(children) ? ownData(children, 'length') : 0;
+        if (!isFiniteNumber(count)) count = 0;
+        // No more of them than the walk has left to look at, which is all
+        // it could reach before it stops.
+        if (count > SUBTREE_LIMIT - looked) {
+          count = SUBTREE_LIMIT - looked;
+          truncated = true;
+        }
+        // Last first, so the walk goes in document order.
+        for (let i = count - 1; i >= 0; i -= 1) {
+          defineOwn(stack, depth, { __proto__: null, value: ownData(children, i), writable: true, enumerable: true, configurable: true });
+          depth += 1;
+        }
+      }
+    } catch {
+      /* what was found so far */
+    }
+    return { vnode: best, distance, truncated };
+  }
+
+  /**
+   * Vue 2, in a development build or a production one: the component whose
+   * template wrote the element (a vnode's context, the rule Vue 3's
+   * __vnode.ctx follows), the components above it ($parent), its file, the
+   * version, and its props.
+   *
+   * With `brief` (see componentOf), the summary ends once the names are
+   * known. The render tree walk stays, bounded as above, since without it the
+   * name would be the root's and not the one a pick reports.
+   */
+  function vue2Summary(node, brief) {
+    // The nearest element that is a component's root.
+    let root = node;
+    let instance = null;
+    try {
+      for (let steps = 0; root && steps < CLIMB_LIMIT; steps += 1) {
+        const held = ownData(root, '__vue__');
+        if (isVue2(held)) {
+          instance = held;
+          break;
+        }
+        root = parentOf(root);
+      }
+    } catch {
+      return null;
+    }
+    if (!instance) return null;
+
+    // A component whose render returns another component shares its root
+    // with it, and the root holds the outermost (_update sets each in turn).
+    // The elements are written in the innermost.
+    for (let steps = 0; steps < HOC_LIMIT; steps += 1) {
+      const inner = ownData(ownData(instance, '_vnode'), 'componentInstance');
+      if (!isVue2(inner) || ownData(inner, '$el') !== ownData(instance, '$el')) break;
+      instance = inner;
+    }
+
+    // The elements from the picked one up to that root, by distance.
+    const path = new NativeMap();
+    let hops = 0;
+    try {
+      for (let element = node; element && hops < CLIMB_LIMIT; hops += 1) {
+        mapSet(path, element, hops);
+        if (element === root) break;
+        element = parentOf(element);
+      }
+    } catch {
+      return null;
+    }
+
+    // An element the render tree has no vnode for (what v-html writes) is
+    // in the template of the one above it that has, and counts the steps.
+    // When the walk stops short of the picked element, the one it found is
+    // no answer, and the root's component is named.
+    const found = vue2Vnode(instance, path);
+    hops = 0;
+    if (found.vnode && !(found.truncated && found.distance > 0)) {
+      const context = ownData(found.vnode, 'context');
+      if (isVue2(context)) instance = context;
+      hops = found.distance;
+    }
+
+    const names = [];
+    let named = null; // the instance that gave names[0]
+    let current = instance;
+    for (let steps = 0; current && names.length < NAME_LIMIT && steps < CLIMB_LIMIT; steps += 1) {
+      const name = vue2Name(current);
+      if (name) {
+        if (!named) named = current;
+        append(names, name);
+      }
+      const parent = ownData(current, '$parent');
+      current = isVue2(parent) ? parent : null;
+    }
+    if (!named) return null;
+
+    const summary = { framework: 'vue', names, hops };
+    // No build, file, version or props (domGuard looks through the
+    // document).
+    if (brief) return summary;
+
+    // A development build gives each instance a Proxy to render with
+    // (initProxy), a production one the instance itself. Only the first is
+    // claimed: the names are strings the author wrote in either, and the
+    // prompt's "names may be minified" would be wrong for them.
+    const renderProxy = ownData(named, '_renderProxy');
+    if (renderProxy !== undefined && renderProxy !== null && renderProxy !== named) summary.build = 'development';
+
+    const file = inheritedData(ownData(named, '$options'), '__file');
+    if (typeof file === 'string' && file) summary.source = file;
+
+    // Vue.version, on the constructor of the root instance, or on the one
+    // Vue.extend made it from (super).
+    let constructor = inheritedData(ownData(named, '$root'), 'constructor');
+    for (let steps = 0; typeof constructor === 'function' && steps < 10; steps += 1) {
+      const version = ownData(constructor, 'version');
+      if (typeof version === 'string' && version) {
+        summary.version = version;
+        break;
+      }
+      constructor = ownData(constructor, 'super');
+    }
+
+    // _props holds a getter for each prop (defineReactive), run as a Vue 3
+    // prop is run on its proxy. Nothing tracks the read, since no watcher
+    // of Vue's is running at a pick.
+    const props = summariseProps(ownData(named, '_props'), domGuard(node, ownData(named, '$el'), null));
+    if (props.length) summary.props = props;
+    return summary;
+  }
+
+  // ----------------------------------------------------------------- svelte --
+  // A Svelte development build puts __svelte_meta on every element it creates
+  // from a template: loc, the file, line and column the element is written
+  // at, in every version from Svelte 3 on; parent, the stack of blocks and
+  // components it was rendered inside, from Svelte 5.36; and component, the
+  // context of the component that was rendering, with its props and its
+  // function, from Svelte 5.58. A production build puts nothing there, and
+  // nothing is read.
+
+  const PROP_KEYS = 64; // keys of a Svelte component's props or an Angular component's inputs read for one pick
+
+  /**
+   * An element's own __svelte_meta, or null. Svelte 5's development build
+   * also puts a null default on Element.prototype (dom/operations.js), so a
+   * value read through the prototype is on every element, and only one the
+   * element holds itself is a meta.
+   */
+  function metaOf(element) {
+    const meta = ownData(element, '__svelte_meta');
+    return meta !== null && typeof meta === 'object' ? meta : null;
+  }
+
+  /**
+   * The file a Svelte component's function was compiled from: the string
+   * under its FILENAME symbol, which is Symbol('filename') and is not
+   * exported to the page, so it is found by its description. Null when there
+   * is none, as on a production build.
+   */
+  function svelteFileOf(fn) {
+    if (typeof fn !== 'function' || !symbolDescription) return null;
+    let keys;
+    try {
+      keys = ownKeysOf(fn);
+    } catch {
+      return null;
+    }
+    for (let i = 0; i < keys.length && i < PROP_KEYS; i += 1) {
+      const key = keys[i];
+      if (typeof key !== 'symbol' || symbolDescription(key) !== 'filename') continue;
+      const file = ownData(fn, key);
+      return typeof file === 'string' && file ? file : null;
+    }
+    return null;
+  }
+
+  /**
+   * Which major version of Svelte runs on the page: the one Svelte 4 and
+   * later add to window.__svelte.v, a Set, asked through the native has.
+   * Null when there is none, or more than one, as on a page that bundles two.
+   */
+  function svelteVersion() {
+    try {
+      const versions = ownData(ownData(window, '__svelte'), 'v');
+      if (versions === null || typeof versions !== 'object') return null;
+      let found = null;
+      for (let major = 3; major <= 5; major += 1) {
+        if (!setHas(versions, NativeString(major))) continue;
+        if (found !== null) return null;
+        found = NativeString(major);
+      }
+      return found;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * A component's props as a plain object, for summariseProps: at most
+   * PROP_KEYS of the enumerable keys of the object Svelte handed the
+   * component, without the $$slots, $$events and other keys of Svelte's own,
+   * each read once in a try. A prop is often a getter Svelte compiled (one
+   * that reads a signal, or a parent's expression held in a derived), and is
+   * run here as a Vue prop is run on its reactive proxy. Nothing tracks the
+   * read, since no effect of Svelte's is running at a pick.
+   */
+  function svelteProps(given) {
+    if (given === null || typeof given !== 'object') return null;
+    const copy = { __proto__: null };
+    try {
+      const keys = ownKeysOf(given);
+      let kept = 0;
+      for (let i = 0; i < keys.length && kept < PROP_KEYS; i += 1) {
+        const key = keys[i];
+        if (typeof key !== 'string' || sliceString(key, 0, 2) === '$$') continue;
+        const descriptor = ownDescriptor(given, key);
+        if (!descriptor || !descriptor.enumerable) continue;
+        let value;
+        try {
+          value = given[key];
+        } catch {
+          continue;
+        }
+        defineOwn(copy, key, { __proto__: null, value, writable: true, enumerable: true, configurable: true });
+        kept += 1;
+      }
+    } catch {
+      /* the props read so far */
+    }
+    return copy;
+  }
+
+  /**
+   * Whether an element with this meta was rendered by the component of
+   * context, or by one inside it: its component's context, or one up the
+   * chain of contexts each was made in (`p`), is context. Remembered for
+   * each context in known, since the elements under one component share a
+   * handful of them.
+   */
+  function renderedBy(meta, context, known) {
+    const own = ownData(meta, 'component');
+    if (own === null || typeof own !== 'object') return false;
+    const seen = mapGet(known, own);
+    if (seen !== undefined) return seen;
+    let found = false;
+    let current = own;
+    for (let steps = 0; current && steps < CLIMB_LIMIT; steps += 1) {
+      if (current === context) {
+        found = true;
+        break;
+      }
+      current = ownData(current, 'p');
+    }
+    mapSet(known, own, found);
+    return found;
+  }
+
+  /**
+   * The element a Svelte component's elements sit in, for domGuard, and
+   * which of the elements under it the component rendered. A Svelte
+   * component has no element of its own, so this climbs from one of its
+   * elements to the first ancestor it did not render, the parent's element
+   * or the element it was mounted in. Under it, an element counts as the
+   * component's when its meta says so (see renderedBy), or when it has no
+   * meta, as what {@html} writes.
+   */
+  function svelteScope(element, context) {
+    const known = new NativeMap();
+    const owns = (candidate) => {
+      const meta = metaOf(candidate);
+      return meta === null || renderedBy(meta, context, known);
+    };
+    let top = element;
+    for (let steps = 0; steps < CLIMB_LIMIT; steps += 1) {
+      const up = parentOf(top);
+      if (!up) break;
+      const meta = metaOf(up);
+      if (meta === null || !renderedBy(meta, context, known)) return { root: up, owns };
+      top = up;
+    }
+    return { root: top, owns };
+  }
+
+  /**
+   * Svelte, from Svelte 3 to 5, in a development build: the element's own
+   * file, line and column, named after its file as the compiler names the
+   * component, the files of the blocks and components it was rendered inside
+   * (Svelte 5.36 and later), and the component's props (5.58 and later).
+   *
+   * With `brief` (see componentOf), only the climb and the file's name: no
+   * line, no stack, no version and no props.
+   */
+  function svelteSummary(node, brief) {
+    let element = node;
+    let hops = 0;
+    let meta = null;
+    try {
+      while (element && hops < CLIMB_LIMIT) {
+        meta = metaOf(element);
+        if (meta) break;
+        element = parentOf(element);
+        hops += 1;
+      }
+    } catch {
+      return null;
+    }
+    if (!meta) return null;
+
+    const loc = ownData(meta, 'loc');
+    const file = ownData(loc, 'file');
+    if (typeof file !== 'string' || !file) return null;
+    const path = cleanPath(file);
+    const name = baseName(path);
+    if (!name) return null;
+
+    const names = [name];
+    const summary = { framework: 'svelte', build: 'development', names, hops };
+    if (brief) return summary;
+
+    // Svelte 3 and 4 count lines from 0, and only they write char; Svelte 5
+    // counts them from 1. Both count columns from 0, made 1-based here as
+    // React's _debugSource and the frames of a stack are.
+    const line = ownData(loc, 'line');
+    const column = ownData(loc, 'column');
+    summary.source = path;
+    if (isFiniteNumber(line) && line >= 0) {
+      summary.source += ':' + (isFiniteNumber(ownData(loc, 'char')) ? line + 1 : line);
+      if (isFiniteNumber(column) && column >= 0) summary.source += ':' + (column + 1);
+    }
+
+    // The files of the blocks and components the element was rendered
+    // inside, nearest first, each named as names[0] is. An {#if} in the same
+    // file repeats the name before it and is folded into it.
+    let entry = ownData(meta, 'parent');
+    for (let steps = 0; entry && names.length < NAME_LIMIT && steps < CLIMB_LIMIT; steps += 1) {
+      const above = ownData(entry, 'file');
+      const named = typeof above === 'string' && above ? baseName(cleanPath(above)) : null;
+      if (named && named !== names[names.length - 1]) append(names, named);
+      entry = ownData(entry, 'parent');
+    }
+
+    const version = svelteVersion();
+    if (version) summary.version = version;
+
+    // The props of the component whose markup the element is written in.
+    // A snippet's element is written in one file and rendered with another
+    // component's context, whose props would be printed under a name they
+    // do not belong to, so only a context whose function was compiled from
+    // the element's own file is read.
+    const context = ownData(meta, 'component');
+    if (context !== null && typeof context === 'object' && svelteFileOf(ownData(context, 'function')) === file) {
+      const given = svelteProps(ownData(context, 's'));
+      if (given) {
+        const scope = svelteScope(element, context);
+        const props = summariseProps(given, domGuard(node, scope.root, scope.owns));
+        if (props.length) summary.props = props;
+      }
+    }
+    return summary;
+  }
+
+  // ---------------------------------------------------------------- angular --
+  // Angular keeps nothing on an element that says which component rendered
+  // it: since Angular 14 the view sits behind a number in a registry of its
+  // own. What it offers instead, in a development build only, is window.ng,
+  // the functions Angular DevTools calls (publishDefaultGlobalUtils, under
+  // ngDevMode). So this is the one reader that calls the page's code, and it
+  // is asked at a pick only, never while hovering (see componentOf). Each
+  // call goes through ask(), and only an object answer is kept.
+  //
+  // getOwningComponent and getHostElement go through Angular's getLContext,
+  // which caches what it finds in __ngContext__, a property of Angular's own
+  // that it reads back in either form: on each element asked about that
+  // Angular rendered, and on each component instance asked about and its
+  // host element. A component instance has held its view's number there
+  // since it was made (as have the roots of each template and the hosts),
+  // and afterwards holds an object that refers back to the instance and to
+  // its host. So the page's own code that serialises an instance, with
+  // JSON.stringify say, meets a cycle after a pick it did not meet before.
+  // Angular DevTools leaves the same. A production build publishes no
+  // window.ng, and nothing is read.
+
+  /** fn(arg), called as a member of ng, or null when it throws or answers anything but an object. */
+  function ask(ng, fn, arg) {
+    if (typeof fn !== 'function') return null;
+    try {
+      const answer = reflectApply(fn, ng, [arg]);
+      return answer !== null && typeof answer === 'object' ? answer : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * A component instance's class, and the debugInfo the compiler gives its
+   * definition in a development build from Angular 17.1 (className, filePath,
+   * lineNumber). The definition is read only when it is a value of the
+   * class's own: one compiled just in time is a getter that compiles it, and
+   * is not called.
+   */
+  function angularClass(instance) {
+    let constructor;
+    try {
+      constructor = ownData(prototypeOf(instance), 'constructor');
+    } catch {
+      return { constructor: null, info: null };
+    }
+    if (typeof constructor !== 'function') return { constructor: null, info: null };
+    const info = ownData(ownData(constructor, 'ɵcmp'), 'debugInfo');
+    return { constructor, info: info !== null && typeof info === 'object' ? info : null };
+  }
+
+  /** What a component instance is called: its debugInfo's className, or its class's own name. */
+  function angularName(instance) {
+    const { constructor, info } = angularClass(instance);
+    const className = ownData(info, 'className');
+    if (typeof className === 'string' && className) return className;
+    const name = ownData(constructor, 'name');
+    return typeof name === 'string' && name ? name : null;
+  }
+
+  /** The version the root component's host carries, as ng-version, or null. */
+  function angularVersion() {
+    if (!queryAllIn || typeof document !== 'object' || document === null) return null;
+    try {
+      const roots = queryAllIn(document, '[ng-version]');
+      const version = listLength(roots) > 0 ? attributeIn(roots[0], 'ng-version') : null;
+      return typeof version === 'string' && version ? version : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * A component's inputs as a plain object, for summariseProps, under their
+   * public names: at most PROP_KEYS of what getDirectiveMetadata lists (a
+   * class property's name, or a list that starts with it), each read off the
+   * instance once in a try. An input with a setter has its getter run, as a
+   * Vue prop is run on its reactive proxy. A signal input, which isSignal
+   * says is one, is called for its value; a required one not set yet throws
+   * (NG0950), and is left out.
+   *
+   * An input has two names, and summariseProps judges a value by the one it
+   * is filed under. An alias can make the public one harmless while the
+   * class property says what it holds (`@Input('value') password`), so an
+   * input whose class property alone has a secret looking name is filed
+   * under that name, and withheld for it. An alias that lands on a name
+   * already filed is left out, unread: whichever input holds that name,
+   * its value is withheld.
+   */
+  function angularInputs(ng, instance) {
+    const inputs = ownData(ask(ng, ownData(ng, 'getDirectiveMetadata'), instance), 'inputs');
+    if (inputs === null || typeof inputs !== 'object') return null;
+    const isSignal = ownData(ng, 'isSignal');
+    const copy = { __proto__: null };
+    try {
+      const keys = ownKeysOf(inputs);
+      let kept = 0;
+      for (let i = 0; i < keys.length && kept < PROP_KEYS; i += 1) {
+        const key = keys[i];
+        if (typeof key !== 'string') continue;
+        let property = ownData(inputs, key);
+        if (isArray(property)) property = ownData(property, 0);
+        if (typeof property !== 'string' || !property) continue;
+        const name = !isSecretText(key) && isSecretText(property) ? property : key;
+        if (hasOwn(copy, name)) continue;
+        let value;
+        try {
+          value = instance[property];
+          if (typeof value === 'function' && typeof isSignal === 'function' && reflectApply(isSignal, ng, [value]) === true) {
+            value = reflectApply(value, undefined, []);
+          }
+        } catch {
+          continue;
+        }
+        defineOwn(copy, name, { __proto__: null, value, writable: true, enumerable: true, configurable: true });
+        kept += 1;
+      }
+    } catch {
+      /* the inputs read so far */
+    }
+    return copy;
+  }
+
+  /**
+   * Angular, in a development build, through window.ng: the component whose
+   * template the element is written in (getOwningComponent, the rule Vue's
+   * __vnode.ctx follows), the components whose templates hold its host and
+   * theirs, the file and line of its class (debugInfo), the version, and its
+   * inputs. Never asked with `brief`.
+   */
+  function angularSummary(node) {
+    const ng = ownData(window, 'ng');
+    const owning = ownData(ng, 'getOwningComponent');
+    if (typeof owning !== 'function') return null;
+    const hostOf = ownData(ng, 'getHostElement');
+
+    // An element Angular did not render (what a directive or a library
+    // wrote into the page itself) has no owner, so the climb goes on to the
+    // nearest that has one, and counts the steps.
+    let element = node;
+    let hops = 0;
+    let instance = null;
+    try {
+      while (element && hops < CLIMB_LIMIT) {
+        instance = ask(ng, owning, element);
+        if (instance) break;
+        element = parentOf(element);
+        hops += 1;
+      }
+    } catch {
+      return null;
+    }
+    if (!instance) return null;
+
+    const names = [];
+    let named = null; // the instance that gave names[0]
+    let namedHost = null; // its host element
+    let current = instance;
+    for (let steps = 0; current && names.length < NAME_LIMIT && steps < CLIMB_LIMIT; steps += 1) {
+      const name = angularName(current);
+      const host = ask(ng, hostOf, current);
+      if (name) {
+        if (!named) {
+          named = current;
+          namedHost = host;
+        }
+        append(names, name);
+      }
+      if (!host) break;
+      const next = ask(ng, owning, host);
+      if (next === current) break;
+      current = next;
+    }
+    if (!named) return null;
+
+    const summary = { framework: 'angular', build: 'development', names, hops };
+    const { info } = angularClass(named);
+    const file = ownData(info, 'filePath');
+    const path = typeof file === 'string' && file ? cleanPath(file) : '';
+    if (path) {
+      const line = ownData(info, 'lineNumber');
+      summary.source = isFiniteNumber(line) && line > 0 ? path + ':' + line : path;
+    }
+    const version = angularVersion();
+    if (version) summary.version = version;
+    const inputs = angularInputs(ng, named);
+    if (inputs) {
+      const props = summariseProps(inputs, domGuard(node, namedHost, null));
+      if (props.length) summary.props = props;
+    }
+    return summary;
+  }
+
   const SHADOW_SCAN = 20000; // elements walked looking for open shadow roots on a pick
 
   /**
@@ -4133,7 +4861,7 @@
    * often as once a frame for as long as the pointer moves:
    *
    *   It reads names only: `framework`, `names` and, where it applies,
-   *   `renamed`. No props, so no guard (reactGuard, vueGuard) and none of
+   *   `renamed`. No props, so no guard (reactGuard, vueGuard, domGuard) and none of
    *   its look through the document and its shadow roots for secret
    *   fields: a pick's round trip, guard included, took 1.24 ms at 20,000
    *   elements and 8.5 ms at 100,000 (Chrome 157), and a name about 4
@@ -4151,10 +4879,19 @@
    *   the tag shows the name the item's Component line will start with.
    *
    * A reader that cannot keep to this answers null when `brief` is set, and
-   * so is simply not asked while hovering.
+   * so is simply not asked while hovering. Angular's is the one so far: it
+   * learns everything by calling window.ng.
    */
   function componentOf(node, brief) {
-    return reactSummary(node, brief) || vueSummary(node, brief);
+    return (
+      reactSummary(node, brief) ||
+      vueSummary(node, brief) ||
+      vue2Summary(node, brief) ||
+      svelteSummary(node, brief) ||
+      // Not while hovering: it can only be read by calling Angular's own
+      // functions, once for each element climbed.
+      (brief ? null : angularSummary(node))
+    );
   }
 
   function inspect(marker) {

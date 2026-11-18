@@ -35,11 +35,16 @@ Clicking **Apply** on that page fires a failing request, a console warning, and 
 `TypeError`. That gives the collector real data to pick up, so you can verify a change end to
 end rather than against an empty buffer.
 
-Two more fixtures sit beside it. `tools/demo-react.html` and `tools/demo-vue.html` render a
-small component tree so the element picker's component lookup has something to read; the stage
-loads either with `?demo=demo-react.html` or `?demo=demo-vue.html`. Both pull their framework
-from a CDN, which is fine for a fixture and would not be fine in the extension. Nothing under
-`tools/` is packaged.
+Three more fixtures sit beside it. `tools/demo-react.html`, `tools/demo-vue.html` and
+`tools/demo-vue2.html` render a small component tree so the element picker's component lookup
+has something to read; the stage loads each with `?demo=` and its file name. The Vue 2 one has the
+three cases its reader must get right: a component that renders another as its root, slot
+content, and what `v-html` writes. All three pull their framework from a CDN, which is fine for a
+fixture and would not be fine in the extension. Nothing under `tools/` is packaged. There is no
+Svelte or Angular fixture: their development builds come only out of their compilers, and a page
+here cannot have a build step. Check a change to those readers in a project of your own
+(`npx sv create`, `ng new`) in Chrome, beside the tests in `test/collector.test.mjs`, whose shapes
+name the versions they were taken from.
 
 For work on the panel itself there is a faster loop. With the same server running, open
 `http://localhost:8000/tools/panel-stage.html`. That is the panel as an ordinary web page
@@ -206,8 +211,9 @@ reading a single file, and breaking them tends to fail silently rather than loud
   `isSecretName` written without any method the page can replace, so a change to the rules of
   `isSecretName` must be made there too; `test/collector.test.mjs` fails until the two agree. The
   README's privacy section lists what is screened and what is not, and should change with them.
-* The picker reads a React fiber or a Vue instance by asking `content/collector-main.js`, because
-  those live on the node as properties only the page's own JavaScript world can see. At a pick the
+* The picker reads a React fiber, a Vue instance or a Svelte meta, and Angular's `window.ng`, by
+  asking `content/collector-main.js`, because those live on the node or the window as properties
+  only the page's own JavaScript world can see. At a pick the
   node crosses the boundary as a temporary `data-cdr-pick` attribute, since the DOM is shared and
   the property is not. Both sides remove that attribute, including on the timeout path. Hovering
   writes nothing: the picker sends `__cdr_name` on the node itself, and the collector answers on
@@ -233,10 +239,11 @@ reading a single file, and breaking them tends to fail silently rather than loud
     the item's Component line starts with.
 
   A reader that cannot keep to it answers `null` when `brief` is set, and is then simply not asked
-  while hovering. `test/collector.test.mjs` holds React and Vue 3 to it, and a new reader needs
-  the same tests: that its brief path reads no prop and nothing of the document, and that the
-  nodes it looks at stay within those bounds, where a walk down the render tree is counted
-  against `SUBTREE_LIMIT`.
+  while hovering, as Angular's is, since it learns everything by calling `window.ng`.
+  `test/collector.test.mjs` holds React, Vue 3, Vue 2 and Svelte to it, and Angular to not being
+  asked, and a new reader needs the same tests: that its brief path reads no prop, nothing of the
+  document and calls nothing, that its `names[0]` is the pick's, and that the nodes it looks at
+  stay within those bounds, where a walk down the render tree is counted against `SUBTREE_LIMIT`.
 * Content script broadcasts reach every open side panel, not just the one in the same window.
   Filter on `sender.tab.id`.
 * A content script runs in a page that may be hostile. The worker acts on the messages only the
@@ -374,6 +381,6 @@ test of the tool, and the output is exactly the context a maintainer wants.
 
 Some things are intentionally out of scope for now: a full page scroll and stitch capture, any
 server component, and telemetry of any kind. Nothing in this extension should ever make a
-network request. The React and Vue fixtures under `tools/` load a framework from a CDN, which is
-the one exception and only because they are test pages that never ship. If you have an idea that
+network request. The React, Vue and Vue 2 fixtures under `tools/` load a framework from a CDN,
+which is the one exception and only because they are test pages that never ship. If you have an idea that
 needs one, open an issue first so we can talk about it before you spend time on it.

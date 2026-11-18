@@ -53,6 +53,26 @@ function domClasses() {
     get shadowRoot() {
       return this.shadow ?? null;
     }
+    // A child put under this one, for a test that builds a tree. Returns the
+    // child, as appendChild does.
+    append(child) {
+      child.parentElement = this;
+      (this.kids ||= []).push(child);
+      return child;
+    }
+    // The elements under this one, in document order, as Chrome's live list
+    // has them: '*' or a tag.
+    getElementsByTagName(tag) {
+      const found = [];
+      const visit = (element) => {
+        for (const child of element.kids || []) {
+          if (tag === '*' || child.tag === tag) found.push(child);
+          visit(child);
+        }
+      };
+      visit(this);
+      return found;
+    }
   }
   // querySelector and querySelectorAll, for the selectors the collector
   // uses: tag, tag[name], and tag[name="value" i] with =, *=, ^= or ~=, the
@@ -4780,6 +4800,32 @@ function devFibers(...types) {
   return { tag: 5, type: 'button', memoizedProps: {}, return: parent, _debugOwner: parent };
 }
 
+// The shapes a Svelte development build leaves, as svelte@5.58.0 writes them
+// (src/internal/client/dev/elements.js and context.js), svelte@5.57.0 (no
+// component on the meta) and svelte@4.2.20 (add_location, with char and a
+// line counted from 0). The compiler names the FILENAME symbol
+// Symbol('filename') and keeps it to itself.
+const FILENAME = Symbol('filename');
+
+/** A component's function as the compiler leaves it, with the file it was compiled from. */
+function svelteFunction(name, file) {
+  const fn = { [name]: function () {} }[name];
+  fn[FILENAME] = file;
+  return fn;
+}
+
+/** A component's context as Svelte 5.58 pushes it: its props (s), its function, and the context it was made in (p). */
+function svelteContext(fn, props, parent = null) {
+  return { p: parent, i: true, c: null, e: null, s: props, x: null, r: null, l: null, function: fn };
+}
+
+/** What Svelte 5 puts on an element: where it is written, the stack it was rendered in, and from 5.58 the component's context. */
+function svelteMeta(file, line, column, { parent = null, component } = {}) {
+  const meta = { parent, loc: { file, line, column } };
+  if (component !== undefined) meta.component = component;
+  return meta;
+}
+
 test('collector: a name asked for while hovering is the name a pick reports, and says when the bundler made it up', () => {
   const page = arm();
   const named = (name, extra = {}) => Object.assign({ [name]: function () {} }[name], extra);
@@ -4808,6 +4854,18 @@ test('collector: a name asked for while hovering is the name a pick reports, and
       __vueParentComponent: { type: { name: 'Card' }, props: {}, parent: null },
     }),
     'Vue 3 named by its file': nodeWith({ __vnode: { ctx: { type: { __file: '/src/components/PriceTag.vue' }, props: {}, parent: null } } }),
+    'Svelte 5.58, inside another component': nodeWith({
+      __svelte_meta: svelteMeta('src/lib/CouponField.svelte', 5, 2, {
+        parent: { type: 'component', file: 'src/lib/CheckoutForm.svelte', line: 6, column: 2, parent: null },
+        component: svelteContext(svelteFunction('CouponField', 'src/lib/CouponField.svelte'), { value: 'SUMMER25' }),
+      }),
+    }),
+    'Svelte 4, found by climbing': nodeWith({}, nodeWith({ __svelte_meta: { loc: { file: 'src/routes/+page.svelte', line: 2, column: 0, char: 40 } } })),
+    'a Svelte snippet, named for the file that writes it': nodeWith({
+      __svelte_meta: svelteMeta('src/lib/CheckoutForm.svelte', 9, 4, {
+        component: svelteContext(svelteFunction('CouponField', 'src/lib/CouponField.svelte'), {}),
+      }),
+    }),
   };
   const expected = {
     'a development component': { name: 'Total', renamed: false },
@@ -4820,6 +4878,9 @@ test('collector: a name asked for while hovering is the name a pick reports, and
     'Vue 3': { name: 'CartSummary', renamed: false },
     'Vue 3 slot content, named for whoever wrote it': { name: 'CheckoutPage', renamed: false },
     'Vue 3 named by its file': { name: 'PriceTag', renamed: false },
+    'Svelte 5.58, inside another component': { name: 'CouponField', renamed: false },
+    'Svelte 4, found by climbing': { name: '+page', renamed: false },
+    'a Svelte snippet, named for the file that writes it': { name: 'CheckoutForm', renamed: false },
   };
   const names = {};
   for (const [label, node] of Object.entries(cases)) {
@@ -4903,6 +4964,86 @@ test('collector: a name asked for while hovering reads no prop, no owner, no cal
   assert.ok(page.realm('documentWork').includes('querySelectorAll'), 'a pick searched nothing either');
 });
 
+/**
+ * Counts, in the page, every search of the document or under an element the
+ * collector could make, and every shadow root it asks for: arm()'s `before`,
+ * since the collector takes these at its start.
+ */
+const COUNT_DOCUMENT_WORK = `
+  globalThis.documentWork = [];
+  const count = (proto, key, label) => {
+    const native = proto[key];
+    proto[key] = function (...args) { documentWork.push(label); return native.apply(this, args); };
+  };
+  count(Document.prototype, 'querySelectorAll', 'querySelectorAll');
+  count(Document.prototype, 'getElementsByTagName', 'getElementsByTagName');
+  count(Element.prototype, 'getElementsByTagName', 'getElementsByTagName under an element');
+  count(DocumentFragment.prototype, 'querySelectorAll', 'querySelectorAll in a shadow root');
+  count(DocumentFragment.prototype, 'querySelector', 'querySelector in a shadow root');
+  const shadow = Object.getOwnPropertyDescriptor(Element.prototype, 'shadowRoot');
+  Object.defineProperty(Element.prototype, 'shadowRoot', {
+    configurable: true,
+    get() { documentWork.push('shadowRoot'); return shadow.get.call(this); },
+  });
+`;
+
+/**
+ * A proxy over target that writes into touched each member asked of it (by
+ * descriptor or by value), each listing of its keys and each call.
+ */
+function watchedProxy(touched, label, target) {
+  return new Proxy(target, {
+    get(object, key, receiver) {
+      touched.push(`${label}.${String(key)}`);
+      return Reflect.get(object, key, receiver);
+    },
+    getOwnPropertyDescriptor(object, key) {
+      touched.push(`${label}.${String(key)}`);
+      return Reflect.getOwnPropertyDescriptor(object, key);
+    },
+    ownKeys(object) {
+      touched.push(`${label} keys`);
+      return Reflect.ownKeys(object);
+    },
+    apply(fn, self, args) {
+      touched.push(`${label}()`);
+      return Reflect.apply(fn, self, args);
+    },
+  });
+}
+
+test('collector: a Svelte name asked for while hovering reads the file and nothing else, nothing of the document, and calls nothing', () => {
+  const page = arm({ dom: true, before: COUNT_DOCUMENT_WORK });
+  const touched = [];
+  const watched = (label, target) => watchedProxy(touched, label, target);
+  // A password field on the page, which a pick's guard reads.
+  const field = new page.page.HTMLInputElement('input', { type: 'password' });
+  field.value = 'correct horse battery';
+  page.page.__svelte = watched('__svelte', { v: page.realm("new Set(['5'])") });
+  const fn = watched('function', svelteFunction('CouponField', 'src/lib/CouponField.svelte'));
+  const box = new page.page.Element('div', {});
+  const button = box.append(new page.page.Element('button', {}));
+  button.__svelte_meta = {
+    parent: watched('stack', { type: 'component', file: 'src/lib/CheckoutForm.svelte', line: 6, column: 2, parent: null }),
+    loc: watched('loc', { file: 'src/lib/CouponField.svelte', line: 5, column: 2 }),
+    component: watched('context', svelteContext(fn, watched('props', { value: 'SUMMER25' }))),
+  };
+
+  assert.deepEqual(page.name(button), { name: 'CouponField', renamed: false });
+  assert.deepEqual(touched, ['loc.file'], 'read for the name');
+  assert.deepEqual(plain(page.realm('documentWork')), [], 'the document was searched for the name');
+
+  // A pick reads all of it, so the counts above can see it.
+  page.page.document.querySelector = () => button;
+  const { component } = page.request('inspect', { marker: 'pick1' });
+  assert.deepEqual([component.names, component.source, component.version, component.props], [['CouponField', 'CheckoutForm'], 'src/lib/CouponField.svelte:5:3', '5', ['value="SUMMER25"']]);
+  for (const read of ['loc.line', 'stack.file', 'context.s', 'context.function', 'props keys', '__svelte.v']) {
+    assert.ok(touched.includes(read), `a pick did not read ${read}`);
+  }
+  assert.ok(!touched.includes('function()'), "a pick called the component's function");
+  assert.ok(page.realm('documentWork').includes('getElementsByTagName under an element'), 'a pick searched nothing either');
+});
+
 test('collector: a name asked for in a deep tree with no component climbs a bounded number of elements', () => {
   const page = arm();
   let climbed = 0;
@@ -4919,8 +5060,9 @@ test('collector: a name asked for in a deep tree with no component climbs a boun
   }
   // node is the deepest, 10,000 elements from the top.
   assert.equal(page.name(node), null);
-  // CLIMB_LIMIT (500) up for React, and as many again for Vue.
-  assert.ok(climbed <= 1000, `${climbed} elements climbed`);
+  // CLIMB_LIMIT (500) up for React, and as many again for Vue 3, for Vue 2
+  // and for Svelte. Angular is not asked.
+  assert.ok(climbed <= 2000, `${climbed} elements climbed`);
 });
 
 test('collector: a name asked for on a page with no component is answered with null, and one that throws too', () => {
@@ -4994,4 +5136,821 @@ test('collector: the name is answered through the natives taken at document_star
     late = arm({ before: "addEventListener = function () { throw new Error('the page refuses'); };" });
   });
   assert.equal(late.name(node), undefined);
+});
+
+// ----------------------------------------------------------------- Svelte --
+// The shapes a Svelte development build leaves are built by svelteMeta and
+// the helpers beside it, above the hover tests.
+
+test('collector: a Svelte element is named after its file, and printed at its line, with its column counted from 1', () => {
+  const page = arm({ dom: true });
+  page.realm("window.__svelte = { v: new Set(['5']) }; Element.prototype.__svelte_meta = null;");
+  const button = new page.page.Element('button', {});
+  page.page.document.querySelector = () => button;
+  const pick = () => page.request('inspect', { marker: 'pick1' }).component;
+
+  // Svelte 5 counts lines from 1 and columns from 0.
+  button.__svelte_meta = svelteMeta('src/lib/CouponField.svelte', 14, 4);
+  assert.deepEqual(pick(), {
+    framework: 'svelte',
+    build: 'development',
+    names: ['CouponField'],
+    hops: 0,
+    source: 'src/lib/CouponField.svelte:14:5',
+    version: '5',
+  });
+  // Svelte 4 counts lines from 0 as well, and only it writes char.
+  button.__svelte_meta = { loc: { file: 'src/lib/CouponField.svelte', line: 13, column: 4, char: 310 } };
+  assert.equal(pick().source, 'src/lib/CouponField.svelte:14:5');
+  // A path with Vite's cache buster prints without it.
+  button.__svelte_meta = svelteMeta('/src/routes/+page.svelte?t=1731900000', 3, 0);
+  assert.deepEqual([pick().names, pick().source], [['+page'], '/src/routes/+page.svelte:3:1']);
+  // No file, no component: there is nothing to name it by.
+  button.__svelte_meta = { loc: { line: 3, column: 0 } };
+  assert.equal(pick(), null);
+
+  // The version only when exactly one major is on the page.
+  button.__svelte_meta = svelteMeta('src/lib/CouponField.svelte', 14, 4);
+  for (const [versions, expected] of [["new Set(['4', '5'])", undefined], ["new Set(['4'])", '4'], ["['5']", undefined], ['null', undefined]]) {
+    page.realm(`window.__svelte = { v: ${versions} };`);
+    assert.equal(pick().version, expected, versions);
+  }
+  page.realm('delete window.__svelte;');
+  assert.equal(pick().version, undefined);
+});
+
+test("collector: a Svelte element with no meta of its own climbs to the nearest that has one, and never takes Element.prototype's for one", () => {
+  const page = arm({ dom: true });
+  // Svelte 5 puts null there; a page could put anything.
+  page.realm("Element.prototype.__svelte_meta = { loc: { file: 'src/lib/Wrong.svelte', line: 1, column: 0 } };");
+  const card = new page.page.Element('div', { class: 'card' });
+  card.__svelte_meta = svelteMeta('src/lib/Card.svelte', 2, 0);
+  // What {@html} writes has no meta of its own.
+  const inner = card.append(new page.page.Element('p', {})).append(new page.page.Element('em', {}));
+  page.page.document.querySelector = () => inner;
+  const { component } = page.request('inspect', { marker: 'pick1' });
+  assert.deepEqual([component.names, component.hops, component.source], [['Card'], 2, 'src/lib/Card.svelte:2:1']);
+  // With no element of its own holding one, there is no Svelte component.
+  const loose = new page.page.Element('span', {});
+  page.page.document.querySelector = () => loose;
+  assert.equal(page.request('inspect', { marker: 'pick1' }).component, null);
+});
+
+test('collector: the blocks a Svelte element was rendered inside give the files it sits in, folded and at most five', () => {
+  const page = arm({ dom: true });
+  const stack = (entries) => entries.reduceRight((parent, [type, file]) => ({ type, file, line: 1, column: 0, parent }), null);
+  const input = new page.page.Element('input', {});
+  input.__svelte_meta = svelteMeta('src/lib/CouponField.svelte', 5, 2, {
+    parent: stack([
+      ['if', 'src/lib/CouponField.svelte'],
+      ['component', 'src/lib/CheckoutForm.svelte'],
+      ['each', 'src/lib/CheckoutForm.svelte'],
+      ['component', 'src/routes/checkout/+page.svelte'],
+      ['component', 'src/routes/+layout.svelte'],
+      ['component', 'src/App.svelte'],
+      ['component', 'src/Root.svelte'],
+    ]),
+  });
+  page.page.document.querySelector = () => input;
+  assert.deepEqual(page.request('inspect', { marker: 'pick1' }).component.names, ['CouponField', 'CheckoutForm', '+page', '+layout', 'App']);
+});
+
+test("collector: a Svelte 5.58 element prints the props of the component it is written in, without Svelte's own keys, and withholds a secret one", () => {
+  const page = arm({ dom: true });
+  const CouponField = svelteFunction('CouponField', 'src/lib/CouponField.svelte');
+  let reads = 0;
+  const props = {
+    // What the compiler hands a component for a reactive expression.
+    get value() {
+      reads += 1;
+      return 'SUMMER25';
+    },
+    disabled: false,
+    apiToken: 'tok_live_abc123',
+    children() {},
+    $$slots: { default: true },
+    $$events: {},
+  };
+  const context = svelteContext(CouponField, props);
+  const input = new page.page.Element('input', {});
+  input.__svelte_meta = svelteMeta('src/lib/CouponField.svelte', 5, 2, { component: context });
+  page.page.document.querySelector = () => input;
+  const pick = () => page.request('inspect', { marker: 'pick1' }).component;
+  assert.deepEqual(pick().props, ['value="SUMMER25"', 'disabled=false', 'apiToken=<redacted>']);
+  assert.equal(reads, 1, 'a prop was read more than once');
+
+  // A snippet's element, written in the parent's file and rendered with the
+  // component's context: the props are not the parent's, so none print.
+  input.__svelte_meta = svelteMeta('src/lib/CheckoutForm.svelte', 9, 4, { component: context });
+  assert.deepEqual([pick().names, pick().props], [['CheckoutForm'], undefined]);
+  // Svelte 5.57 and earlier put no context on the element.
+  input.__svelte_meta = svelteMeta('src/lib/CouponField.svelte', 5, 2);
+  assert.equal(pick().props, undefined);
+  // Nor does a function compiled without a file (a production build) name one.
+  input.__svelte_meta = svelteMeta('src/lib/CouponField.svelte', 5, 2, { component: svelteContext(function CouponField() {}, props) });
+  assert.equal(pick().props, undefined);
+});
+
+test('collector: a Svelte component that renders a password field withholds its value prop, and a component beside it does not', () => {
+  const page = arm({ dom: true });
+  const Form = svelteFunction('CheckoutForm', 'src/lib/CheckoutForm.svelte');
+  const Coupon = svelteFunction('PasswordBox', 'src/lib/PasswordBox.svelte');
+  const Note = svelteFunction('Note', 'src/lib/Note.svelte');
+  const form = svelteContext(Form, {});
+  const coupon = svelteContext(Coupon, { value: 'abc', hint: 'Use 12 characters' }, form);
+  const note = svelteContext(Note, { value: 'abc' }, form);
+  // <div id="app"> > <form> > (<div> > <label>, <input type=password>), <p>
+  const app = new page.page.Element('div', { id: 'app' });
+  const formElement = app.append(new page.page.Element('form', {}));
+  formElement.__svelte_meta = svelteMeta('src/lib/CheckoutForm.svelte', 4, 0, { component: form });
+  const box = formElement.append(new page.page.Element('div', {}));
+  box.__svelte_meta = svelteMeta('src/lib/PasswordBox.svelte', 3, 0, { component: coupon });
+  const label = box.append(new page.page.Element('label', {}));
+  label.__svelte_meta = svelteMeta('src/lib/PasswordBox.svelte', 4, 2, { component: coupon });
+  const field = box.append(new page.page.HTMLInputElement('input', { type: 'password' }));
+  field.__svelte_meta = svelteMeta('src/lib/PasswordBox.svelte', 5, 2, { component: coupon });
+  field.value = 'correct horse battery';
+  const aside = formElement.append(new page.page.Element('p', {}));
+  aside.__svelte_meta = svelteMeta('src/lib/Note.svelte', 2, 0, { component: note });
+
+  page.page.document.querySelector = () => label;
+  assert.deepEqual(page.request('inspect', { marker: 'pick1' }).component.props, ['value=<redacted>', 'hint="Use 12 characters"']);
+  // The field is under the same form, but Note did not render it.
+  page.page.document.querySelector = () => aside;
+  assert.deepEqual(page.request('inspect', { marker: 'pick1' }).component.props, ['value="abc"']);
+});
+
+test('collector: a Svelte pick calls no accessor planted on what it reads', () => {
+  const page = arm({ dom: true });
+  const calls = [];
+  const planted = (object, key, value) =>
+    Object.defineProperty(object, key, {
+      configurable: true,
+      enumerable: true,
+      get() {
+        calls.push(key);
+        return value;
+      },
+    });
+  const Coupon = svelteFunction('CouponField', 'src/lib/CouponField.svelte');
+  const card = new page.page.Element('div', {});
+  card.__svelte_meta = svelteMeta('src/lib/Card.svelte', 2, 0);
+  // An accessor where the meta would be: passed over, as no meta.
+  const child = card.append(new page.page.Element('span', {}));
+  planted(child, '__svelte_meta', svelteMeta('src/lib/Wrong.svelte', 1, 0));
+  page.page.document.querySelector = () => child;
+  assert.deepEqual(page.request('inspect', { marker: 'pick1' }).component.names, ['Card']);
+
+  // On the meta, its loc, the stack and the context.
+  const meta = { parent: null, loc: { file: 'src/lib/CouponField.svelte' } };
+  planted(meta.loc, 'line', 5);
+  planted(meta.loc, 'column', 2);
+  const entry = {};
+  planted(entry, 'file', 'src/lib/Wrong.svelte');
+  meta.parent = entry;
+  const context = { p: null };
+  planted(context, 's', { value: 'SUMMER25' });
+  planted(context, 'function', Coupon);
+  meta.component = context;
+  card.__svelte_meta = meta;
+  page.page.document.querySelector = () => card;
+  assert.deepEqual(page.request('inspect', { marker: 'pick1' }).component, {
+    framework: 'svelte',
+    build: 'development',
+    names: ['CouponField'],
+    hops: 0,
+    source: 'src/lib/CouponField.svelte',
+  });
+  planted(page.page, '__svelte', { v: null });
+  const loc = { file: 'src/lib/CouponField.svelte', line: 5, column: 2 };
+  card.__svelte_meta = { loc };
+  planted(card.__svelte_meta, 'component', svelteContext(Coupon, { value: 'SUMMER25' }));
+  page.request('inspect', { marker: 'pick1' });
+  planted(card.__svelte_meta, 'loc', loc);
+  assert.equal(page.request('inspect', { marker: 'pick1' }).component, null);
+  assert.deepEqual(calls, [], `called: ${calls.join(', ')}`);
+});
+
+// ---------------------------------------------------------------- Angular --
+// window.ng as @angular/core@22.3.0 publishes it in a development build
+// (publishDefaultGlobalUtils in _debug_node-chunk.mjs): getOwningComponent
+// answers the component whose template holds an element, or null for one
+// Angular did not render and for the root component's host; getHostElement
+// the element a component is on; getDirectiveMetadata its inputs, as
+// { public name: class property name }; isSignal whether a value is a signal.
+// The compiler gives a component's definition (ɵcmp, a value of the class's
+// own) a debugInfo in a development build (compiler-cli
+// extractClassDebugInfo, with lineNumber counted from 1).
+
+/** A signal as Angular makes one: a function to call for the value, or one that throws while a required input is unset. */
+function signalOf(value, { unset = false } = {}) {
+  const read = () => {
+    if (unset) throw new Error('NG0950: Input is required but no value is available yet.');
+    return value;
+  };
+  read.isSignal = true;
+  return read;
+}
+
+/**
+ * <app-root ng-version="22.3.0"> > <app-checkout> > <app-coupon-field> >
+ * <div class="coupon"> > (<input>, <p> > <em>), where the <p> is a library's
+ * own markup that Angular did not render, with each component of its own
+ * class. calls counts every call of a window.ng function.
+ */
+function angularApp(page, { coupon = {}, info = true, publish = true } = {}) {
+  const { Element } = page.page;
+  const calls = [];
+  const component = (name, inputs, fields, debug) => {
+    const Type = { [name]: class {} }[name];
+    if (debug) Type.ɵcmp = { debugInfo: { className: name, ...debug } };
+    Type.inputsMeta = inputs;
+    return Object.assign(new Type(), fields);
+  };
+  const app = component('AppComponent', {}, {}, info && { filePath: 'src/app/app.component.ts', lineNumber: 9 });
+  const checkout = component('CheckoutComponent', { step: 'step' }, { step: 2 }, info && { filePath: 'src/app/checkout/checkout.component.ts', lineNumber: 20 });
+  const couponField = component(
+    'CouponFieldComponent',
+    { code: 'code', disabled: ['disabled', 0], apiToken: 'token', placeholder: 'placeholder', ...coupon.inputs },
+    { code: 'SUMMER25', disabled: signalOf(false), token: 'tok_live_abc123', placeholder: signalOf('', { unset: true }), ...coupon.fields },
+    info && { filePath: 'src/app/coupon-field/coupon-field.component.ts', lineNumber: 12 }
+  );
+  const root = new Element('app-root', { 'ng-version': '22.3.0' });
+  const checkoutHost = root.append(new Element('app-checkout', {}));
+  const couponHost = checkoutHost.append(new Element('app-coupon-field', {}));
+  const box = couponHost.append(new Element('div', { class: 'coupon' }));
+  const input = box.append(new page.page.HTMLInputElement('input', coupon.type ? { type: coupon.type } : {}));
+  const note = box.append(new Element('p', {}));
+  const emphasis = note.append(new Element('em', {}));
+  const owners = new Map([
+    [checkoutHost, app],
+    [couponHost, checkout],
+    [box, couponField],
+    [input, couponField],
+  ]);
+  const hosts = new Map([
+    [app, root],
+    [checkout, checkoutHost],
+    [couponField, couponHost],
+  ]);
+  const ng = {
+    getOwningComponent(element) {
+      calls.push('getOwningComponent');
+      return owners.get(element) ?? null;
+    },
+    getHostElement(instance) {
+      calls.push('getHostElement');
+      return hosts.get(instance) ?? null;
+    },
+    getDirectiveMetadata(instance) {
+      calls.push('getDirectiveMetadata');
+      return { inputs: instance.constructor.inputsMeta, outputs: {} };
+    },
+    isSignal(value) {
+      calls.push('isSignal');
+      return typeof value === 'function' && value.isSignal === true;
+    },
+  };
+  if (publish) page.page.ng = ng;
+  return { ng, calls, root, checkoutHost, couponHost, box, input, note, emphasis, couponField };
+}
+
+test('collector: an Angular element names the component whose template holds it, the file and line of its class, the components above, and the version', () => {
+  const page = arm({ dom: true });
+  const angular = angularApp(page);
+  page.page.document.querySelector = () => angular.input;
+  assert.deepEqual(page.request('inspect', { marker: 'pick1' }).component, {
+    framework: 'angular',
+    build: 'development',
+    names: ['CouponFieldComponent', 'CheckoutComponent', 'AppComponent'],
+    hops: 0,
+    source: 'src/app/coupon-field/coupon-field.component.ts:12',
+    version: '22.3.0',
+    // By public name. A signal is called, and the required one not set yet
+    // is left out.
+    props: ['code="SUMMER25"', 'disabled=false', 'apiToken=<redacted>'],
+  });
+  // The host element is written in the template of the component above it.
+  page.page.document.querySelector = () => angular.couponHost;
+  assert.deepEqual(page.request('inspect', { marker: 'pick1' }).component.names, ['CheckoutComponent', 'AppComponent']);
+  // What a library wrote itself climbs to the nearest element Angular rendered.
+  page.page.document.querySelector = () => angular.emphasis;
+  const { component } = page.request('inspect', { marker: 'pick1' });
+  assert.deepEqual([component.names[0], component.hops], ['CouponFieldComponent', 2]);
+});
+
+test('collector: an Angular component without debugInfo is named by its class, with no source, and a definition behind a getter is not read', () => {
+  const page = arm({ dom: true });
+  const angular = angularApp(page, { info: false });
+  page.page.document.querySelector = () => angular.input;
+  const { component } = page.request('inspect', { marker: 'pick1' });
+  assert.deepEqual([component.names, component.source], [['CouponFieldComponent', 'CheckoutComponent', 'AppComponent'], undefined]);
+  // A component compiled just in time: ɵcmp is a getter that compiles it.
+  let compiled = 0;
+  Object.defineProperty(angular.couponField.constructor, 'ɵcmp', {
+    configurable: true,
+    get() {
+      compiled += 1;
+      return { debugInfo: { className: 'Wrong', filePath: 'src/wrong.ts', lineNumber: 1 } };
+    },
+  });
+  const again = page.request('inspect', { marker: 'pick1' }).component;
+  assert.deepEqual([again.names[0], again.source, compiled], ['CouponFieldComponent', undefined, 0]);
+});
+
+test("collector: an Angular component that renders a password field withholds its value input, read under its host", () => {
+  const page = arm({ dom: true });
+  const angular = angularApp(page, {
+    coupon: { type: 'password', inputs: { value: 'value', hint: 'hint' }, fields: { value: 'abc', hint: 'Use 12 characters' } },
+  });
+  angular.input.value = 'correct horse battery';
+  page.page.document.querySelector = () => angular.note;
+  assert.deepEqual(page.request('inspect', { marker: 'pick1' }).component.props, [
+    // Shaped like a password, in a component that renders one (secretShaped).
+    'code=<redacted>',
+    'disabled=false',
+    'apiToken=<redacted>',
+    'value=<redacted>',
+    'hint="Use 12 characters"',
+  ]);
+});
+
+test('collector: an Angular input a template binds by a harmless alias is withheld for the secret name of its class property', () => {
+  const page = arm({ dom: true });
+  // @Input('value') password, and apiKey = input('', { alias: 'note' }): a
+  // template binds them as value and note, and getDirectiveMetadata lists
+  // them as { value: 'password', note: 'apiKey' }. No secret field anywhere.
+  const angular = angularApp(page, {
+    coupon: {
+      inputs: { value: 'password', note: 'apiKey', label: 'label' },
+      fields: { password: 'hunter2-blue-42', apiKey: signalOf('abcdEFGH1234ijkl'), label: 'Coupon' },
+    },
+  });
+  page.page.document.querySelector = () => angular.input;
+  assert.deepEqual(page.request('inspect', { marker: 'pick1' }).component.props, [
+    'code="SUMMER25"',
+    'disabled=false',
+    'apiToken=<redacted>',
+    // Filed under the class property, so the name rule withholds it.
+    'password=<redacted>',
+    'apiKey=<redacted>',
+    'label="Coupon"',
+  ]);
+
+  // An alias that lands on another input's public name is listed once, and
+  // the second is not read at all.
+  const again = arm({ dom: true });
+  let read = 0;
+  const twice = angularApp(again, {
+    coupon: { inputs: { value: 'password', password: 'pin' }, fields: { password: 'hunter2-blue-42' } },
+  });
+  Object.defineProperty(twice.couponField, 'pin', {
+    get() {
+      read += 1;
+      return '4321';
+    },
+  });
+  again.page.document.querySelector = () => twice.input;
+  const props = again.request('inspect', { marker: 'pick1' }).component.props;
+  assert.deepEqual([props.filter((prop) => prop.startsWith('password=')), read], [['password=<redacted>'], 0]);
+});
+
+test('collector: a window.ng that throws, answers nothing an object, or is not Angular\'s gives no component and throws nothing', () => {
+  const cases = {
+    'functions that throw': (ng) => {
+      ng.getOwningComponent = () => {
+        throw new Error('the page refuses');
+      };
+    },
+    'answers of the wrong kind': (ng) => {
+      ng.getOwningComponent = () => 'CouponFieldComponent';
+    },
+    'no getOwningComponent': (ng) => {
+      delete ng.getOwningComponent;
+    },
+    'getOwningComponent behind a getter': (ng) => {
+      const owning = ng.getOwningComponent;
+      Object.defineProperty(ng, 'getOwningComponent', { get: () => owning });
+    },
+    'a window.ng of another kind': (ng, page) => {
+      page.page.ng = 'ng';
+    },
+  };
+  for (const [label, spoil] of Object.entries(cases)) {
+    const page = arm({ dom: true });
+    const angular = angularApp(page);
+    spoil(angular.ng, page);
+    page.page.document.querySelector = () => angular.input;
+    let reply;
+    assert.doesNotThrow(() => {
+      reply = page.request('inspect', { marker: 'pick1' });
+    }, label);
+    assert.equal(reply.component, null, label);
+  }
+  // A getHostElement and a getDirectiveMetadata that throw leave the name.
+  const page = arm({ dom: true });
+  const angular = angularApp(page);
+  angular.ng.getHostElement = angular.ng.getDirectiveMetadata = () => {
+    throw new Error('the page refuses');
+  };
+  page.page.document.querySelector = () => angular.input;
+  const { component } = page.request('inspect', { marker: 'pick1' });
+  assert.deepEqual([component.names, component.props], [['CouponFieldComponent'], undefined]);
+});
+
+test("collector: Angular is never asked while hovering, and a page another framework rendered first never calls window.ng", () => {
+  const page = arm({ dom: true, before: COUNT_DOCUMENT_WORK });
+  const angular = angularApp(page);
+  const touched = [];
+  page.page.ng = watchedProxy(touched, 'ng', angular.ng);
+  assert.equal(page.name(angular.input), null);
+  assert.deepEqual([angular.calls, touched], [[], []], 'window.ng was asked for a name');
+  assert.deepEqual(plain(page.realm('documentWork')), [], 'the document was searched for a name');
+  // A pick asks it.
+  page.page.document.querySelector = () => angular.input;
+  assert.equal(page.request('inspect', { marker: 'pick1' }).component.names[0], 'CouponFieldComponent');
+  assert.ok(angular.calls.includes('getOwningComponent'));
+
+  // React found first: window.ng is not called.
+  angular.calls.length = 0;
+  touched.length = 0;
+  angular.input.__reactFiber$t = devFibers(function CouponField() {});
+  const { component } = page.request('inspect', { marker: 'pick1' });
+  assert.deepEqual([component.framework, component.names[0]], ['react', 'CouponField']);
+  assert.deepEqual([angular.calls, touched], [[], []], 'window.ng was asked on a React page');
+});
+
+// ------------------------------------------------------------------ Vue 2 --
+// A Vue 2 app as vue@2.7.16 leaves it (src/core/instance/lifecycle.js, init.js
+// and vdom/vnode.js): __vue__ on each component's root element, set by each
+// _update in turn so the outermost of components sharing a root holds it;
+// $options made from the constructor's options (initInternalComponent), so
+// name and __file sit on its prototype and _componentTag on it; $parent the
+// component whose patch created it, which for slot content is the one that
+// renders the slot; and vnodes holding elm, children, context and
+// componentInstance as their own values.
+
+/**
+ * root (new Vue, no name) > App > CheckoutForm > (Card > (<label> slot
+ * content, WithTracking > CouponField), <div class="terms"> with v-html),
+ * as elements:
+ *
+ *   <div class="app"> > <form> > (<section class="card"> > (<label>,
+ *   <div class="coupon"> > <input>), <div class="terms"> > <p> > <a>)
+ *
+ * dev false gives the production build's _renderProxy. watch, a list, makes
+ * each instance a proxy that writes into it each member asked of it.
+ */
+function vue2App(page, { dev = true, password = false, watch = null } = {}) {
+  const { Element, HTMLInputElement } = page.page;
+  const counts = { child: 0, props: 0 };
+  class VNode {
+    constructor(fields) {
+      this.tag = undefined;
+      this.children = undefined;
+      this.elm = undefined;
+      this.context = undefined;
+      this.componentInstance = undefined;
+      Object.assign(this, fields);
+    }
+    // Vue's one accessor on a vnode: the old name of componentInstance.
+    get child() {
+      counts.child += 1;
+      return this.componentInstance;
+    }
+  }
+  function Vue() {}
+  Vue.version = '2.7.16';
+  Vue.options = {};
+  const extend = (options) => {
+    function VueComponent() {}
+    VueComponent.prototype = Object.create(Vue.prototype);
+    VueComponent.prototype.constructor = VueComponent;
+    VueComponent.super = Vue;
+    VueComponent.options = options;
+    return VueComponent;
+  };
+  const instance = (Ctor, parent, { label, tag, props = {} } = {}) => {
+    const target = Object.create(Ctor.prototype);
+    const vm = watch ? watchedProxy(watch, label, target) : target;
+    target._isVue = true;
+    target.$options = Ctor === Vue ? {} : Object.create(Ctor.options);
+    if (tag) target.$options._componentTag = tag;
+    target.$parent = parent;
+    target.$root = parent ? parent.$root : vm;
+    // defineReactive: a getter for each prop.
+    target._props = {};
+    for (const [key, value] of Object.entries(props)) {
+      Object.defineProperty(target._props, key, {
+        enumerable: true,
+        configurable: true,
+        get() {
+          counts.props += 1;
+          return value;
+        },
+      });
+    }
+    target._renderProxy = dev ? new Proxy(vm, {}) : vm;
+    return vm;
+  };
+  const mount = (vm, vnode) => {
+    vm._vnode = vnode;
+    vm.$el = vnode.elm;
+    vnode.elm.__vue__ = vm;
+  };
+
+  const appElement = new Element('div', { class: 'app' });
+  const form = appElement.append(new Element('form', {}));
+  const section = form.append(new Element('section', { class: 'card' }));
+  const label = section.append(new Element('label', {}));
+  const coupon = section.append(new Element('div', { class: 'coupon' }));
+  const input = coupon.append(new HTMLInputElement('input', password ? { type: 'password' } : {}));
+  const terms = form.append(new Element('div', { class: 'terms' }));
+  const link = terms.append(new Element('p', {})).append(new Element('a', {}));
+
+  const root = instance(Vue, null, { label: 'root' });
+  const App = instance(extend({ name: 'App', __file: 'src/App.vue' }), root, { label: 'App' });
+  const Form = instance(extend({ __file: 'src/components/CheckoutForm.vue' }), App, { label: 'CheckoutForm' });
+  const Card = instance(extend({ name: 'Card' }), Form, { label: 'Card', tag: 'card' });
+  const Tracking = instance(extend({}), Card, { label: 'WithTracking', tag: 'with-tracking' });
+  const Coupon = instance(extend({ __name: 'CouponField', __file: 'src/components/CouponField.vue' }), Tracking, {
+    label: 'CouponField',
+    tag: 'coupon-field',
+    props: { value: 'SUMMER25', disabled: false },
+  });
+
+  // Inner before outer, as Vue patches them.
+  mount(Coupon, new VNode({ tag: 'div', elm: coupon, context: Coupon, children: [new VNode({ tag: 'input', elm: input, context: Coupon })] }));
+  mount(Tracking, new VNode({ tag: 'vue-component-5-CouponField', elm: coupon, context: Tracking, componentInstance: Coupon }));
+  mount(
+    Card,
+    new VNode({
+      tag: 'section',
+      elm: section,
+      context: Card,
+      children: [
+        // Written in CheckoutForm's template, rendered in Card's slot.
+        new VNode({ tag: 'label', elm: label, context: Form, children: [new VNode({ elm: { nodeType: 3 }, context: Form })] }),
+        new VNode({ tag: 'vue-component-4-with-tracking', elm: coupon, context: Form, componentInstance: Tracking }),
+      ],
+    })
+  );
+  mount(
+    Form,
+    new VNode({
+      tag: 'form',
+      elm: form,
+      context: Form,
+      children: [
+        new VNode({ tag: 'vue-component-3-card', elm: section, context: Form, componentInstance: Card }),
+        // v-html: what it writes has no vnode.
+        new VNode({ tag: 'div', elm: terms, context: Form }),
+      ],
+    })
+  );
+  mount(App, new VNode({ tag: 'div', elm: appElement, context: App, children: [new VNode({ tag: 'vue-component-2', elm: form, context: App, componentInstance: Form })] }));
+  mount(root, new VNode({ tag: 'vue-component-1-App', elm: appElement, context: root, componentInstance: App }));
+  if (watch) watch.length = 0;
+  return { counts, extend, Vue, VNode, instance, root, App, Form, Card, Tracking, Coupon, appElement, form, section, label, coupon, input, terms, link };
+}
+
+test('collector: a Vue 2 element names the component whose template wrote it, the components above, its file, the version and its props', () => {
+  const page = arm({ dom: true });
+  const app = vue2App(page);
+  const pick = (node) => {
+    page.page.document.querySelector = () => node;
+    return page.request('inspect', { marker: 'pick1' }).component;
+  };
+  assert.deepEqual(pick(app.input), {
+    framework: 'vue',
+    // A name from __name (script setup), then the tag it was written as,
+    // then the options' name, then the file.
+    names: ['CouponField', 'with-tracking', 'Card', 'CheckoutForm', 'App'],
+    hops: 0,
+    build: 'development',
+    source: 'src/components/CouponField.vue',
+    version: '2.7.16',
+    props: ['value="SUMMER25"', 'disabled=false'],
+  });
+  assert.equal(app.counts.props, 2, 'a prop was read more than once');
+  // The root of a component that another renders as its own: the innermost.
+  assert.deepEqual(pick(app.coupon).names[0], 'CouponField');
+  // Slot content: rendered by Card, written by CheckoutForm.
+  assert.deepEqual([pick(app.label).names, pick(app.label).hops], [['CheckoutForm', 'App'], 0]);
+  assert.equal(pick(app.label).source, 'src/components/CheckoutForm.vue');
+  // A component's own root.
+  assert.deepEqual(pick(app.section).names, ['Card', 'CheckoutForm', 'App']);
+  // What v-html wrote: two up to the element its template has.
+  assert.deepEqual([pick(app.link).names[0], pick(app.link).hops], ['CheckoutForm', 2]);
+  // The app's root element, which new Vue holds: App, and new Vue has no name.
+  assert.deepEqual(pick(app.appElement).names, ['App']);
+});
+
+test('collector: a Vue 2 production build is read too, claims no build, and finds the version through Vue.extend', () => {
+  const page = arm({ dom: true });
+  const app = vue2App(page, { dev: false });
+  // A root made with new (Vue.extend(options))().
+  Object.setPrototypeOf(app.root, app.extend({}).prototype);
+  page.page.document.querySelector = () => app.input;
+  const { component } = page.request('inspect', { marker: 'pick1' });
+  assert.deepEqual([component.names[0], component.build, component.version], ['CouponField', undefined, '2.7.16']);
+  // No __vue__, no Vue 2.
+  delete app.coupon.__vue__;
+  delete app.section.__vue__;
+  delete app.form.__vue__;
+  delete app.appElement.__vue__;
+  assert.equal(page.request('inspect', { marker: 'pick1' }).component, null);
+});
+
+test('collector: a Vue 2 component that renders a password field withholds its value prop', () => {
+  const page = arm({ dom: true });
+  const app = vue2App(page, { password: true });
+  app.input.value = 'correct horse battery';
+  page.page.document.querySelector = () => app.coupon;
+  assert.deepEqual(page.request('inspect', { marker: 'pick1' }).component.props, ['value=<redacted>', 'disabled=false']);
+});
+
+test('collector: an element with a Vue 3 vnode and a __vue__ reads as Vue 3, and a Vue 2 pick calls no accessor planted on what it reads', () => {
+  const page = arm({ dom: true });
+  const app = vue2App(page);
+  app.input.__vnode = { ctx: { type: { name: 'Three' }, props: {}, parent: null } };
+  page.page.document.querySelector = () => app.input;
+  assert.deepEqual(page.request('inspect', { marker: 'pick1' }).component.names, ['Three']);
+  delete app.input.__vnode;
+
+  const calls = [];
+  const planted = (object, key) => {
+    const value = object[key];
+    delete object[key];
+    Object.defineProperty(object, key, {
+      configurable: true,
+      get() {
+        calls.push(key);
+        return value;
+      },
+    });
+  };
+  // Where the climb looks first: passed over, as no instance.
+  planted(app.coupon, '__vue__');
+  planted(app.Card, '$parent');
+  planted(app.Form.$options, '_componentTag');
+  page.page.document.querySelector = () => app.label;
+  const { component } = page.request('inspect', { marker: 'pick1' });
+  assert.deepEqual(component.names, ['CheckoutForm', 'App']);
+  page.page.document.querySelector = () => app.input;
+  // The climb passes the coupon's root and reaches Card's, whose walk finds
+  // the coupon's element as WithTracking, written in CheckoutForm.
+  assert.deepEqual(page.request('inspect', { marker: 'pick1' }).component.names, ['CheckoutForm', 'App']);
+  assert.deepEqual([calls, app.counts.child], [[], 0], `called: ${calls.join(', ')}`);
+});
+
+test('collector: a Vue 2 name asked for while hovering is the name a pick reports, and reads no prop, no version, nothing of the document, and calls nothing', () => {
+  const page = arm({ dom: true, before: COUNT_DOCUMENT_WORK });
+  const touched = [];
+  const app = vue2App(page, { watch: touched });
+  const elements = ['input', 'coupon', 'label', 'section', 'link', 'appElement'];
+  const names = {};
+  for (const key of elements) names[key] = page.name(app[key]);
+  assert.deepEqual(
+    elements.map((key) => names[key]?.name),
+    ['CouponField', 'CouponField', 'CheckoutForm', 'Card', 'CheckoutForm', 'App']
+  );
+  const read = new Set(touched.map((entry) => entry.slice(entry.indexOf('.') + 1)));
+  for (const key of ['_props', '$root', '_renderProxy', 'constructor']) assert.ok(!read.has(key), `read ${key} for a name`);
+  assert.deepEqual([app.counts.props, app.counts.child], [0, 0], 'a getter was run for a name');
+  assert.deepEqual(plain(page.realm('documentWork')), [], 'the document was searched for a name');
+
+  for (const key of elements) {
+    page.page.document.querySelector = () => app[key];
+    const { component } = page.request('inspect', { marker: 'pick1' });
+    assert.deepEqual([names[key].name, names[key].renamed], [component.names[0], false], `${key}: not the name the pick reports`);
+  }
+  const picked = new Set(touched.map((entry) => entry.slice(entry.indexOf('.') + 1)));
+  assert.ok(picked.has('_props') && picked.has('$root'), [...picked].join());
+  assert.ok(page.realm('documentWork').includes('getElementsByTagName under an element'), 'a pick searched nothing either');
+});
+
+test('collector: a Vue 2 render tree is walked no further than SUBTREE_LIMIT vnodes, and an element past that is named for the root', () => {
+  const page = arm({ dom: true });
+  const { Element } = page.page;
+  const app = vue2App(page);
+  let looked = 0;
+  const counted = (vnode) =>
+    new Proxy(vnode, {
+      getOwnPropertyDescriptor(target, key) {
+        if (key === 'elm') looked += 1;
+        return Reflect.getOwnPropertyDescriptor(target, key);
+      },
+    });
+  const List = app.instance(app.extend({ name: 'LongList' }), app.App, { label: 'LongList' });
+  const list = new Element('ul', {});
+  const rows = [];
+  const spans = [];
+  for (let i = 0; i < 4000; i += 1) {
+    const row = list.append(new Element('li', {}));
+    const span = row.append(new Element('span', {}));
+    spans.push(span);
+    rows.push(counted(new app.VNode({ tag: 'li', elm: row, context: app.Form, children: [counted(new app.VNode({ tag: 'span', elm: span, context: app.Form }))] })));
+  }
+  // And each of the list's children taken from it, which is work too.
+  let taken = 0;
+  const children = new Proxy(rows, {
+    getOwnPropertyDescriptor(target, key) {
+      if (key !== 'length') taken += 1;
+      return Reflect.getOwnPropertyDescriptor(target, key);
+    },
+  });
+  List._vnode = counted(new app.VNode({ tag: 'ul', elm: list, context: List, children }));
+  List.$el = list;
+  list.__vue__ = List;
+
+  const both = (node) => {
+    looked = taken = 0;
+    const name = page.name(node);
+    const hover = looked + taken;
+    page.page.document.querySelector = () => node;
+    looked = taken = 0;
+    const { component } = page.request('inspect', { marker: 'pick1' });
+    return { name: name.name, names: component.names, hops: component.hops, hover, pick: looked + taken };
+  };
+  // Inside the walk: rows rendered from CheckoutForm's slot, found exactly.
+  const near = both(spans[10]);
+  assert.deepEqual([near.name, near.names[0], near.hops], ['CheckoutForm', 'CheckoutForm', 0]);
+  // Past it: the list's element is two up, but the span may have a vnode
+  // of its own that was never looked at, so the root's component is named
+  // with no steps counted.
+  const far = both(spans[3500]);
+  assert.deepEqual([far.name, far.names[0], far.hops], ['LongList', 'LongList', 0]);
+  // At most SUBTREE_LIMIT vnodes looked at, and as many taken from a list.
+  assert.ok(far.hover <= 6000 && far.pick <= 6000, `${far.hover} and ${far.pick} vnodes looked at or taken`);
+});
+
+// ------------------------------------------------------- the step up a tree --
+
+test('collector: the Svelte, Vue 2 and Angular climbs step up through the native parentElement, never one the page defined on an element', () => {
+  // Chrome's parentElement is a getter on Node.prototype, which the
+  // collector takes at its start. This one reads _parent.
+  const page = arm({
+    dom: true,
+    before: `
+      globalThis.Node = class Node {};
+      Object.defineProperty(Node.prototype, 'parentElement', {
+        configurable: true,
+        get() { return this._parent ?? null; },
+      });
+    `,
+  });
+  const { Element, HTMLInputElement } = page.page;
+  const pick = (node) => {
+    page.page.document.querySelector = () => node;
+    return page.request('inspect', { marker: 'pick1' }).component;
+  };
+
+  // Svelte: <form> > <div> > (<label> > <b>, <input type=password>), where
+  // <b> has no meta and the rest is PasswordBox's but the form.
+  const form = svelteContext(svelteFunction('CheckoutForm', 'src/lib/CheckoutForm.svelte'), {});
+  const box = svelteContext(svelteFunction('PasswordBox', 'src/lib/PasswordBox.svelte'), { value: 'abc', hint: 'Use 12 characters' }, form);
+  const formElement = new Element('form', {});
+  formElement.__svelte_meta = svelteMeta('src/lib/CheckoutForm.svelte', 4, 0, { component: form });
+  const boxElement = formElement.append(new Element('div', {}));
+  boxElement.__svelte_meta = svelteMeta('src/lib/PasswordBox.svelte', 3, 0, { component: box });
+  const label = boxElement.append(new Element('label', {}));
+  label.__svelte_meta = svelteMeta('src/lib/PasswordBox.svelte', 4, 2, { component: box });
+  const bold = label.append(new Element('b', {}));
+  const field = boxElement.append(new HTMLInputElement('input', { type: 'password' }));
+  field.__svelte_meta = svelteMeta('src/lib/PasswordBox.svelte', 5, 2, { component: box });
+  field.value = 'correct horse battery';
+  const vue = vue2App(page);
+  const angular = angularApp(page);
+
+  // Then every element's own parentElement becomes an accessor of the
+  // page's that answers null, its real parent kept where the native reads
+  // it, and each read of it notes the function in the collector that made it.
+  const readers = new Set();
+  for (const element of page.page.document.getElementsByTagName('*')) {
+    element._parent = element.parentElement;
+    Object.defineProperty(element, 'parentElement', {
+      configurable: true,
+      get() {
+        const frame = new Error().stack.split('\n').find((line) => line.includes('collector-main.js'));
+        readers.add(/at (\S+) /.exec(frame ?? '')?.[1] ?? 'outside the collector');
+        return null;
+      },
+    });
+  }
+
+  // One up to its meta, and the password field found beside it, which only
+  // the climb from the meta to the component's scope reaches.
+  const svelte = pick(bold);
+  assert.deepEqual([svelte.names, svelte.hops, svelte.props], [['PasswordBox'], 1, ['value=<redacted>', 'hint="Use 12 characters"']]);
+  // One up to the coupon's root, and what v-html wrote two up.
+  assert.deepEqual([pick(vue.input).names[0], pick(vue.input).hops], ['CouponField', 0]);
+  assert.deepEqual([pick(vue.link).names[0], pick(vue.link).hops], ['CheckoutForm', 2]);
+  // Two up to the nearest element Angular rendered.
+  assert.deepEqual([pick(angular.emphasis).names[0], pick(angular.emphasis).hops], ['CouponFieldComponent', 2]);
+  assert.deepEqual([pick(angular.input).props], [['code="SUMMER25"', 'disabled=false', 'apiToken=<redacted>']]);
+
+  // The readers of React and Vue 3, asked first, read the element's own
+  // parentElement as they always have, so the accessor was in reach.
+  assert.deepEqual([...readers].sort(), ['fiberOf', 'handlersOf', 'vueSummary']);
 });

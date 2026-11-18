@@ -2094,6 +2094,37 @@ test('picker events: a call site read from a stack keeps saying so, and nothing 
   }
 });
 
+// REVIEW lead 8: every framework but 'vue' was rebuilt as 'react', so a
+// Svelte component would have printed as a React one. The four the collector
+// reads are kept as they came, and a component of any other framework is
+// dropped, rather than printed with another framework's wording.
+test('picker events: a Svelte or an Angular component keeps its framework, and one of a framework no collector reads is dropped', async () => {
+  const sent = {
+    svelte: { framework: 'svelte', version: '5', build: 'development', names: ['CouponField', '+page'], source: 'src/lib/CouponField.svelte:14:5', props: ['value="SUMMER25"'] },
+    angular: { framework: 'angular', version: '22.3.0', build: 'development', names: ['CouponFieldComponent'], source: 'src/app/coupon-field.component.ts:12', hops: 2 },
+    vue: { framework: 'vue', version: '2.7.16', names: ['CouponField', 'App'], source: 'src/components/CouponField.vue' },
+    solid: { framework: 'solid', names: ['Counter'] },
+    toString: { framework: 'toString', names: ['Counter'] },
+    missing: { names: ['Counter'] },
+  };
+  for (const [label, component] of Object.entries(sent)) {
+    const realm = makeRealm();
+    realm.add('div', { id: 'target' }, [100, 100, 200, 100]);
+    realm.collector((data) => (data.action === 'inspect' ? { component, handlers: null } : null));
+    realm.arm();
+    await realm.frame();
+    realm.click(150, 150);
+    await realm.idle(1000);
+    const picked = realm.picks()[0].element.component;
+    if (['svelte', 'angular', 'vue'].includes(label)) {
+      assert.deepEqual(picked, { hops: 0, ...component }, label);
+    } else {
+      // Absent, as on a page with no component.
+      assert.equal(picked, undefined, `${label}: a component of a framework no collector reads was kept`);
+    }
+  }
+});
+
 // F28 and CW2. Each start names its run, answers the injection with it and
 // puts it on every message, so a late message from an earlier run cannot end
 // a newer arm; and a pick sends the visual viewport the panel crops through.

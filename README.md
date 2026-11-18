@@ -61,10 +61,11 @@ was collected while you walked. Claude Code opens the images itself.
 * **A sheet, not a shot.** Every capture becomes a numbered item with its own screenshot,
   its own sentence and its own intent. Add as many as the walkthrough needs.
 * **Three ways to frame.** Drag a region, click an element, or grab the whole viewport.
-  Element captures also bring the node's markup, its computed styles, the React or Vue component
-  that rendered it, the handlers bound to it, and a line of search targets, so Claude Code opens
-  a file instead of grepping class names. While you hover, the highlight already names that
-  component, so you know what you are about to pick.
+  Element captures also bring the node's markup, its computed styles, the React, Vue, Svelte or
+  Angular component that rendered it, the handlers bound to it, and a line of search targets, so
+  Claude Code opens a file instead of grepping class names. While you hover, the highlight
+  already names that component (on Angular, only the pick does), so you know what you are about
+  to pick.
 * **Failed requests name their caller.** A 500 in the console tells you what broke. The prompt
   also tells you which function sent it, and from which file and line.
 * **Bugs and suggestions on the same sheet.** Each item is either. The prompt opens with
@@ -152,16 +153,18 @@ the page for about a second after the pick, and a press that begins in that seco
 it until the button comes up (five seconds at most). If you pick with <kbd>Enter</kbd> and keep it
 held, its repeats and its release are kept from the page until you let go.
 
-**The name on the highlight.** On a React or Vue page, the tag over the highlight gives the
-element, its size and the component that rendered it, the name the item's Component line will start
-with, and it follows the highlight as the arrow keys move it. A name the bundler made up shows as
+**The name on the highlight.** On a React, Vue or Svelte page, the tag over the highlight gives
+the element, its size and the component that rendered it, the name the item's Component line will
+start with, and it follows the highlight as the arrow keys move it. A name the bundler made up shows as
 `<A> minified`, since it appears nowhere in your source. Over an element in a closed shadow root
 the tag names the component of the root's host, and over a frame, the component that rendered the
 frame. The name is read in the page once for each element the highlight goes to, by the pointer,
 Tab or the arrow keys, with nothing written into the page and nothing posted to it, and it is kept
 nowhere. On a page with no component, on a site you keep the collector off, and in a tab left open
 across an update or reload of the extension (whose old collector may not know the question) until
-you reload the tab, the tag gives the element and its size alone.
+you reload the tab, the tag gives the element and its size alone. So does it on an Angular page:
+Angular can be asked which component rendered an element only by calling its own functions, which
+the extension does once for a pick and not for every element the pointer crosses.
 
 **Frames and shadow roots.** A frame (an iframe, embed or object) is picked as a whole: nothing
 inside it can be picked, and no click goes into it while Element is armed. Frames let the pointer
@@ -400,9 +403,9 @@ returns. Properties still sitting at their initial value are dropped automatical
 here is `opacity: 1` filler. If `font-family` and a fractional `height` are not what you debug,
 the list is one array to edit.
 
-**On a React or Vue page the element section says more.** The demo page above uses neither, so
-its sample has no component to name. Pick an element in a React application and the same section
-reads:
+**On a React, Vue, Svelte or Angular page the element section says more.** The demo page above
+uses none of them, so its sample has no component to name. Pick an element in a React application
+and the same section reads:
 
 ```markdown
 Component: `Total` (React, development build)
@@ -457,6 +460,48 @@ to the extension. That is `keepNames: true` for esbuild, which Vite 7 exposes as
 `esbuild: { keepNames: true }` and Vite 8 as `build.rolldownOptions.output.keepNames`, and
 `keep_fnames: true` for terser. Next.js minifies with SWC and offers no supported way to keep
 them, so capture on `next dev` instead, which also gives the file and line.
+
+**Vue, Svelte and Angular each say it in their own words**, because each records something
+different. Vue 3 and Vue 2 name the component whose template the element is written in, slot
+content included, and give the file that component is defined in when the build recorded one
+(`Defined in`). A Svelte development build records where the element itself is written, so its
+line points into the markup:
+
+```markdown
+Component: `CouponField` (Svelte 5, development build)
+Element written at src/lib/CouponField.svelte:14:5
+Inside CheckoutForm > +page
+Search for: `cart-total`, "Order total", `CouponField`
+Props of `CouponField`: value="SUMMER25", disabled=false
+```
+
+Svelte names a component after its file, as its compiler does, which is why a SvelteKit route
+shows as `+page`. The file, line and column come from Svelte 3 on, the files around it from Svelte
+5.36, and the props only from Svelte 5.58, the first to record which component rendered an
+element. An element a snippet renders is written in one component and rendered with another's
+props, so its props are left out rather than printed under a name they do not belong to.
+
+Angular keeps nothing on the element, so for a pick the extension asks Angular itself, through the
+functions a development build publishes for Angular DevTools (`window.ng`):
+
+```markdown
+Component: `CouponFieldComponent` (Angular 22.3.0, development build)
+Defined in src/app/coupon-field/coupon-field.component.ts:12
+Inside CheckoutComponent > AppComponent
+Search for: `cart-total`, "Order total", `CouponFieldComponent`
+Props of `CouponFieldComponent`: code="SUMMER25", disabled=false
+```
+
+Its props are the component's inputs, under the names a template binds them by (or under the
+class property's name, when only that one looks secret), and a signal input is read for its value. The file and line are the ones the Angular compiler records for the
+class from Angular 17.1 on; a component compiled in the browser has none, and the line is left out.
+
+A production build of Svelte or Angular records none of this, so there the element section has no
+Component line, only the markup, the search targets and the selector. Vue 2 keeps its instances on
+the page in production too, so a Vue 2 production build is read as a development one is, without
+the file, which vue-loader records only in development, and without saying which build it is. The
+handlers bound to an element are read on React and Vue 3 pages only, so on Svelte, Vue 2 and
+Angular pages the section has no Handlers line.
 
 **What it hands Claude Code to search for.** Names in a codebase are what a grep can find, and
 mining them out of the markup is work. The prompt does it up front:
@@ -654,7 +699,7 @@ stays for as long as that page is in view, through a copy too.
 | :--- | :--- |
 | **console** | `console.error` and `console.warn` calls, uncaught exceptions with stack frames, unhandled promise rejections, and failed resource loads |
 | **network** | Requests that returned 4xx or 5xx or failed outright, with method, URL, status, timing, and the function that sent them with its file and line. Requests the page ended itself, by aborting them, reopening them before they finished, or through a timeout it set, are labelled as such, leave the buffer before a real failure does, and in a single report they come after the real failures |
-| **element** | For each item picked with the element tool: the component behind it on a React or Vue page, the handlers bound to it and the first line of their source, a line of search targets, any file its class names imply, the node's markup, a CSS selector that finds it again, and a curated set of computed styles |
+| **element** | For each item picked with the element tool: the component behind it on a React, Vue, Svelte or Angular page, the handlers bound to it on a React or Vue 3 page and the first line of their source, a line of search targets, any file its class names imply, the node's markup, a CSS selector that finds it again, and a curated set of computed styles |
 | **page** | URL, title, viewport size and device pixel ratio, plus each item's own URL when the sheet spans more than one page. URLs print as paths (`/checkout?step=2`) while the sheet stays on one origin, and in full once it spans two |
 
 Console and network are read once, when you copy, from the tab you are looking at. If that
@@ -698,11 +743,15 @@ left alone. A word of five letters or more also matches at either end of a run t
 (`authtoken`, `phonenumber`, and also `microphone`), and a number at the end of a word is ignored
 (`otp1`, `cvv2`, and also `auth0`). What is screened:
 
-* **Component props.** Only the nearest component's props are read, `children` is skipped, at most
-  twelve keys are kept, and every string is cut at sixty characters. A prop with a secret looking
-  name keeps its name and loses its value, unless the value is a boolean, null, a function (printed
-  by name) or an object (printed as `{…}`), none of which shows one. A string or number prop under
-  any other name loses its value when it holds what a secret field on the page holds: when it equals
+* **Component props.** Only the nearest component's props are read (an Angular component's inputs,
+  found at the pick by calling Angular's own development functions, and a Svelte component's props
+  from Svelte 5.58), `children` is skipped, at most twelve keys are kept, and every string is cut at
+  sixty characters. A prop with a secret looking name keeps its name and loses its value, unless
+  the value is a boolean, null, a function (printed by name) or an object (printed as `{…}`), none
+  of which shows one. An Angular input counts as secret looking by either of its names, the one a
+  template binds or its class property's, so `@Input('value') password` is printed as
+  `password=<redacted>`. A string or number prop under any other name loses its value when it holds
+  what a secret field on the page holds: when it equals
   the live value of such a field, contains one of four characters or more, or is a piece of four
   characters or more that makes up at least half of one (a value seeded into a field the user has
   since typed on the end of). It also loses it when it differs from such a value in one place,
@@ -735,10 +784,15 @@ left alone. A word of five letters or more also matches at either end of a run t
   only when it is the element you picked or its name or id looks secret (a `csrf_token`), so a
   product id elsewhere in a form hides nothing. The values are read at the pick: from the fields the
   component renders (up to 3,000 nodes, into a Vue `<Suspense>` too), so a `PasswordInput` that sets
-  `type="password"` itself is caught, and from the document's own secret fields, at most 32 of each
-  kind, the names judged among its first 256 inputs, text areas and selects, and from those in its
-  open shadow roots, nested ones included, up to 512 roots taken in the order they stand in the
-  page, among the page's first 100,000 elements.
+  `type="password"` itself is caught. For Svelte, Vue 2 and Angular, which keep no tree of what a
+  component rendered that the extension reads, those fields are the ones under the component's
+  element in the page (for Svelte, the ones it rendered under the element its own sit in), up to
+  3,000. A field such a component puts elsewhere, as an Angular overlay or a portal does, is not
+  among them, so it brings neither the `value` rule nor the shape rule, though its value is still
+  matched through the document's fields below. The values are also read from the document's own
+  secret fields, at most 32 of each kind, the names judged among its first 256 inputs, text areas
+  and selects, and from those in its open shadow roots, nested ones included, up to 512 roots taken
+  in the order they stand in the page, among the page's first 100,000 elements.
 * **Handler bodies.** Dropped entirely, rather than masked in part, if they mention one of those
   words or contain a quoted run of twenty or more token characters, which is the shape a key or
   a bearer token has whatever the code around it is called.
@@ -1005,9 +1059,11 @@ For work on the panel there is a faster loop. Serve the repository and open
 `http://localhost:8000/tools/panel-stage.html`: that is the panel running as an ordinary web
 page beside the demo page, with `chrome.*` stood in for by `tools/chrome-shim.js`. Capture
 modes, the collector, the prompt and persistence all work, and reloading the page is the whole
-cycle. The stage loads the broken checkout page by default. Add `?demo=demo-react.html` or
-`?demo=demo-vue.html` to load a small React or Vue fixture instead, which is how to see the
-component lines without pointing the extension at a real application. It is also where the
+cycle. The stage loads the broken checkout page by default. Add `?demo=demo-react.html`,
+`?demo=demo-vue.html` or `?demo=demo-vue2.html` to load a small React, Vue 3 or Vue 2 fixture
+instead, which is how to see the component lines without pointing the extension at a real
+application. Svelte and Angular have no fixture there, since their development builds come only
+out of their compilers and the repository has no build step. It is also where the
 images in this README come from, so they can be regenerated rather than redrawn:
 
 ```bash

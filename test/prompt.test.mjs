@@ -412,11 +412,63 @@ test('prompt: a call site read from a stack says so, a recorded one does not, an
   assert.equal(listed.match(caveat).length, 1);
   assert.equal(listed.match(/^Call site read from a stack: /gm).length, 3);
   assert.ok(listed.indexOf('code the browser ran') < listed.indexOf('## 1.'));
+  // Nor is Svelte's or Angular's, a place in the markup and a class's line.
+  for (const name of ['svelte', 'angular']) {
+    const report = Object.assign(EXTRA[name](), { consoleLines: [], errors: [], network: [] });
+    report.items[0].element.component.sourceFrom = 'stack';
+    const prompt = buildPrompt(report);
+    assert.ok(!/read from a stack|code the browser ran/.test(prompt), `${name}: its source was said to be read from a stack`);
+  }
   // No frame anywhere: the sentence names the call site alone.
   const sitesOnly = Object.assign(sampleReport('bug'), { consoleLines: [], errors: [], network: [] });
   const only = buildPrompt(sitesOnly);
   assert.match(only, / The line and column of a call site read from a stack are a position in the code the browser ran, not mapped back to the source\.\n/);
   assert.equal(only.match(caveat).length, 1);
+});
+
+// REVIEW lead 8: a component sent as 'svelte' printed as React, its markup
+// line as a call site in another file. Each framework names itself, says what
+// its source is, and says it in the hops sentence; one the template does not
+// know, which only a stored item from elsewhere can carry, prints as React
+// always has.
+test('prompt: a Svelte, an Angular and a Vue 2 component each print in their own words, and an unknown framework as React', () => {
+  const svelte = buildPrompt(EXTRA.svelte());
+  assert.equal(lineOf(svelte, 'Component:'), 'Component: `CouponField` (Svelte 5, development build)');
+  assert.equal(lineOf(svelte, 'Element written at'), 'Element written at src/lib/CouponField.svelte:14:5');
+  assert.equal(lineOf(svelte, 'Inside'), 'Inside CheckoutForm > +page');
+  assert.ok(!/^(?:Call site|Defined in)/m.test(svelte), 'a Svelte element was given a call site or a definition');
+  const hopped = EXTRA.svelte();
+  hopped.items[0].element.component.hops = 1;
+  assert.match(
+    lineOf(buildPrompt(hopped), 'Component:'),
+    /\(Svelte 5, development build\)\. The selected element was not rendered by Svelte itself; this is the nearest component node, 1 DOM element up\.$/
+  );
+
+  const angular = buildPrompt(EXTRA.angular());
+  assert.equal(
+    lineOf(angular, 'Component:'),
+    'Component: `CouponFieldComponent` (Angular 22.3.0, development build). The selected element was not rendered by Angular itself; this is the nearest component node, 2 DOM elements up.'
+  );
+  assert.equal(lineOf(angular, 'Defined in'), 'Defined in src/app/coupon-field/coupon-field.component.ts:12');
+  assert.equal(lineOf(angular, 'Props of'), 'Props of `CouponFieldComponent`: code="SUMMER25", disabled=false');
+
+  // Vue 2 goes through Vue's wording: its version, and no build, which Vue 2
+  // cannot be asked.
+  const vue2 = EXTRA['vue-and-failures']();
+  Object.assign(vue2.items[0].element.component, { version: '2.7.16' });
+  delete vue2.items[0].element.component.build;
+  const printed = buildPrompt(vue2);
+  assert.equal(lineOf(printed, 'Component:'), 'Component: `CouponField` (Vue 2.7.16)');
+  assert.equal(lineOf(printed, 'Defined in'), 'Defined in /src/components/CouponField.vue');
+
+  const react = buildPrompt(sampleReport('bug'));
+  for (const framework of ['solid', 'toString', '__proto__', 'constructor', 'hasOwnProperty', 'React', 7, null, ['vue'], { vue: 1 }]) {
+    const report = sampleReport('bug');
+    report.items[0].element.component.framework = framework;
+    let prompt;
+    assert.doesNotThrow(() => (prompt = buildPrompt(report)), JSON.stringify(framework));
+    assert.equal(prompt, react, `${JSON.stringify(framework)} did not print as React`);
+  }
 });
 
 // R5 and R6: with nothing over the page while picking, nearly every mouse
@@ -672,6 +724,7 @@ test('prompt: malformed fields never print undefined or throw (PJ15)', () => {
     ['items', 0, 'element', 'handlers', 'hops'], ['items', 0, 'element', 'component'], ['items', 0, 'element', 'component', 'names'],
     ['items', 0, 'element', 'component', 'props'], ['items', 0, 'element', 'component', 'hops'], ['items', 0, 'element', 'component', 'owner'],
     ['items', 0, 'element', 'component', 'source'], ['items', 0, 'element', 'component', 'renamed'], ['items', 0, 'element', 'component', 'minified'],
+    ['items', 0, 'element', 'component', 'framework'],
     ['page'], ['page', 'url'], ['page', 'title'], ['page', 'viewport'], ['page', 'viewport', 'width'], ['page', 'viewport', 'dpr'],
     ['consoleLines'], ['consoleLines', 0], ['consoleLines', 0, 'level'], ['consoleLines', 0, 'text'], ['consoleLines', 0, 't'],
     ['errors'], ['errors', 0], ['errors', 0, 'text'], ['errors', 0, 'stack'], ['errors', 0, 'where'], ['errors', 0, 'kind'],

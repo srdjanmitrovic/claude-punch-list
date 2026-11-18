@@ -53,7 +53,14 @@
  * @property {Object=} element        { selector, attributes, html, styles, text,
  *                                    truncated, component, handlers,
  *                                    classHints, hovered }, where component is
- *                                    the React or Vue node behind the selector,
+ *                                    the node behind the selector, of
+ *                                    framework 'react', 'vue' (Vue 2 or 3),
+ *                                    'svelte' or 'angular' (see FRAMEWORKS),
+ *                                    whose source is a call site for React,
+ *                                    the component's own file for Vue, the
+ *                                    file and line of its class for Angular,
+ *                                    and the element's own file, line and
+ *                                    column for Svelte;
  *                                    handlers are the event props found on the
  *                                    picked node or on the nearest ancestor
  *                                    carrying any, classHints is one clause per
@@ -66,7 +73,7 @@
  *                                    sourceFrom: 'stack' when its call site is
  *                                    a position in the code the browser ran
  *                                    rather than one React recorded. A
- *                                    component of either kind carries
+ *                                    component of any kind carries
  *                                    closedHost, the host's label, when the
  *                                    picked element is inside a closed shadow
  *                                    root and the component was read from
@@ -289,14 +296,41 @@ function printsFrames(report) {
 }
 
 /**
+ * The frameworks a component can come from, each with the name it prints
+ * under and what its source is (see formatComponent): React's is a call
+ * site, where the element's JSX is written in the file of whoever rendered
+ * it; Vue's and Angular's are the component's own definition; Svelte's is
+ * the element's own place in the markup of the file it is written in. Vue 2
+ * and Vue 3 are both 'vue'.
+ */
+const FRAMEWORKS = {
+  react: { label: 'React', site: 'call' },
+  vue: { label: 'Vue', site: 'definition' },
+  svelte: { label: 'Svelte', site: 'markup' },
+  angular: { label: 'Angular', site: 'definition' },
+};
+
+/**
+ * Which of FRAMEWORKS a component is from. Looked up as an own key, so a
+ * framework of "toString" cannot reach Object.prototype. Anything else,
+ * which only a stored item from somewhere other than the picker can carry,
+ * prints as React, as every framework that was not 'vue' always has.
+ */
+function frameworkOf(component) {
+  const framework = component.framework;
+  return typeof framework === 'string' && Object.hasOwn(FRAMEWORKS, framework) ? framework : 'react';
+}
+
+/**
  * Whether a component's call site prints, read from a stack: a React one
- * with sourceFrom 'stack', as formatComponent prints it. Vue's path is the
- * component's own file and carries no position to doubt.
+ * with sourceFrom 'stack', as formatComponent prints it. The path of every
+ * other framework is a file of the component's own, or a place in its
+ * markup, and carries no position to doubt.
  */
 function siteFromStack(component) {
   return (
     Boolean(component) &&
-    component.framework !== 'vue' &&
+    frameworkOf(component) === 'react' &&
     component.sourceFrom === 'stack' &&
     typeof component.source === 'string' &&
     flatten(component.source) !== ''
@@ -684,8 +718,8 @@ function formatStyles(styles = {}) {
 }
 
 /**
- * The React or Vue component behind a picked element, as a few lines plus the
- * props, which the caller places further down.
+ * The React, Vue, Svelte or Angular component behind a picked element, as a
+ * few lines plus the props, which the caller places further down.
  *
  * The MAIN world does the reading and hands over plain strings, so nothing is
  * left here but wording, and the wording is what decides whether Claude Code
@@ -694,8 +728,11 @@ function formatStyles(styles = {}) {
  *   - React records where a node's JSX is WRITTEN, which is the owner's file
  *     and not the component's own. Telling a reader that `Total` lives at
  *     Checkout.tsx:42 sends them to the call site to look for a definition that
- *     is not there. Vue records the opposite, the component's own file, so the
- *     two frameworks cannot share a sentence.
+ *     is not there. Vue records the opposite, the component's own file, and
+ *     Angular the file and line of the component's class, so those share
+ *     "Defined in". Svelte records where the element itself is written, in
+ *     the file of the component whose markup holds it, which is neither (see
+ *     FRAMEWORKS).
  *   - A production build renames components, so `t` is a real answer rather
  *     than a broken one, and a reader who is not told that will grep for a name
  *     that was never in the source.
@@ -710,7 +747,8 @@ function formatComponent(component) {
   const nameIndex = names.findIndex(Boolean);
   const name = nameIndex === -1 ? '' : names[nameIndex];
 
-  const vue = component.framework === 'vue';
+  const kind = frameworkOf(component);
+  const { label, site: written } = FRAMEWORKS[kind];
   const source = typeof component.source === 'string' ? flatten(component.source) : '';
   const owner = typeof component.owner === 'string' ? flatten(component.owner) : '';
   const props = list(component.props)
@@ -723,10 +761,12 @@ function formatComponent(component) {
   const lines = [];
 
   if (name) {
-    let framework = vue ? 'Vue' : 'React';
-    // Only Vue offers its version, and it is worth the four characters: the same
-    // question has different answers in the options API and the composition API.
-    if (vue && typeof component.version === 'string') framework += ` ${flatten(component.version)}`;
+    let framework = label;
+    // Every framework but React offers its version, and it is worth the few
+    // characters: the same question has different answers in Vue's options API
+    // and its composition API, in Svelte 4 and in Svelte 5's runes, and in an
+    // Angular with signals and one without.
+    if (kind !== 'react' && typeof component.version === 'string') framework += ` ${flatten(component.version)}`;
     // Asserted nowhere: a reply this build did not produce must not be allowed
     // to claim a development build, because that claim is what tells a reader
     // the names can be trusted as written.
@@ -768,7 +808,7 @@ function formatComponent(component) {
           `\`${host}\`, which the page's own scripts cannot see into; ` +
           `this is the component nearest that host, ${steps} up.`
         : `${identity.endsWith('.') ? '' : '.'} The selected element was not rendered by ` +
-          `${vue ? 'Vue' : 'React'} itself; ` +
+          `${label} itself; ` +
           `this is the nearest component node, ${steps} up.`;
     }
     lines.push(identity);
@@ -781,10 +821,16 @@ function formatComponent(component) {
   // the line says where it came from, and the sentence above the first line
   // read from the page says once what that means (see pageData).
   const site = siteFromStack(component) ? 'Call site read from a stack' : 'Call site';
-  if (source && vue) {
-    // Not "Call site". Vue's __file is the component's own file, so this is the
-    // one framework where the path is where the definition lives.
+  if (source && written === 'definition') {
+    // Not "Call site". Vue's __file is the component's own file, and Angular's
+    // the file and line of the component's class, so for these the path is
+    // where the definition lives.
     lines.push(`Defined in ${source}`);
+  } else if (source && written === 'markup') {
+    // Svelte's is the element's own file, line and column, in the markup of
+    // the component that writes it: neither a call site in another file nor
+    // the line a definition starts on.
+    lines.push(`Element written at ${source}`);
   } else if (source && owner && owner === name) {
     // The commonest case: the picked element is written in the render of the
     // component that renders it, so the call site is inside that component's
