@@ -28,6 +28,17 @@ const REPORT_TTL_MS = 7 * 24 * 60 * 60 * 1000; // how long an uncopied report su
 const THUMB_MAX_WIDTH = 800; // the frame is never wider than this in device pixels
 const THUMB_MAX_HEIGHT = 800; // and a tall element crop should not cost a megabyte
 const THUMB_QUALITY = 0.85;
+// Marking up a capture (see openMarkup). The marks are drawn into the saved
+// image in one fixed magenta over a white edge, whatever the theme, because
+// the prompt names that colour as the user's own (MARKS in the template).
+const MARK_COLOR = '#e6007e';
+const MARK_EDGE = 'rgba(255, 255, 255, 0.85)';
+const MARK_MIN_DRAG_PX = 4; // a shape shorter than this, in CSS pixels, is not drawn
+const MARK_STEP = 0.02; // how far an arrow key moves a point, as a share of the image
+// The clean captures the panel keeps for marking up (holdFull): those of its
+// newest captures, this many at most and about this many bytes together.
+const FULL_KEEP_COUNT = 10;
+const FULL_KEEP_BYTES = 100 * 1024 * 1024;
 const UNDO_MS = 6000; // how long a discard can be taken back before its files go
 const REMOVED_TTL_MS = 10 * 60 * 1000; // how long the sheet remembers what left it, see state.removed
 const REMOVED_MAX = 200;
@@ -105,6 +116,7 @@ const el = {
   banner: document.getElementById('banner'),
   shortcutKeys: document.getElementById('shortcut-keys'),
 
+  modes: document.getElementById('modes'),
   modeRegion: document.getElementById('mode-region'),
   modeElement: document.getElementById('mode-element'),
   modeVisible: document.getElementById('mode-visible'),
@@ -114,6 +126,14 @@ const el = {
   previewImg: document.getElementById('preview-img'),
   previewClear: document.getElementById('preview-clear'),
   previewMeta: document.getElementById('preview-meta'),
+  markUp: document.getElementById('mark-up'),
+  markupCanvas: document.getElementById('markup-canvas'),
+  marks: document.getElementById('marks'),
+  markArrow: document.getElementById('mark-arrow'),
+  markEllipse: document.getElementById('mark-ellipse'),
+  markUndo: document.getElementById('mark-undo'),
+  markCancel: document.getElementById('mark-cancel'),
+  markDone: document.getElementById('mark-done'),
   sheet: document.getElementById('sheet'),
   list: document.getElementById('list'),
   rowMoveHint: document.getElementById('row-move-hint'),
@@ -209,6 +229,41 @@ const el = {
  *                                  item's own file: this panel saved it, or
  *                                  recordFor found it so. Chrome does not
  *                                  reissue an id within a session. Not stored.
+ * @property {boolean=} marked      Its file is a copy with marks drawn on it
+ *                                  (see commitMarks). Stored only when true.
+ * @property {number=} fileAt       Epoch ms of the last time marking up gave
+ *                                  the item another file, in any panel. A
+ *                                  merge takes path, downloadId and marked
+ *                                  from the side with the newer stamp. Stored
+ *                                  only once set.
+ * @property {Blob|null=} full      The clean capture, kept for marking up by
+ *                                  the panel that took it, while it stays
+ *                                  open, for its newest captures (holdFull).
+ *                                  Never stored.
+ * @property {boolean=} fullReleased  That capture was let go to keep within
+ *                                  the bound, so the item says why it can no
+ *                                  longer be marked up. Not stored.
+ * @property {Mark[]|null=} marks   The marks drawn on its file in this panel,
+ *                                  which marking up again starts from. Not
+ *                                  stored.
+ * @property {Mark[]|null=} unsaved Marks whose save failed, which marking up
+ *                                  again starts from instead. Not stored.
+ * @property {{ downloadId: number|null }|null=} markSave  A marked copy on its
+ *                                  way to disk. Copy waits for it. Not stored.
+ */
+
+/**
+ * @typedef {Object} Mark
+ * One arrow or ellipse drawn on a screenshot. Its two points are shares of
+ * the image's width and height (0 to 1), so one record draws the same at the
+ * frame's scale and at full size.
+ * @property {'arrow'|'ellipse'} tool
+ * @property {number} x1  Where the drag began: the arrow's tail, or a corner
+ *                        of the box the ellipse fills.
+ * @property {number} y1
+ * @property {number} x2  Where it ended: the arrow's head, or the opposite
+ *                        corner.
+ * @property {number} y2
  */
 
 const state = {
@@ -256,6 +311,13 @@ const state = {
   // (writeReceiptNote).
   lastCopy: null,
   busy: false,
+  // The markup open on the item in the frame, see openMarkup: { item, bitmap,
+  // width, height, tool, saved, marks, pending, cursor, pointerId }. Null
+  // while nothing is being marked up.
+  markup: null,
+  markupOpening: null, // a markup whose screenshot is being decoded, so a second press waits
+  markTool: 'arrow', // the tool a markup starts with; sticks for the life of the panel
+  fulls: [], // the items holding their clean capture, oldest first, see holdFull
 };
 
 // ---------------------------------------------------------------- helpers --
@@ -591,12 +653,21 @@ async function resolveTab() {
   state.restrictionShown = Boolean(state.restriction);
   if (el.banner.hidden) sayMissing();
 
-  const disabled = Boolean(state.restriction);
+  applyModesDisabled();
+
+  refreshContext();
+}
+
+/**
+ * The capture buttons can be pressed unless the tab in view may not be
+ * captured, or a markup has taken their row's place (see showMarking). A
+ * tab change while marking leaves them off.
+ */
+function applyModesDisabled() {
+  const disabled = Boolean(state.restriction) || Boolean(state.markup);
   el.modeRegion.disabled = disabled;
   el.modeElement.disabled = disabled;
   el.modeVisible.disabled = disabled;
-
-  refreshContext();
 }
 
 // --------------------------------------------------------------- capture --
@@ -716,19 +787,42 @@ async function cropCapture(fullDataUrl, rect, viewport) {
  * kept, and the original is let go once it is on disk. WebP because it is
  * roughly half the size of JPEG at the same quality and the canvas encoder
  * supports it everywhere this extension runs.
+ *
+ * `source` is a data URL, an image or a canvas: a capture arrives as a data
+ * URL, and a marked copy is drawn on a canvas (see commitMarks), which is cut
+ * down as it is rather than encoded and decoded again first. `maxHeight` is
+ * the item's own bound, from thumbMaxHeight, so the thumbnail made at the
+ * capture and the one made after marking it up agree.
  */
-async function makeThumb(dataUrl) {
-  const image = await loadImage(dataUrl);
-  const scale = Math.min(
-    1,
-    THUMB_MAX_WIDTH / image.naturalWidth,
-    THUMB_MAX_HEIGHT / image.naturalHeight
-  );
+async function makeThumb(source, maxHeight = THUMB_MAX_HEIGHT) {
+  const image = typeof source === 'string' ? await loadImage(source) : source;
+  // An image has a natural size; a canvas and a decoded bitmap have only theirs.
+  const width = image.naturalWidth ?? image.width;
+  const height = image.naturalHeight ?? image.height;
+  const scale = Math.min(1, THUMB_MAX_WIDTH / width, maxHeight / height);
   const canvas = document.createElement('canvas');
-  canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
-  canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+  canvas.width = Math.max(1, Math.round(width * scale));
+  canvas.height = Math.max(1, Math.round(height * scale));
   canvas.getContext('2d').drawImage(image, 0, 0, canvas.width, canvas.height);
   return canvas.toDataURL('image/webp', THUMB_QUALITY);
+}
+
+/**
+ * The tallest a thumbnail of an item of this mode may be. Every mode shares
+ * THUMB_MAX_HEIGHT. A mode whose captures run far taller than the frame is
+ * wide gets a bound of its own here, the one place every thumbnail of an item
+ * asks, whoever makes it.
+ */
+function thumbMaxHeight(mode) {
+  switch (mode) {
+    default:
+      return THUMB_MAX_HEIGHT;
+  }
+}
+
+/** The bytes behind a data URL, as a Blob. */
+async function blobOf(dataUrl) {
+  return (await fetch(dataUrl)).blob();
 }
 
 // ----------------------------------------------------------------- items --
@@ -741,13 +835,16 @@ function selectedItem() {
  * Show the item in the frame. Called again whenever anything about the sheet
  * changes, a move of any row and every write adopted from another window
  * included, so it sets what the item says and nothing more: called twice
- * with nothing changed, it leaves the frame as it was.
+ * with nothing changed, it leaves the frame as it was. An open markup has
+ * its canvas in the image's place, and that stays as it is: only the
+ * readout and the buttons follow the item.
  */
 function renderFrame() {
   const item = selectedItem();
   // Kept with the item rather than only in the shared banner, which other
   // news replaces: why this item holds Copy back, and what lifts it.
   el.itemMissing.hidden = !item?.missing;
+  updateMarkUp();
 
   if (!item) {
     el.previewImg.hidden = true;
@@ -760,8 +857,13 @@ function renderFrame() {
   }
 
   // An empty src is a request for the document itself, and the image shows its
-  // alt text and a broken-image glyph while it fails.
-  if (item.thumb) {
+  // alt text and a broken-image glyph while it fails. While the item is marked
+  // up, the markup's canvas stands in the image's place (showMarking).
+  if (markingUp(item)) {
+    el.previewImg.hidden = true;
+    // Only its label, which names the item by its number.
+    showMarkTool();
+  } else if (item.thumb) {
     el.previewImg.src = item.thumb;
     el.previewImg.hidden = false;
   } else {
@@ -774,13 +876,24 @@ function renderFrame() {
 
   const index = state.items.indexOf(item) + 1;
   const position = state.items.length > 1 ? `${index}/${state.items.length} · ` : '';
-  const status = item.missing ? ' · FILE MISSING' : item.path ? '' : ' · SAVING';
   // The size of the saved PNG, which is in the screen's own pixels: twice the
   // page's CSS pixels on a Retina display, and more again when zoomed in.
   // Named as such, because the prompt's viewport line is in CSS pixels and
   // two bare sizes side by side read as one measure that disagrees.
-  el.previewMeta.textContent = `${position}${MODE_LABEL[item.mode]} · PNG ${item.width}×${item.height}${status}`;
+  el.previewMeta.textContent = `${position}${MODE_LABEL[item.mode]} · PNG ${item.width}×${item.height}${statusOf(item)}`;
   el.previewMeta.hidden = false;
+}
+
+/**
+ * What the frame's readout and a row's head say after the item's kind: why
+ * it holds Copy back (its file gone, or a file still being written), that it
+ * is being marked up, or that its screenshot carries marks.
+ */
+function statusOf(item) {
+  if (item.missing) return ' · FILE MISSING';
+  if (!item.path || item.markSave) return ' · SAVING';
+  if (markingUp(item)) return ' · MARKING';
+  return item.marked ? ' · MARKED' : '';
 }
 
 /**
@@ -788,7 +901,7 @@ function renderFrame() {
  * nothing. The sentence itself rides along, cut short.
  */
 function describeRow(item, index) {
-  const head = `Item ${index + 1}, ${MODE_LABEL[item.mode].toLowerCase()}`;
+  const head = `Item ${index + 1}, ${MODE_LABEL[item.mode].toLowerCase()}${item.marked ? ', marked' : ''}`;
   if (item.missing) return `${head}, file missing`;
   const words = item.description.trim();
   if (!words) return `${head}, no description yet`;
@@ -797,8 +910,7 @@ function describeRow(item, index) {
 
 /** The small readout above a row's sentence. */
 function rowHead(item, index) {
-  const status = item.missing ? ' · FILE MISSING' : item.path ? '' : ' · SAVING';
-  return `${index + 1} · ${MODE_LABEL[item.mode]}${status}`;
+  return `${index + 1} · ${MODE_LABEL[item.mode]}${statusOf(item)}`;
 }
 
 /**
@@ -1438,8 +1550,14 @@ function refreshRow(item) {
  * pressing one changes this item. The sticky default for the next capture is
  * updated at the same time, in the click handler, on the theory that someone
  * who just marked an item as a suggestion is probably about to mark another.
+ *
+ * A markup open on the item leaving the frame is closed first, with its marks
+ * saved (leaveMarkup): picking another row, + New item and a capture arriving
+ * all come through here.
  */
 function selectItem(id) {
+  // A markup open on the frame's item ends before another item comes in.
+  if (state.markup && state.markup.item.id !== id) leaveMarkup();
   state.selectedId = id;
   const item = selectedItem();
 
@@ -1528,7 +1646,7 @@ async function addItem(capture) {
     editedAt: Date.now(),
     // The full capture stands in until the thumbnail exists, so the frame is
     // never briefly empty. It is replaced before anything is persisted.
-    thumb: capture.dataUrl,
+    thumb: capture.thumb ?? capture.dataUrl,
     path: null,
     downloadId: null,
   };
@@ -1571,15 +1689,29 @@ async function addItem(capture) {
   if (capture.notice) showBanner(capture.notice);
 
   try {
-    item.thumb = await makeThumb(capture.dataUrl);
+    // A capture can bring its own thumbnail and its own Blob, when it was
+    // put together from more than one screenshot; one screenshot brings its
+    // data URL, and both are made from that.
+    item.thumb = capture.thumb ?? (await makeThumb(capture.dataUrl, thumbMaxHeight(item.mode)));
     // Not selectItem: that resets the field's value and would throw the caret
     // to the end of whatever has been typed in the meantime.
     renderFrame();
     renderSheet();
 
-    const saved = await saveScreenshot(capture.dataUrl, item.mode, (downloadId) => {
-      item.downloadId = downloadId;
-    });
+    const blob = capture.blob ?? (await blobOf(capture.dataUrl));
+    // Kept for marking up while this panel stays open; the data URL is let
+    // go with this call, as before.
+    holdFull(item, blob);
+    // Named for the moment of the capture rather than of the save, so that
+    // a marked copy of it, named the same way, shares its name.
+    const saved = await saveScreenshot(
+      blob,
+      item.mode,
+      (downloadId) => {
+        item.downloadId = downloadId;
+      },
+      { at: item.capturedAt }
+    );
     item.path = saved.path;
     item.downloadId = saved.downloadId;
     item.verified = true; // this session's own download, just completed
@@ -1608,6 +1740,7 @@ async function addItem(capture) {
     // already discarded while the dialog was open needs no explanation, and
     // leaves the discard too: it has no file, and an undo brought it back
     // marked SAVING for good, holding Copy back with it.
+    releaseFull(item);
     if (!state.items.includes(item)) {
       dropFromTrash(item);
       return;
@@ -1678,6 +1811,9 @@ function focusAfterDiscard() {
 
 function discardSelected() {
   if (state.selectedId == null) return;
+  // An item discarded while it is marked up goes with its marks unsaved, and
+  // Undo brings it back as it was saved.
+  closeMarkup();
   discard([state.selectedId]);
   focusAfterDiscard();
 }
@@ -1688,6 +1824,7 @@ function discardSelected() {
  */
 function discardAll() {
   if (!state.items.length) return;
+  closeMarkup();
   // What the receipt showed, for an undo to put back. After a blocked
   // clipboard it is the prompt being copied by hand and Clear these items,
   // the one way to clear the sheet that keeps the files that prompt names.
@@ -1811,6 +1948,8 @@ function settleTrash() {
     // Back on the sheet: another panel changed it after this discard, and a
     // merge keeps the newer word. Its file is in use again.
     if (state.items.some((candidate) => candidate.id === item.id)) continue;
+    // Gone for good, so nothing will mark it up.
+    releaseFull(item);
     // One still saving has no path yet; addItem deletes it once it has.
     if (item.path) deleteFile(item);
   }
@@ -1922,6 +2061,9 @@ function resetAfterCopy(copied) {
   const ids = new Set(copied.map((item) => item.id));
   const now = Date.now();
   for (const id of ids) state.removed.set(id, now);
+  // Their clean captures and marks go: state.lastCopy and state.handCopy
+  // keep these objects alive, and nothing marks a copied item up.
+  for (const item of [...copied, ...state.items.filter((each) => ids.has(each.id))]) releaseFull(item);
   state.items = state.items.filter((item) => !ids.has(item.id));
   // What was left out of this prompt was left for the next one, so it is
   // ticked for it, as a capture arriving now would be. Not a missing item,
@@ -1933,8 +2075,10 @@ function resetAfterCopy(copied) {
   }
   state.handCopy = null;
   el.clearCopied.hidden = true;
-  // The newest capture left, wherever it stands on the sheet.
-  selectItem(newestItem()?.id ?? null);
+  // The newest capture left, wherever it stands on the sheet. Unless an item
+  // left out of the copy is being marked up: the frame stays on it.
+  const marking = state.markup && state.items.find((item) => item.id === state.markup.item.id);
+  selectItem(marking ? marking.id : (newestItem()?.id ?? null));
   persist({ thumbs: true });
   updateSubmitState();
   // A missing file reported while the clipboard was written raised a banner
@@ -2160,6 +2304,8 @@ async function captureVisible() {
   // turned away where the click is handled.
   if (state.restriction || state.capturing) return;
   state.capturing = true;
+  // Mark up waits while a capture is under way.
+  updateMarkUp();
   try {
     showBanner(null);
     // An armed overlay is drawn on the page itself. Photographing it would bake
@@ -2203,6 +2349,7 @@ async function captureVisible() {
     showBanner(error?.message || 'Screenshot failed.', 'error');
   } finally {
     state.capturing = false;
+    updateMarkUp();
   }
 }
 
@@ -2532,6 +2679,712 @@ function countsFollowed(tabId) {
   return countsPort?.tabId === tabId && countsPort.counts;
 }
 
+// ----------------------------------------------------------------- markup --
+
+/*
+ * Marking up a capture: arrows and ellipses drawn on an item's screenshot in
+ * the frame, saved as a copy that takes the item's file over.
+ *
+ * Only the panel that took a capture can mark it up, and only while it stays
+ * open, because only that panel holds the clean capture (holdFull), in
+ * memory and never stored. Each mark is a record of two points (Mark), drawn
+ * by drawMarks alone, on the frame's canvas and on the copy that is saved, so
+ * what is seen while marking is what is saved. Done saves the copy through
+ * saveScreenshot as `<capture time>_<mode>_marked.png` (without `_marked`
+ * once every mark is taken back), points the item at it, and only then
+ * deletes the file it replaced (swapFile). Every rule about files works on
+ * one path and download id per item, and goes on working.
+ */
+
+const MARK_TOOLS = { arrow: 'Arrow', ellipse: 'Ellipse' };
+const ARROW_STEPS = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
+
+/** Whether the markup is open on this item. */
+function markingUp(item) {
+  return Boolean(state.markup && item && state.markup.item.id === item.id);
+}
+
+/**
+ * Keep an item's clean capture, so it can be marked up while this panel
+ * stays open. It is the Blob the save was given, held in memory and never
+ * stored. A Blob lives in Chrome's blob store rather than in the page's heap,
+ * and Chrome may page a large one out to a temporary file in the profile
+ * while it is held (PRIVACY.md says so). Kept for the newest
+ * FULL_KEEP_COUNT captures, in about FULL_KEEP_BYTES together, the oldest let
+ * go first; and let go when the item is copied, its discard settles, or it
+ * leaves the sheet in another window.
+ */
+function holdFull(item, blob) {
+  if (!blob) return;
+  item.full = blob;
+  item.fullReleased = false;
+  state.fulls.push(item);
+  trimFulls();
+}
+
+/** Let an item's clean capture go, and the marks only it could show again. */
+function releaseFull(item) {
+  if (!item) return;
+  item.full = null;
+  item.marks = null;
+  item.unsaved = null;
+  state.fulls = state.fulls.filter((held) => held !== item);
+}
+
+/**
+ * Keep the clean captures within their bound. Never the one being marked up,
+ * which its markup is drawing on, nor the newest, just taken and the likeliest
+ * to be marked up next.
+ */
+function trimFulls() {
+  for (const held of state.fulls) {
+    if (!state.items.includes(held) && !inTrash(held)) releaseFull(held);
+  }
+  const bytes = () => state.fulls.reduce((sum, held) => sum + (held.full?.size || 0), 0);
+  while (state.fulls.length > FULL_KEEP_COUNT || bytes() > FULL_KEEP_BYTES) {
+    const oldest = state.fulls.slice(0, -1).find((held) => !markingUp(held));
+    if (!oldest) break;
+    releaseFull(oldest);
+    oldest.fullReleased = true;
+  }
+  updateMarkUp();
+}
+
+/**
+ * Why an item cannot be marked up, or null when it can. The one place that
+ * decides it: an item can be marked up while this panel holds its clean
+ * capture.
+ */
+function markupBlocked(item) {
+  if (item.full) return null;
+  const number = state.items.indexOf(item) + 1;
+  if (item.fullReleased) {
+    return (
+      `Item ${number} can no longer be marked up: the panel keeps the full screenshots of its ` +
+      `${FULL_KEEP_COUNT} newest captures only, about ${Math.round(FULL_KEEP_BYTES / 2 ** 20)} MB at most. ` +
+      'Capture it again to mark it up.'
+    );
+  }
+  return (
+    `Item ${number} cannot be marked up: a panel keeps the full screenshot only of the captures it ` +
+    'took, and only while it stays open. Capture it again to mark it up.'
+  );
+}
+
+/**
+ * The Mark up button on the frame, for the item in it. Shown once the item
+ * has a file to replace, and not while it is being marked up. One that cannot
+ * be marked up still takes focus and a press, which says why (aria-disabled,
+ * not disabled). It waits while a copy or a capture runs, while a marked copy
+ * of the item is being saved, and while a markup opens.
+ */
+function updateMarkUp() {
+  const item = selectedItem();
+  el.markUp.hidden = !item || !item.path || markingUp(item);
+  if (el.markUp.hidden) return;
+  if (markupBlocked(item)) el.markUp.setAttribute('aria-disabled', 'true');
+  else el.markUp.removeAttribute('aria-disabled');
+  el.markUp.disabled =
+    state.busy || state.capturing || Boolean(item.markSave) || Boolean(state.markupOpening);
+}
+
+/** A mark's stroke in the image's own pixels: a 200th of its longer side, never under 4. */
+function markStroke(width, height) {
+  return Math.max(4, Math.round(Math.max(width, height) / 200));
+}
+
+/**
+ * Draw marks on a 2D context whose units are the image's own pixels, for an
+ * image `width` by `height`. The only code that draws a mark: the frame's
+ * canvas calls it through a transform to its own scale, and the marked copy
+ * at full size, so the two cannot differ.
+ *
+ * Each mark is drawn twice, a white edge and the magenta over it, so it holds
+ * on a dark page and a light one alike, in the one colour the prompt names,
+ * whatever the theme.
+ */
+function drawMarks(ctx, marks, width, height) {
+  const stroke = markStroke(width, height);
+  const edge = Math.max(1, Math.round(stroke / 4));
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  for (const mark of marks) {
+    const [x1, y1, x2, y2] = [mark.x1 * width, mark.y1 * height, mark.x2 * width, mark.y2 * height];
+    for (const [color, outline] of [
+      [MARK_EDGE, edge * 2],
+      [MARK_COLOR, 0],
+    ]) {
+      ctx.strokeStyle = color;
+      ctx.fillStyle = color;
+      ctx.lineWidth = stroke + outline;
+      ctx.beginPath();
+      if (mark.tool === 'ellipse') {
+        ctx.ellipse((x1 + x2) / 2, (y1 + y2) / 2, Math.abs(x2 - x1) / 2, Math.abs(y2 - y1) / 2, 0, 0, Math.PI * 2);
+        ctx.stroke();
+      } else {
+        drawArrow(ctx, x1, y1, x2, y2, stroke, outline);
+      }
+    }
+  }
+}
+
+/**
+ * An arrow from its tail to its head: a line, and a filled head about four
+ * strokes long, never more than half the arrow. `outline` widens the head by
+ * as much as the edge widens the line.
+ */
+function drawArrow(ctx, x1, y1, x2, y2, stroke, outline) {
+  const length = Math.hypot(x2 - x1, y2 - y1);
+  if (!length) return;
+  const ux = (x2 - x1) / length;
+  const uy = (y2 - y1) / length;
+  const head = Math.min(stroke * 4, length / 2);
+  const half = head * 0.6;
+  const baseX = x2 - ux * head;
+  const baseY = y2 - uy * head;
+  // The line stops where the head begins, which covers its round end.
+  ctx.moveTo(x1, y1);
+  ctx.lineTo(baseX, baseY);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(x2, y2);
+  ctx.lineTo(baseX - uy * half, baseY + ux * half);
+  ctx.lineTo(baseX + uy * half, baseY - ux * half);
+  ctx.closePath();
+  if (outline) {
+    ctx.lineWidth = outline;
+    ctx.stroke();
+  }
+  ctx.fill();
+}
+
+/** The keyboard's crosshair at its point, the same size on screen at any scale. */
+function drawCursor(ctx, point, width, height, scale) {
+  const unit = (window.devicePixelRatio || 1) / scale; // one CSS pixel, in the image's
+  const x = point.x * width;
+  const y = point.y * height;
+  for (const [color, lineWidth] of [
+    [MARK_EDGE, 4 * unit],
+    [MARK_COLOR, 2 * unit],
+  ]) {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = lineWidth;
+    ctx.beginPath();
+    ctx.moveTo(x - 8 * unit, y);
+    ctx.lineTo(x + 8 * unit, y);
+    ctx.moveTo(x, y - 8 * unit);
+    ctx.lineTo(x, y + 8 * unit);
+    ctx.stroke();
+  }
+}
+
+/** Whether the markup can open on this item now. */
+function openable(item) {
+  return Boolean(item.full && item.path && !item.markSave && !state.busy && !state.capturing);
+}
+
+/**
+ * Mark up: open the markup on the item in the frame. Its clean capture is
+ * decoded and shown on a canvas in the image's place, as large as the panel
+ * allows, and the marking tools take the place of the capture buttons. Marks
+ * saved before come back, still editable, over the clean capture, or the
+ * marks whose save failed, which wait for the next Done. An item that cannot
+ * be marked up says why instead (markupBlocked).
+ */
+async function openMarkup() {
+  const item = selectedItem();
+  if (!item || state.markup || state.markupOpening) return;
+  const reason = markupBlocked(item);
+  if (reason) {
+    showBanner(reason, 'warn', 'capture');
+    return;
+  }
+  if (!openable(item)) return;
+  state.markupOpening = { item };
+  updateMarkUp();
+  let bitmap = null;
+  try {
+    bitmap = await createImageBitmap(item.full);
+  } catch {
+    /* said below */
+  }
+  state.markupOpening = null;
+  // Anything can have happened while it was decoded: another item came into
+  // the frame, a copy or a capture began, or the item left the sheet.
+  if (!bitmap || selectedItem() !== item || !openable(item) || state.markup) {
+    bitmap?.close?.();
+    updateMarkUp();
+    if (!bitmap && selectedItem() === item) {
+      showBanner(`Item ${state.items.indexOf(item) + 1}'s screenshot could not be opened to mark it up.`, 'error', 'capture');
+    }
+    return;
+  }
+  const copy = (marks) => (marks || []).map((mark) => ({ ...mark }));
+  state.markup = {
+    item,
+    bitmap,
+    width: item.width || bitmap.width,
+    height: item.height || bitmap.height,
+    tool: state.markTool,
+    saved: copy(item.marks), // as they were last saved, which Cancel keeps
+    marks: copy(item.unsaved || item.marks),
+    pending: null, // a shape half drawn, by a drag or by the keys
+    cursor: null, // the keyboard's crosshair, once an arrow key has shown it
+    pointerId: null, // the pointer drawing, while a drag is under way
+  };
+  showMarking(true);
+  showMarkTool();
+  sizeMarkup();
+  renderMarkup();
+  renderFrame();
+  refreshRow(item);
+  updateSubmitState();
+  el.markupCanvas.focus({ preventScroll: true });
+}
+
+/**
+ * Swap the frame and the row under it between showing the item and marking
+ * it up: the canvas in the image's place, and the marking tools in the place
+ * of the capture buttons, which are off while hidden, so neither a click nor
+ * a key reaches them (applyModesDisabled).
+ */
+function showMarking(on) {
+  el.preview.classList.toggle('marking', on);
+  el.markupCanvas.hidden = !on;
+  el.marks.hidden = !on;
+  el.modes.hidden = on;
+  applyModesDisabled();
+}
+
+/** Light the tool in use, and say on the canvas what a drag draws. */
+function showMarkTool() {
+  for (const [name, node] of [
+    ['arrow', el.markArrow],
+    ['ellipse', el.markEllipse],
+  ]) {
+    node.classList.toggle('on', name === state.markTool);
+    node.setAttribute('aria-pressed', String(name === state.markTool));
+  }
+  const markup = state.markup;
+  if (!markup) return;
+  el.markupCanvas.setAttribute(
+    'aria-label',
+    `Screenshot of item ${state.items.indexOf(markup.item) + 1}. Drag to draw an ${state.markTool}, ` +
+      'or use the arrow keys and Enter.'
+  );
+}
+
+/** Arrow or Ellipse pressed: the tool for the next shape, and for one half drawn. */
+function setMarkTool(tool) {
+  state.markTool = tool;
+  const markup = state.markup;
+  if (markup) {
+    markup.tool = tool;
+    if (markup.pending) {
+      markup.pending.tool = tool;
+      renderMarkup();
+    }
+  }
+  showMarkTool();
+  // Choosing the tool is the step before drawing with it.
+  if (markup) el.markupCanvas.focus({ preventScroll: true });
+}
+
+/**
+ * Size the canvas to show the whole capture as large as the frame's width
+ * and 70% of the panel's height allow, small crops scaled up, with as many
+ * canvas pixels as the screen has under it. The capture's own pixels are for
+ * the saved copy (saveMarks), not for the screen.
+ */
+function sizeMarkup() {
+  const markup = state.markup;
+  if (!markup) return;
+  const { width, height } = markup;
+  const frame = el.preview.getBoundingClientRect();
+  const fit = Math.min((frame.width || width) / width, ((window.innerHeight || height) * 0.7) / height);
+  const shownWidth = Math.max(1, Math.round(width * fit));
+  const shownHeight = Math.max(1, Math.round(height * fit));
+  const ratio = window.devicePixelRatio || 1;
+  el.markupCanvas.style.width = `${shownWidth}px`;
+  el.markupCanvas.style.height = `${shownHeight}px`;
+  el.markupCanvas.width = Math.max(1, Math.round(shownWidth * ratio));
+  el.markupCanvas.height = Math.max(1, Math.round(shownHeight * ratio));
+}
+
+/** Draw the markup on its canvas: the capture, the marks, a shape half drawn, the crosshair. */
+function renderMarkup() {
+  const markup = state.markup;
+  if (!markup) return;
+  const canvas = el.markupCanvas;
+  const ctx = canvas.getContext('2d');
+  const { width, height } = markup;
+  const scale = canvas.width / width;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.setTransform(scale, 0, 0, scale, 0, 0);
+  ctx.drawImage(markup.bitmap, 0, 0, width, height);
+  drawMarks(ctx, markup.pending ? [...markup.marks, markup.pending] : markup.marks, width, height);
+  if (markup.cursor) drawCursor(ctx, markup.cursor, width, height, scale);
+}
+
+/** The canvas's size on screen in CSS pixels, or the capture's own where it has none. */
+function shownSize() {
+  const box = el.markupCanvas.getBoundingClientRect();
+  return { width: box.width || state.markup.width, height: box.height || state.markup.height };
+}
+
+/** Where a pointer event falls on the capture, as shares of it, held to its edges. */
+function markPoint(event) {
+  const box = el.markupCanvas.getBoundingClientRect();
+  const share = (offset, size) => (size ? Math.min(1, Math.max(0, offset / size)) : 0);
+  return { x: share(event.clientX - box.left, box.width), y: share(event.clientY - box.top, box.height) };
+}
+
+/** Whether a shape spans MARK_MIN_DRAG_PX on screen, which a stray click does not. */
+function longEnough(shape) {
+  const shown = shownSize();
+  return Math.hypot((shape.x2 - shape.x1) * shown.width, (shape.y2 - shape.y1) * shown.height) >= MARK_MIN_DRAG_PX;
+}
+
+/** A shape drawn: kept, and said. */
+function addMark(shape) {
+  const markup = state.markup;
+  markup.marks.push(shape);
+  announceAnew(`${MARK_TOOLS[shape.tool]} ${markup.marks.length} drawn.`);
+}
+
+/**
+ * A press on the canvas starts a shape, and the release ends it: an arrow
+ * from the press to the release, its head at the release, or an ellipse that
+ * fills the box the drag spans. The canvas holds the pointer meanwhile, so a
+ * drag that leaves it still ends there, held to its edges.
+ */
+function markPointerDown(event) {
+  const markup = state.markup;
+  if (!markup || event.button !== 0 || markup.pointerId != null) return;
+  // No text selection or drag of the canvas starts with the press. Focus is
+  // given by hand, so the keys and Esc reach the markup after a drag too.
+  event.preventDefault();
+  el.markupCanvas.focus({ preventScroll: true });
+  try {
+    el.markupCanvas.setPointerCapture(event.pointerId);
+  } catch {
+    /* a pointer already gone; its release still ends the shape, or nothing does */
+  }
+  const { x, y } = markPoint(event);
+  markup.pointerId = event.pointerId;
+  // A drag takes over from the keys.
+  markup.cursor = null;
+  markup.pending = { tool: markup.tool, x1: x, y1: y, x2: x, y2: y };
+  renderMarkup();
+}
+
+function markPointerMove(event) {
+  const markup = state.markup;
+  if (!markup || event.pointerId !== markup.pointerId || !markup.pending) return;
+  const { x, y } = markPoint(event);
+  markup.pending.x2 = x;
+  markup.pending.y2 = y;
+  renderMarkup();
+}
+
+function markPointerUp(event) {
+  const markup = state.markup;
+  if (!markup || event.pointerId !== markup.pointerId) return;
+  const shape = markup.pending;
+  const { x, y } = markPoint(event);
+  markup.pointerId = null;
+  markup.pending = null;
+  try {
+    el.markupCanvas.releasePointerCapture(event.pointerId);
+  } catch {
+    /* already released */
+  }
+  if (shape) {
+    shape.x2 = x;
+    shape.y2 = y;
+    if (longEnough(shape)) addMark(shape);
+  }
+  renderMarkup();
+}
+
+/** The drag ended without a release of its own: nothing is drawn. */
+function markPointerCancel(event) {
+  const markup = state.markup;
+  if (!markup || event.pointerId !== markup.pointerId) return;
+  markup.pointerId = null;
+  markup.pending = null;
+  renderMarkup();
+}
+
+/**
+ * The keys on the canvas, on the model Region teaches. The first arrow key,
+ * or Enter, shows a crosshair in the middle. The arrows move it by MARK_STEP
+ * of the capture, or with Alt by one CSS pixel of the canvas as shown. Enter
+ * fixes the first point, the arrows then move the second, drawn as they go,
+ * and Enter draws the shape. Esc drops a shape half drawn (escapeMarkup).
+ */
+function markKey(event) {
+  const markup = state.markup;
+  if (!markup || event.isComposing || event.metaKey || event.ctrlKey) return;
+  const step = ARROW_STEPS[event.key];
+  if (!step && event.key !== 'Enter') return;
+  event.preventDefault();
+  // A drag is under way, and the keys wait for it.
+  if (markup.pointerId != null) return;
+  if (!markup.cursor) {
+    markup.cursor = { x: 0.5, y: 0.5 };
+    renderMarkup();
+    announceAnew('Crosshair in the middle. The arrow keys move it, and Enter sets the first point.');
+    return;
+  }
+  if (step) {
+    const shown = shownSize();
+    const [dx, dy] = event.altKey ? [1 / shown.width, 1 / shown.height] : [MARK_STEP, MARK_STEP];
+    const held = (value) => Math.min(1, Math.max(0, value));
+    markup.cursor = { x: held(markup.cursor.x + step[0] * dx), y: held(markup.cursor.y + step[1] * dy) };
+    if (markup.pending) Object.assign(markup.pending, { x2: markup.cursor.x, y2: markup.cursor.y });
+    renderMarkup();
+    return;
+  }
+  const { x, y } = markup.cursor;
+  if (!markup.pending) {
+    markup.pending = { tool: markup.tool, x1: x, y1: y, x2: x, y2: y };
+    renderMarkup();
+    announceAnew(`First point set. Move to where the ${markup.tool} ends, and press Enter.`);
+    return;
+  }
+  if (!longEnough(markup.pending)) {
+    announceAnew('Move the second point away from the first, then press Enter.');
+    return;
+  }
+  addMark(markup.pending);
+  markup.pending = null;
+  renderMarkup();
+}
+
+/** Take back the last mark drawn: the Undo button, or Cmd/Ctrl+Z while marking. */
+function undoMark() {
+  const markup = state.markup;
+  if (!markup) return;
+  const mark = markup.marks.pop();
+  if (!mark) {
+    announceAnew('No marks to take back.');
+    return;
+  }
+  renderMarkup();
+  announceAnew(`${MARK_TOOLS[mark.tool]} ${markup.marks.length + 1} removed.`);
+}
+
+/**
+ * Esc while marking, once the row tooltip is closed: a shape half drawn goes
+ * first. Then the markup closes as Done closes it, saving marks that changed,
+ * so that a stray Esc never loses them; Cancel is the way to drop them.
+ */
+function escapeMarkup() {
+  const markup = state.markup;
+  if (!markup) return;
+  if (markup.pending) {
+    if (markup.pointerId != null) {
+      try {
+        el.markupCanvas.releasePointerCapture(markup.pointerId);
+      } catch {
+        /* already released */
+      }
+      markup.pointerId = null;
+    }
+    const { tool } = markup.pending;
+    markup.pending = null;
+    renderMarkup();
+    announceAnew(`The ${tool} being drawn was dropped.`);
+    return;
+  }
+  commitMarks({ focus: true });
+}
+
+/** Cancel: close without saving. The item keeps its file, and the marks it was saved with. */
+function cancelMarkup() {
+  const markup = state.markup;
+  if (!markup) return;
+  const changed = marksChanged(markup);
+  markup.item.unsaved = null;
+  closeMarkup({ focus: el.markUp });
+  if (changed) announceAnew('Marks not saved.');
+}
+
+function marksChanged(markup) {
+  return JSON.stringify(markup.marks) !== JSON.stringify(markup.saved);
+}
+
+/**
+ * The frame is about to show another item, or none, while a markup is open.
+ * The marks are saved, as Done saves them, so a mark drawn is never silently
+ * left out of the prompt. Not for an item that has left the sheet (copied or
+ * discarded in another window), whose marks would go to nothing.
+ */
+function leaveMarkup() {
+  const markup = state.markup;
+  if (!markup) return;
+  if (state.items.some((item) => item.id === markup.item.id)) commitMarks();
+  else closeMarkup();
+}
+
+/**
+ * Close the markup and give the frame and the row under it back. The decoded
+ * capture goes with it, unless `keep` hands it on to the save (commitMarks).
+ * Focus goes to `focus` when one is given, and is the caller's otherwise.
+ *
+ * @returns {Object|null} the markup that was open
+ */
+function closeMarkup({ focus = null, keep = false } = {}) {
+  const markup = state.markup;
+  if (!markup) return null;
+  state.markup = null;
+  if (markup.pointerId != null) {
+    try {
+      el.markupCanvas.releasePointerCapture(markup.pointerId);
+    } catch {
+      /* already released */
+    }
+  }
+  if (!keep) markup.bitmap.close?.();
+  // A closed canvas keeps no pixels.
+  el.markupCanvas.width = 0;
+  el.markupCanvas.height = 0;
+  showMarking(false);
+  renderFrame();
+  refreshRow(markup.item);
+  updateSubmitState();
+  focus?.focus({ preventScroll: true });
+  return markup;
+}
+
+/**
+ * Done: close the markup and, when its marks changed, save them (saveMarks).
+ * Every way out of a markup but Cancel and a discard ends here: Esc, another
+ * row, + New item, a capture arriving. `focus` is for Done and Esc, which
+ * give the keyboard to what comes next: the description while marks are
+ * saved, Mark up again when nothing changed.
+ */
+function commitMarks({ focus = false } = {}) {
+  const markup = state.markup;
+  if (!markup) return;
+  if (!marksChanged(markup)) {
+    // Back at the marks last saved: those are the ones kept, and marks whose
+    // save failed, taken back since, do not return at the next Mark up.
+    markup.item.unsaved = null;
+    closeMarkup({ focus: focus ? el.markUp : null });
+    return;
+  }
+  // Copy waits from this moment, before anything is drawn.
+  markup.item.markSave = { downloadId: null };
+  closeMarkup({ keep: true, focus: focus ? el.description : null });
+  saveMarks(markup);
+}
+
+/**
+ * Draw the marks onto the clean capture at full size and save the result
+ * beside the item's file, named for the capture's own time and mode with
+ * `_marked`, or without it when every mark was taken back. The PNG goes from
+ * the canvas to the save as a Blob, with no data URL in between. Meanwhile
+ * the item says SAVING and Copy waits; once Chrome has the path, swapFile
+ * points the item at it. A save that fails, or is cancelled in a "Save as"
+ * dialog, leaves the item as it was and says so, and its marks wait for the
+ * next Done.
+ */
+async function saveMarks({ item, marks, bitmap, width, height }) {
+  const canvas = document.createElement('canvas');
+  try {
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(bitmap, 0, 0, width, height);
+    drawMarks(ctx, marks, width, height);
+    bitmap.close?.();
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/png'));
+    if (!blob) throw new Error('The marks could not be drawn into the screenshot.');
+    const thumb = await makeThumb(canvas, thumbMaxHeight(item.mode));
+    // Let go before the wait on Chrome, which a dialog can make minutes long.
+    canvas.width = 0;
+    canvas.height = 0;
+    const saved = await saveScreenshot(
+      blob,
+      item.mode,
+      (downloadId) => {
+        if (item.markSave) item.markSave.downloadId = downloadId;
+      },
+      // Named for what it holds: with every mark taken back it is the clean
+      // capture again, and takes the capture's own name.
+      { at: item.capturedAt, suffix: marks.length ? 'marked' : undefined }
+    );
+    swapFile(item, saved, marks, thumb);
+  } catch (error) {
+    item.unsaved = marks;
+    const number = state.items.findIndex((each) => each.id === item.id) + 1;
+    if (number > 0) {
+      showBanner(
+        `The marked screenshot was not saved: ${error?.message || error} Item ${number} keeps the ` +
+          'screenshot it had. Press Mark up to try the same marks again.',
+        'error',
+        'report'
+      );
+    }
+  } finally {
+    bitmap.close?.();
+    canvas.width = 0;
+    canvas.height = 0;
+    item.markSave = null;
+    const live = state.items.find((each) => each.id === item.id);
+    renderFrame();
+    if (live) refreshRow(live);
+    updateSubmitState();
+  }
+}
+
+/**
+ * Point an item at its marked copy, then delete the file it replaced.
+ *
+ * In that order: deleted first, the old file's removal reaches
+ * downloads.onChanged while the item still names it, and marks the item's
+ * file missing. The swap is stamped (fileAt) and stored with its thumbnail,
+ * so every other window takes it over (adoptStored). The old file stays when
+ * the prompt being copied by hand names it.
+ *
+ * An item discarded meanwhile is swapped where it waits, so Undo brings it
+ * back with its marks, and the discard deletes the marked copy when it
+ * lapses. One that has left for good, copied or its discard settled, here or
+ * in another window, keeps the file it had, since a prompt may name it, and
+ * the copy nothing names is deleted.
+ */
+function swapFile(item, saved, marks, thumb) {
+  const live = state.items.find((each) => each.id === item.id) || (inTrash(item) ? item : null);
+  if (!live) {
+    deleteFile({ path: saved.path, downloadId: saved.downloadId });
+    return;
+  }
+  const old = { path: live.path, downloadId: live.downloadId };
+  live.path = saved.path;
+  live.downloadId = saved.downloadId;
+  live.marked = marks.length ? true : undefined;
+  live.fileAt = Math.max(Date.now(), (live.fileAt || 0) + 1);
+  live.thumb = thumb;
+  live.verified = true; // this session's own download, just completed
+  live.unchecked = false;
+  live.missing = false;
+  live.marks = marks;
+  live.unsaved = null;
+  persist({ thumbs: true });
+  if (!state.handCopy?.some((each) => each.id === live.id)) deleteFile(old);
+  const number = state.items.indexOf(live) + 1;
+  if (!number) return;
+  // The banner about a missing file may have been about this one.
+  if (state.bannerScope === 'missing') {
+    showBanner(null);
+    sayMissing();
+  }
+  announce(marks.length ? `Item ${number} is saved with its marks.` : `Item ${number} is saved without marks.`);
+}
+
 
 // ----------------------------------------------------------------- saving --
 
@@ -2599,15 +3452,20 @@ function clearSlowSaveHint() {
  * last path segment, and every path is printed in the prompt, so the page
  * toggle could not keep the host out of it.
  *
+ * @param {Blob|string} source  the PNG, as a Blob or a data URL
  * @param {(downloadId: number) => void} onStarted  told the id as soon as
  *   Chrome has one, which is before the file is written, so a panel closed
  *   while the save waits can still take it back.
+ * @param {{ at?: number, suffix?: string }} [name]  `at` is the time the name
+ *   gives, now unless said (a marked copy keeps its capture's time), and
+ *   `suffix` a word after the mode, as in `_region_marked.png`.
  * @returns {Promise<{ path: string, downloadId: number }>}
  */
-async function saveScreenshot(dataUrl, mode, onStarted = () => {}) {
+async function saveScreenshot(source, mode, onStarted = () => {}, { at, suffix } = {}) {
   const label = (MODE_LABEL[mode] || MODE_LABEL.other).toLowerCase();
-  const filename = `${SAVE_FOLDER}/${timestamp()}_${label}.png`;
-  const blob = await (await fetch(dataUrl)).blob();
+  const when = Number.isFinite(at) ? new Date(at) : new Date();
+  const filename = `${SAVE_FOLDER}/${timestamp(when)}_${label}${suffix ? `_${suffix}` : ''}.png`;
+  const blob = typeof source === 'string' ? await blobOf(source) : source;
 
   // URL.createObjectURL does not exist in an MV3 service worker, which is the
   // other reason this whole path lives in the panel rather than the worker.
@@ -2721,6 +3579,9 @@ function assembleReport(items, read, numbers = items.map((item) => state.items.i
       intent: item.intent,
       description: item.description,
       screenshotPath: item.path,
+      // The file carries marks the user drew, which the prompt says are not
+      // part of the page.
+      marked: item.marked || undefined,
       // Always passed: the template compares each item's page against the one
       // the buffers were read on, and counts pages for the opening line. It
       // prints a URL only when `page` is present, so the toggle still holds.
@@ -2772,8 +3633,13 @@ function includedItems() {
   return state.items.filter((item) => item.included);
 }
 
+/**
+ * Whether these items hold Copy back: one still being saved (its first file,
+ * or a marked copy of it), one whose file is gone, or one being marked up,
+ * whose marks would otherwise be left out of the prompt.
+ */
 function blocked(items) {
-  return items.some((item) => !item.path || item.missing);
+  return items.some((item) => !item.path || item.missing || item.markSave || markingUp(item));
 }
 
 async function copyReport() {
@@ -2792,6 +3658,9 @@ async function copyReport() {
   const copies = state.copies;
   el.submit.classList.add('busy');
   el.submit.disabled = true;
+  // No markup opens while the copy runs, so no marked copy can take the
+  // place of a file between the prompt naming it and the sheet letting go.
+  updateMarkUp();
   el.submitLabel.textContent = 'Copying…';
   showBanner(null);
 
@@ -2962,6 +3831,7 @@ function updateSubmitState() {
   el.selectAll.hidden = !partial;
   el.clearSelection.hidden = picked.length === 0;
   showSubmitNote(picked);
+  updateMarkUp();
 }
 
 /**
@@ -2979,18 +3849,22 @@ function showSubmitNote(picked) {
   if (el.submitNote.hidden) return;
 
   const number = (item) => state.items.indexOf(item) + 1;
-  // A missing file first: a save in progress ends by itself, a missing file
-  // holds Copy back until the user acts.
+  // What waits on the user first: a save in progress ends by itself, a
+  // missing file holds Copy back until the user acts, and so does a markup
+  // until it is done.
   const missing = picked.find((item) => item.missing);
-  const saving = picked.find((item) => !item.path);
+  const marking = picked.find((item) => markingUp(item));
+  const saving = picked.find((item) => !item.path || item.markSave);
   const reason =
     picked.length === 0
       ? 'Tick an item to copy it.'
       : missing
         ? `Item ${number(missing)}'s screenshot is no longer on disk. Discard or untick it to copy.`
-        : saving
-          ? `Item ${number(saving)} is still saving.`
-          : null;
+        : marking
+          ? `Finish marking up item ${number(marking)} to copy it.`
+          : saving
+            ? `Item ${number(saving)} is still saving.`
+            : null;
   el.submitNote.replaceChildren(
     // Copy is ready: say the keys that press it from anywhere in the panel.
     ...(reason ? [textSpan(reason)] : [textSpan('Or press'), ...keyCaps(copyKeys())])
@@ -3199,6 +4073,10 @@ function storedForm(item) {
     wordsAt: item.wordsAt || 0,
     path: item.path,
     downloadId: item.downloadId,
+    // Both left out of the write until marking up has given the item another
+    // file, so an item never marked up is stored as before.
+    marked: item.marked === true ? true : undefined,
+    fileAt: item.fileAt || undefined,
   };
 }
 
@@ -3330,6 +4208,7 @@ function readItem(raw) {
       ? raw.element
       : null;
   const rank = number(raw.rank);
+  const fileAt = number(raw.fileAt);
   return {
     id: raw.id,
     mode,
@@ -3350,6 +4229,10 @@ function readItem(raw) {
     thumb: null,
     path,
     downloadId: Number.isSafeInteger(raw.downloadId) && raw.downloadId >= 0 ? raw.downloadId : null,
+    // The value true only: anything else claims marks the file may not have.
+    marked: raw.marked === true ? true : undefined,
+    // Not in the future, where it would outrank every later file of the item.
+    fileAt: fileAt != null && fileAt > 0 ? Math.min(fileAt, Date.now()) : undefined,
   };
 }
 
@@ -3400,7 +4283,9 @@ function thumbFrom(thumbs, id) {
  *   holds it too.
  * - An item on both sides takes the newer words (wordsAt) and the newer
  *   intent, tick and place (editedAt), each from whichever side changed it
- *   last. A side that holds something newer writes it back.
+ *   last, and its file (path, download id and whether it is marked) from
+ *   the side that marked it up last (fileAt). A side that holds something
+ *   newer writes it back.
  * - Which window has focus decides nothing. The old rule kept the sentence of
  *   whichever panel had its field focused, and the field stays the active
  *   element of a window that has lost focus: a panel in the background
@@ -3462,6 +4347,25 @@ function adoptStored(report, thumbs, { initial = false } = {}) {
     } else if ((mine.wordsAt || 0) > theirs.wordsAt) {
       writeBack = true;
     }
+    // The file follows its own stamp: a panel that marked the item up gave
+    // it another file and deleted the one before, which this panel must not
+    // copy, nor write back over the new one. Whether that file is there is
+    // asked again, as for any file this session has not checked.
+    if ((theirs.fileAt || 0) > (mine.fileAt || 0)) {
+      mine.path = theirs.path;
+      mine.downloadId = theirs.downloadId;
+      mine.marked = theirs.marked;
+      mine.fileAt = theirs.fileAt;
+      mine.verified = false;
+      mine.unchecked = false;
+      mine.missing = false;
+      // Marks remembered here describe a file that is no longer the item's.
+      mine.marks = null;
+      mine.unsaved = null;
+      changed.add(mine);
+    } else if ((mine.fileAt || 0) > (theirs.fileAt || 0)) {
+      writeBack = true;
+    }
     const thumb = thumbFrom(thumbs, mine.id);
     if (thumb && thumb !== mine.thumb) {
       mine.thumb = thumb;
@@ -3507,6 +4411,8 @@ function adoptStored(report, thumbs, { initial = false } = {}) {
       if (el.description.value !== selected.description) setFieldText(selected.description);
     }
   }
+  // A clean capture kept for an item that has left the sheet elsewhere goes.
+  if (reshaped) trimFulls();
   updateSubmitState();
   updateElementCount();
   // Numbers may have moved under the missing file banner.
@@ -3748,6 +4654,28 @@ el.modeVisible.addEventListener('click', (event) => {
 el.previewClear.addEventListener('click', discardSelected);
 el.discardAll.addEventListener('click', discardAll);
 
+el.markUp.addEventListener('click', openMarkup);
+el.markArrow.addEventListener('click', () => setMarkTool('arrow'));
+el.markEllipse.addEventListener('click', () => setMarkTool('ellipse'));
+el.markUndo.addEventListener('click', undoMark);
+el.markCancel.addEventListener('click', cancelMarkup);
+el.markDone.addEventListener('click', () => commitMarks({ focus: true }));
+el.markupCanvas.addEventListener('pointerdown', markPointerDown);
+el.markupCanvas.addEventListener('pointermove', markPointerMove);
+el.markupCanvas.addEventListener('pointerup', markPointerUp);
+el.markupCanvas.addEventListener('pointercancel', markPointerCancel);
+// Capture taken away without a release (the canvas hidden mid drag, say)
+// drops the shape, as a cancel does; after a release it has nothing to drop.
+el.markupCanvas.addEventListener('lostpointercapture', markPointerCancel);
+el.markupCanvas.addEventListener('keydown', markKey);
+// A panel dragged wider or narrower while marking draws the canvas afresh at
+// its new size.
+window.addEventListener('resize', () => {
+  if (!state.markup) return;
+  sizeMarkup();
+  renderMarkup();
+});
+
 for (const [intent, node] of [
   ['bug', el.intentBug],
   ['change', el.intentChange],
@@ -3926,13 +4854,23 @@ el.clearCopied.addEventListener('click', () => {
   focusAfterDiscard();
 });
 
-// Undo the last discard from the keyboard too. In the field only while it
-// holds what the discard left there; once something is typed, the key belongs
-// to the text.
+// Cmd/Ctrl+Z from the keyboard. While a markup is open it takes back the last
+// mark and nothing else, so a discard still waiting is left alone: one press
+// is one undo. Otherwise it undoes the last discard. In the description field
+// the key belongs to the text while marking, and once something is typed
+// there since the discard; until then it means the discard. One listener for
+// both, so a press cannot reach the two.
 document.addEventListener('keydown', (event) => {
-  if (!state.trash || event.isComposing) return;
+  if (event.isComposing) return;
   if (!(event.metaKey || event.ctrlKey) || event.shiftKey || event.altKey) return;
   if (String(event.key).toLowerCase() !== 'z') return;
+  if (state.markup) {
+    if (document.activeElement === el.description) return;
+    event.preventDefault();
+    undoMark();
+    return;
+  }
+  if (!state.trash) return;
   if (document.activeElement === el.description && !untouchedSinceDiscard()) return;
   event.preventDefault();
   undoDiscard();
@@ -3981,6 +4919,8 @@ document.addEventListener('pointerover', (event) => {
  *   without asking again (deleteNow).
  * - A save still in flight is taken back: its item was never stored, so its
  *   file would be left in the Downloads folder with nothing pointing at it.
+ *   So is a marked copy still on its way: the stored item names the file it
+ *   had, which stays, and marks not yet saved are lost with the panel.
  */
 function flushOnClose() {
   const trash = state.trash;
@@ -3988,12 +4928,14 @@ function flushOnClose() {
   if (trash) {
     clearTimeout(trash.timer);
     for (const { item } of trash.entries) {
+      if (item.markSave?.downloadId != null) deleteNow(item.markSave.downloadId);
       if (state.items.some((candidate) => candidate.id === item.id)) continue;
       if (item.downloadId != null && (item.verified || !item.path)) deleteNow(item.downloadId);
     }
   }
   for (const item of state.items) {
     if (!item.path && item.downloadId != null) deleteNow(item.downloadId);
+    if (item.markSave?.downloadId != null) deleteNow(item.markSave.downloadId);
   }
 }
 window.addEventListener('pagehide', flushOnClose);
@@ -4019,17 +4961,27 @@ el.clearBuffers.addEventListener('click', async () => {
 });
 
 document.addEventListener('keydown', (event) => {
-  // Cmd/Ctrl+Enter copies without reaching for the mouse.
+  // Cmd/Ctrl+Enter copies without reaching for the mouse. A ticked item being
+  // marked up holds it back, as it holds Copy (blocked).
   if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
     event.preventDefault();
     copyReport();
     return;
   }
   // Esc closes the row tooltip first, wherever the pointer and focus are: it
-  // is the nearest thing open. A second Esc reaches an armed mode.
+  // is the nearest thing open. A second Esc reaches the markup, and the one
+  // after that an armed mode.
   if (event.key === 'Escape' && !event.isComposing && !el.tip.hidden) {
     event.preventDefault();
     hideTip();
+    return;
+  }
+  // The markup: a shape half drawn first, then the markup itself, which
+  // closes as Done does, its marks saved if they changed, so that a stray Esc
+  // never loses them.
+  if (event.key === 'Escape' && !event.isComposing && state.markup) {
+    event.preventDefault();
+    escapeMarkup();
     return;
   }
   // Esc cancels an armed mode from here too. Clicking a mode button leaves
@@ -4081,11 +5033,14 @@ const PAGE_KEYS = ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Enter'];
  * text field, where they move the caret, and Enter only from the lit mode
  * button or from nowhere in particular, so that Enter on another button still
  * presses it. Alt with the up or down arrow on a row of the sheet never gets
- * here: it moves the row (see the keydown listener).
+ * here: it moves the row (see the keydown listener). Nor does any key while
+ * a markup is open: the arrows and Enter draw on its canvas (markKey), and
+ * anywhere else in the panel they are the panel's.
  */
 function forwardsKey(event) {
   if (!PAGE_KEYS.includes(event.key) || event.isComposing) return false;
   if (event.metaKey || event.ctrlKey) return false;
+  if (state.markup) return false;
   if (!armedHere()) return false;
   const focused = document.activeElement;
   if (focused && (focused.tagName === 'TEXTAREA' || focused.tagName === 'INPUT')) return false;

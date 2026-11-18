@@ -218,7 +218,10 @@ reading a single file, and breaking them tends to fail silently rather than loud
   deletes the files of the sheet it drops; the reset after a copy must not, because the prompt on
   the clipboard names every file. Before deleting a file or trusting what Chrome says about it,
   hold the download record to the item (`recordFor` in `sidepanel/panel.js`): Chrome hands
-  download ids out again.
+  download ids out again. An item has one file at a time. Marking it up gives it another one,
+  so point the item at the new file and store that, stamped with `fileAt`, before the old file
+  is deleted (`swapFile`), and keep the old one when a prompt still names it. The clean capture
+  kept for marking up lives in the panel's memory only and is never stored (`holdFull`).
 * `shared/prompt-template.js` must render a one item report byte for byte as it did before.
   `npm test` is the check: the goldens in `test/golden/` are that "before", and a deliberate
   change to them belongs in the same commit as the change to the template.

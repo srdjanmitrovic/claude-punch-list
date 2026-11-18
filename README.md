@@ -62,6 +62,8 @@ was collected while you walked. Claude Code opens the images itself.
   its own sentence and its own intent. Add as many as the walkthrough needs. Drag a row, or
   press <kbd>Alt</kbd> (<kbd>Option</kbd> on a Mac) with the up or down arrow, to change the
   order. The numbers follow.
+* **Point at what you mean.** Draw an arrow or an ellipse on a capture before you copy it. The
+  marks go into the saved screenshot, and the prompt says they are yours, not the page's.
 * **Three ways to frame.** Drag a region, click an element, or grab the whole viewport.
   Element captures also bring the node's markup, its computed styles, the React or Vue component
   that rendered it, the handlers bound to it, and a line of search targets, so Claude Code opens
@@ -108,13 +110,47 @@ of the name, so the page toggle keeps it out of the screenshot paths too. **New 
 the frame without touching the sheet, for when you would rather line up the next capture
 against a blank frame than against the last one.
 
+**Marking up a capture.** The pen at the top left of the frame, **Mark up**, opens the capture
+in the frame as large as the panel allows, and Arrow, Ellipse, Undo, Cancel and Done take the
+place of the three capture buttons. Drag to draw: an arrow points from where you pressed to where
+you let go, and an ellipse fills the box you dragged. From the keyboard, the first arrow key or
+<kbd>Enter</kbd> on the screenshot puts a crosshair in its middle, the arrows move it (each step a
+fiftieth of the screenshot, or one pixel with <kbd>Alt</kbd>), <kbd>Enter</kbd> sets the first
+point, the arrows then move the second, and <kbd>Enter</kbd> draws the shape; a screen reader hears
+each step. <kbd>Cmd</kbd><kbd>Z</kbd> (<kbd>Ctrl</kbd><kbd>Z</kbd> elsewhere) takes back the last
+mark, and nothing else while you mark up: a discard waiting to be undone waits on, and in the
+description field the keys undo your typing. <kbd>Esc</kbd> drops a shape you are halfway through,
+and pressed again it closes the markup as Done does. The marks are drawn in one magenta with a
+white edge, whatever the theme, so they show on dark pages and light ones alike.
+
+Done saves a copy with the marks drawn in, next to the capture and named after it with
+`_marked`, as in `2026-11-16_15-19-22_region_marked.png`. Once Chrome has written it, the item
+names the copy, reads MARKED, and the capture without marks is deleted. Picking another row,
+**New item** and a new capture save the marks the same way, so a mark you drew is never left out
+silently; only **Cancel** closes without saving, and the × discards the item with its marks
+unsaved. Mark up again and the marks come back, still editable, over the clean capture; the copy
+saved that time replaces the last one, and if a file by that name is still on disk while it is
+written, Chrome adds ` (1)` to its name. Take every mark back and press Done, and the capture is
+saved again without marks, under its own name, and no longer reads MARKED. Copy waits while a
+ticked item is being marked up and
+while its copy is being saved. If saving fails, or you cancel a "Save as" dialog, the item keeps
+the screenshot it had, and **Mark up** tries the same marks again. Closing the panel while you
+mark up, or before the copy is saved, loses the marks, and the item keeps the screenshot it had.
+
+Only the panel that took a capture can mark it up, while it stays open, because only that panel
+holds the screenshot without marks, in memory. It holds those of its 10 newest captures, about
+100 MB at most. Any other item, one restored when the panel opened, one captured in another
+window, or an older one, shows Mark up dimmed, and pressing it says why. To mark such an item up,
+capture it again.
+
 **From the keyboard.** While Region or Element is armed, the arrow keys and <kbd>Enter</kbd>
 work on the page, and pressed in the panel they go on to the page too, so there is no need to
 click the page after clicking a mode button. In a text field they stay with the field, and
 <kbd>Enter</kbd> goes on only from the lit mode button or with nothing focused, so on any other
 button it still presses that button. On a row of the sheet, <kbd>Alt</kbd> with the up or down
-arrow moves that row instead (see section 2). With Region, the first arrow key puts a box half the size
-of the visible area in its middle. The arrows move it, <kbd>Shift</kbd> with an arrow moves its
+arrow moves that row instead (see section 2). While you mark up a capture they stay in the panel,
+where they draw on the screenshot, even with Region or Element armed. With Region, the first arrow
+key puts a box half the size of the visible area in its middle. The arrows move it, <kbd>Shift</kbd> with an arrow moves its
 right or bottom edge, <kbd>Alt</kbd> makes each step one pixel, and <kbd>Enter</kbd> captures it.
 With Element, the first arrow key highlights the element that has focus on the page, or else one
 you can see, as near the middle of the view as there is one. Up goes to its parent, down goes
@@ -272,7 +308,8 @@ now stands lower on the sheet. The prompt does not say that the order was change
 The ticks decide what goes. Everything is ticked as it is captured, so the usual walkthrough
 is capture, capture, capture, copy. Untick what should wait, or **Clear selection** and tick
 just one, and the button says how many are going. The line under the button says why Copy is
-held back (an item still saving, a screenshot gone from disk, or nothing ticked), and otherwise
+held back (an item still saving, a screenshot gone from disk, an item being marked up, or
+nothing ticked), and otherwise
 shows the keys that copy from anywhere in the panel: <kbd>Cmd</kbd><kbd>Return</kbd> on a Mac,
 <kbd>Ctrl</kbd><kbd>Enter</kbd> elsewhere. A single ticked item is sent as a single report rather
 than a list of one.
@@ -675,14 +712,18 @@ page each item was captured on. If the page was reloaded after an item was captu
 says so, since the log then comes from a later load. If the extension started the log on a tab
 that was already open, the prompt says from when the log was collected, so an empty stretch
 before that does not read as a quiet page. Element payloads belong to the item they were picked
-with and are printed under it.
+with and are printed under it. An item you marked up is sent with its marked copy, and the
+prompt adds a sentence to its screenshot saying the magenta marks were drawn by you to point at
+what it is about and are not part of the page, so Claude Code does not take an arrow for a
+defect.
 
 Each toggle is remembered between sessions, and so is the sheet itself: items, sentences and
 thumbnails come back when the panel reopens. A sheet nobody has touched for a week is dropped the
 next time a panel opens, and the screenshots of its items are deleted with it: nothing was
 copied, so no prompt names them. A panel open in another window keeps the sheet. Screenshots of
 items you copied are never deleted by the extension. Closing the panel while a screenshot is
-still saving cancels that download.
+still saving cancels that download. Closing it while a marked copy is still saving cancels the
+copy, and the item keeps the screenshot it had; the marks are lost with the panel.
 
 Each window has its own panel, and they all show one sheet. Changes made in two windows at the
 same moment are merged item by item: the newer sentence, tick and intent are kept, and a discard
@@ -695,7 +736,9 @@ Nothing leaves your machine. There is no network code in this extension: screens
 your Downloads folder, the sheet itself (thumbnails, sentences, screenshot paths, page URLs,
 and any picked element's markup, component name and prop values) goes to the extension's own
 local storage, which only the extension's own pages can read or write, and text goes to your
-clipboard. The [privacy policy](PRIVACY.md) sets out what
+clipboard. While the panel is open it also keeps the full screenshots of its newest captures in
+its memory, so they can be marked up; they are never stored, and they go when the panel closes.
+The [privacy policy](PRIVACY.md) sets out what
 is read, where it is kept and for how long, in one page of its own.
 
 Local is not the same as harmless, though: the prompt is meant to be pasted, and the sheet sits in

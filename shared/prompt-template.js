@@ -34,6 +34,10 @@
  * @property {'bug'|'change'=} intent  Which voice this item speaks in.
  * @property {string}  description    What the user typed for this item.
  * @property {string=} screenshotPath Absolute path to the saved PNG.
+ * @property {boolean=} marked        The PNG carries arrows or ellipses the
+ *                                    user drew on it, which the prompt says
+ *                                    are not part of the page. Only true
+ *                                    counts.
  * @property {string=} url            Page the item was captured on. Printed as
  *                                    a path while the report stays on one
  *                                    origin, in full once it spans two.
@@ -213,6 +217,34 @@ const MIXED = {
         'change touches that none of the bugs covers, say so rather than fixing it unasked.'
       : ''),
 };
+
+/**
+ * Said of a screenshot the user marked up in the panel, which draws its marks
+ * in one fixed magenta: without it, an arrow or a ring on the page reads as
+ * part of the page, a defect to fix. `one` follows the Screenshot section of
+ * a single report, `each` a list item's Screenshot line.
+ */
+const MARKS = {
+  one:
+    'The magenta marks on it were drawn by the user to point at what this is about, and are not ' +
+    'part of the page.',
+  each:
+    'The magenta marks on this screenshot were drawn by the user to point at what this item is ' +
+    'about, and are not part of the page.',
+};
+
+/**
+ * What is said about an item's screenshot beyond reading it, in this order:
+ * what the image itself is, then the marks on it. Empty for a plain capture,
+ * which prints as it always has.
+ *
+ * @param {'one'|'each'} form  a single report, or an item in a list
+ */
+function screenshotNotes(item, form) {
+  const notes = [];
+  if (item.marked) notes.push(MARKS[form]);
+  return notes;
+}
 
 /**
  * What the closing can refer to: the evidence the screenshot is weighed
@@ -2825,6 +2857,8 @@ function normalized(report) {
       intent: string(item.intent),
       description: string(item.description) ?? '',
       screenshotPath: string(item.screenshotPath),
+      // A claim about the file, so only the value the panel sends counts.
+      marked: item.marked === true ? true : undefined,
       url: address(item.url),
       capturedAt: time(item.capturedAt),
       armedAt: time(item.armedAt),
@@ -2930,7 +2964,8 @@ export function buildPrompt(input) {
     const [item] = items;
     sections.push(`## ${voice.heading}\n${item.description.trim() || '(no description given)'}`);
     if (item.screenshotPath) {
-      sections.push(`## Screenshot\n${item.screenshotPath}\n\n${voice.screenshot}`);
+      const said = [voice.screenshot, ...screenshotNotes(item, 'one')].join(' ');
+      sections.push(`## Screenshot\n${item.screenshotPath}\n\n${said}`);
     }
   } else {
     // Several items read as a list. Each is numbered so the closing line can
@@ -2959,7 +2994,7 @@ export function buildPrompt(input) {
         item.description.trim() || '(no description given)',
       ];
       const facts = [];
-      if (item.screenshotPath) facts.push(`Screenshot: ${item.screenshotPath}`);
+      if (item.screenshotPath) facts.push(`Screenshot: ${item.screenshotPath}`, ...screenshotNotes(item, 'each'));
       if (!samePage && item.url && report.page) facts.push(`Page: ${showUrl(item.url)}`);
       if (facts.length) lines.push('', ...facts);
       if (item.element) {

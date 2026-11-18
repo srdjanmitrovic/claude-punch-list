@@ -596,6 +596,19 @@ test('sheet: stored values that are not what this build writes are not taken on'
     assert.equal(a.R('readItem')(storedItem('odd', { rank })).rank, undefined, String(rank));
   }
   assert.equal(a.R('readItem')(storedItem('moved', { rank: 1_799_999_000_000.5 })).rank, 1_799_999_000_000.5);
+  // Marking up (0.7.0): marks claimed only as true, and a file stamp only as
+  // a moment not yet to come, which would outrank every later file the item
+  // is given.
+  for (const marked of ['yes', 1, 'true', {}, null, false]) {
+    assert.equal(a.R('readItem')(storedItem('odd', { marked })).marked, undefined, String(marked));
+  }
+  assert.equal(a.R('readItem')(storedItem('marked', { marked: true })).marked, true);
+  for (const fileAt of [-5, 0, 'x', null, {}, NaN, Infinity]) {
+    assert.equal(a.R('readItem')(storedItem('odd', { fileAt })).fileAt, undefined, String(fileAt));
+  }
+  const now = a.R('Date').now();
+  assert.equal(a.R('readItem')(storedItem('ahead', { fileAt: now + DAY })).fileAt, now);
+  assert.equal(a.R('readItem')(storedItem('stamped', { fileAt: now - 5 })).fileAt, now - 5);
 });
 
 // SP6. The page toggle could not keep the host out of the prompt.
@@ -2101,4 +2114,479 @@ test('sheet: the newest capture comes into the frame on opening and after a copy
   assert.deepEqual(sentences(a), ['three', 'one']);
   assert.equal(a.internals.state.selectedId, newest.id);
   assert.equal(a.element('description').value, 'three');
+});
+
+// ------------------------------------------------------------- marking up
+
+/** Draw one arrow on the open markup with the keys. */
+function drawArrow(panel) {
+  const canvas = panel.element('markup-canvas');
+  const key = (name) =>
+    canvas.dispatch('keydown', { key: name, isComposing: false, metaKey: false, ctrlKey: false, shiftKey: false, altKey: false });
+  if (!panel.internals.state.markup.cursor) key('Enter');
+  key('Enter');
+  for (let i = 0; i < 5; i += 1) key('ArrowRight');
+  key('Enter');
+}
+
+/** Mark the item in the frame up with one arrow and press Done. */
+async function markAndSave(panel) {
+  panel.click('mark-up');
+  await panel.flush();
+  assert.ok(panel.internals.state.markup, 'the markup did not open');
+  drawArrow(panel);
+  panel.click('mark-done');
+  await panel.flush();
+}
+
+/**
+ * Hold the next download in progress, as a "Save as" dialog holds it, until
+ * finish() writes it where Chrome would have, or fail() ends it as Chrome
+ * reports a cancelled dialog.
+ */
+function holdNextDownload(downloads) {
+  const held = {};
+  downloads.next.push((record) => {
+    held.record = record;
+    held.filename = record.filename;
+    record.state = 'in_progress';
+    record.filename = '';
+  });
+  held.finish = async (...panels) => {
+    held.record.state = 'complete';
+    held.record.filename = held.filename;
+    for (const panel of panels) await panel.clock.advance(200);
+    await settle(...panels);
+  };
+  held.fail = async (panel, error = 'USER_CANCELED') => {
+    held.record.state = 'interrupted';
+    held.record.error = error;
+    await panel.clock.advance(200);
+    await settle(panel);
+  };
+  return held;
+}
+
+test('sheet: Done saves the marked copy beside the capture, points the item at it, and only then deletes the capture', async () => {
+  const { storage, downloads, time, panels: [a] } = await world();
+  await capture(a);
+  const [item] = items(a);
+  const first = { path: item.path, downloadId: item.downloadId };
+  const [plain] = storedItems(storage);
+  assert.ok(!('marked' in plain) && !('fileAt' in plain), 'an item never marked up is stored with keys it did not have');
+  // What the item names at the moment its capture is deleted.
+  const seen = [];
+  const removeFile = downloads.api.removeFile;
+  downloads.api.removeFile = async (id) => {
+    seen.push({ id, path: items(a)[0]?.path });
+    return removeFile(id);
+  };
+  time.now += 5000;
+  await markAndSave(a);
+  await settle(a);
+
+  // Named for the capture's own time and mode, with _marked.
+  const [name, marked] = downloads.calls.download;
+  assert.equal(marked, name.replace(/\.png$/, '_marked.png'));
+  assert.match(marked, /_screen_marked\.png$/);
+  assert.equal(item.path, DIR + marked.split('/').pop());
+  assert.equal(item.downloadId, 2);
+  assert.equal(item.marked, true);
+  assert.deepEqual(seen, [{ id: first.downloadId, path: item.path }], 'the capture went before the item named its marked copy');
+  assert.deepEqual(downloads.calls.erase, [first.downloadId]);
+  const [stored] = storedItems(storage);
+  assert.equal(stored.path, item.path);
+  assert.equal(stored.downloadId, 2);
+  assert.equal(stored.marked, true);
+  assert.equal(stored.fileAt, time.now);
+  assert.equal(storage.data.get('cdrThumbs').items[item.id], item.thumb, 'the marked thumbnail was not stored');
+  assert.equal(a.element('preview-meta').textContent, 'SCREEN · PNG 1280×720 · MARKED');
+  assert.equal(a.element('announce').textContent, 'Item 1 is saved with its marks.');
+  // Chrome's word that the capture is gone is about no item now.
+  for (const listener of downloads.listeners) listener({ id: first.downloadId, exists: { previous: true, current: false } });
+  await settle(a);
+  assert.ok(!item.missing, 'the item was called missing for the file it replaced');
+  assert.equal(a.element('submit').disabled, false);
+});
+
+test('sheet: Copy waits while the marked copy saves, and names it once saved', async () => {
+  const { downloads, panels: [a] } = await world();
+  await capture(a);
+  a.click('mark-up');
+  await a.flush();
+  const note = () => a.element('submit-note');
+  const said = () => note().children.map((node) => node.textContent).join('');
+  assert.equal(a.element('submit').disabled, true);
+  assert.equal(said(), 'Finish marking up item 1 to copy it.');
+  drawArrow(a);
+  const held = holdNextDownload(downloads);
+  a.click('mark-done');
+  await a.flush();
+  assert.equal(a.internals.state.markup, null);
+  assert.equal(a.element('submit').disabled, true, 'Copy could be pressed while the marked copy saved');
+  assert.equal(said(), 'Item 1 is still saving.');
+  assert.equal(a.element('preview-meta').textContent, 'SCREEN · PNG 1280×720 · SAVING');
+  assert.equal(a.element('mark-up').disabled, true, 'Mark up could be pressed while its copy saved');
+  await held.finish(a);
+  assert.equal(a.element('submit').disabled, false);
+  assert.match(said(), /^Or press/);
+  assert.equal(a.element('mark-up').disabled, false);
+});
+
+test('sheet: a marked copy cancelled in the dialog leaves the item its capture, says so, and keeps the marks', async () => {
+  const { downloads, panels: [a] } = await world();
+  await capture(a);
+  const [item] = items(a);
+  const path = item.path;
+  a.click('mark-up');
+  await a.flush();
+  drawArrow(a);
+  const held = holdNextDownload(downloads);
+  a.click('mark-done');
+  await a.flush();
+  await held.fail(a);
+  assert.equal(item.path, path);
+  assert.equal(item.downloadId, 1);
+  assert.equal(item.marked, undefined);
+  assert.deepEqual(downloads.calls.removeFile, []);
+  assert.equal(
+    a.banner(),
+    'The marked screenshot was not saved: Download failed: USER_CANCELED. Item 1 keeps the screenshot it had. ' +
+      'Press Mark up to try the same marks again.'
+  );
+  assert.equal(a.element('submit').disabled, false);
+  a.click('mark-up');
+  await a.flush();
+  assert.equal(a.internals.state.markup.marks.length, 1, 'the marks were lost with the save');
+  // The mark taken back, the marks are the ones last saved (none), and Done
+  // saves nothing; the mark taken back stays taken back.
+  a.click('mark-undo');
+  a.click('mark-done');
+  await settle(a);
+  assert.equal(a.internals.state.markup, null);
+  assert.equal(downloads.calls.download.length, 2, 'Done saved marks that had not changed');
+  a.click('mark-up');
+  await a.flush();
+  assert.equal(a.internals.state.markup.marks.length, 0, 'a mark taken back came back');
+  drawArrow(a);
+  a.click('mark-done');
+  await settle(a);
+  assert.equal(item.marked, true);
+  assert.deepEqual(downloads.calls.removeFile, [1]);
+});
+
+test('sheet: a capture marked up again with every mark taken back is saved under its own name, unmarked', async () => {
+  const { storage, downloads, panels: [a] } = await world();
+  await capture(a);
+  const [item] = items(a);
+  await markAndSave(a);
+  await settle(a);
+  assert.match(item.path, /_screen_marked\.png$/);
+  a.click('mark-up');
+  await a.flush();
+  assert.equal(a.internals.state.markup.marks.length, 1);
+  a.click('mark-undo');
+  a.click('mark-done');
+  await settle(a);
+  const [first, , again] = downloads.calls.download;
+  assert.equal(again, first, 'a copy with no marks was not named as the capture is');
+  assert.doesNotMatch(item.path, /_marked/);
+  assert.equal(item.downloadId, 3);
+  assert.equal(item.marked, undefined);
+  const [stored] = storedItems(storage);
+  assert.equal(stored.path, item.path);
+  assert.ok(!('marked' in stored), 'an item with no marks left is stored as marked');
+  assert.deepEqual(downloads.calls.removeFile, [1, 2], 'the marked copy it replaced was kept');
+  assert.equal(a.element('preview-meta').textContent, 'SCREEN · PNG 1280×720');
+  assert.equal(a.element('announce').textContent, 'Item 1 is saved without marks.');
+});
+
+test('sheet: a discard that lapses lets the full screenshot go', async () => {
+  const { panels: [a] } = await world();
+  await capture(a);
+  const [item] = items(a);
+  assert.ok(item.full);
+  a.click('preview-clear');
+  // Undo can still bring it back, marked up or not.
+  assert.ok(item.full, 'the full screenshot went before the discard was final');
+  await a.clock.advance(UNDO_MS + 100);
+  await settle(a);
+  assert.equal(a.internals.state.trash, null);
+  assert.equal(item.full, null, 'the full screenshot of a discarded item was kept');
+  assert.deepEqual(Array.from(a.internals.state.fulls), []);
+});
+
+test('sheet: a capture whose first save fails lets its full screenshot go, discarded meanwhile or not', async () => {
+  for (const discarded of [false, true]) {
+    const { downloads, panels: [a] } = await world();
+    const held = holdNextDownload(downloads);
+    await capture(a);
+    const [item] = items(a);
+    assert.ok(item.full, `discarded ${discarded}`);
+    if (discarded) a.click('preview-clear');
+    await held.fail(a);
+    assert.equal(items(a).length, 0);
+    assert.equal(a.internals.state.trash, null);
+    assert.equal(item.full, null, `discarded ${discarded}: the full screenshot of a capture never saved was kept`);
+    assert.deepEqual(Array.from(a.internals.state.fulls), []);
+  }
+});
+
+test('sheet: an item discarded while its marked copy saves comes back marked, or takes both files when the undo lapses', async () => {
+  for (const undo of [true, false]) {
+    const { downloads, panels: [a] } = await world();
+    await capture(a);
+    const [item] = items(a);
+    const held = holdNextDownload(downloads);
+    await markAndSave(a);
+    a.click('preview-clear');
+    assert.equal(items(a).length, 0);
+    await held.finish(a);
+    // The capture goes as soon as the marked copy is the item's.
+    assert.deepEqual(downloads.calls.removeFile, [1], `undo ${undo}`);
+    assert.equal(item.downloadId, 2);
+    if (undo) {
+      a.element('undo').children[1].dispatch('click');
+      await settle(a);
+      assert.equal(items(a)[0], item);
+      assert.equal(item.marked, true);
+      assert.match(item.path, /_marked\.png$/);
+      await a.clock.advance(UNDO_MS + 100);
+      assert.deepEqual(downloads.calls.removeFile, [1]);
+    } else {
+      await a.clock.advance(UNDO_MS + 100);
+      await settle(a);
+      assert.deepEqual(downloads.calls.removeFile, [1, 2]);
+      assert.deepEqual(downloads.calls.erase, [1, 2]);
+    }
+  }
+});
+
+test('sheet: another window takes the marked copy over, and its own writes do not bring the capture back', async () => {
+  const { storage, time, panels: [a, b] } = await world({ panels: 2 });
+  await capture(a);
+  await settle(a, b);
+  const [theirs] = items(b);
+  // B has asked Chrome about the capture's id, and knows it for the item's.
+  await b.R('checkFiles')();
+  assert.equal(theirs.verified, true);
+  time.now += 1000;
+  await markAndSave(a);
+  await settle(a, b);
+  const [mine] = items(a);
+  assert.equal(theirs.path, mine.path);
+  assert.equal(theirs.downloadId, 2);
+  assert.equal(theirs.verified, false, 'B took the new id on trust');
+  assert.equal(theirs.marked, true);
+  assert.equal(theirs.fileAt, mine.fileAt);
+  assert.equal(b.element('preview-meta').textContent, 'SCREEN · PNG 1280×720 · MARKED');
+  assert.equal(theirs.thumb, mine.thumb);
+  // Window B cannot mark it up: it never held the capture.
+  assert.equal(b.element('mark-up').getAttribute('aria-disabled'), 'true');
+  time.now += 1000;
+  type(b, 'typed in B');
+  await settle(a, b);
+  assert.equal(storedItems(storage)[0].path, mine.path, 'B wrote the capture back');
+  assert.equal(storedItems(storage)[0].marked, true);
+  assert.equal(mine.path, storedItems(storage)[0].path);
+  assert.equal(mine.description, 'typed in B');
+});
+
+test('sheet: an item from before this panel opened says why it cannot be marked up', async () => {
+  const { panels: [a] } = await world({
+    seed: ({ storage, time }) => {
+      storage.data.set('cdrReport', { items: [storedItem('earlier')], updatedAt: time.now, writer: 'x' });
+    },
+  });
+  const button = a.element('mark-up');
+  assert.equal(button.hidden, false);
+  assert.equal(button.getAttribute('aria-disabled'), 'true');
+  assert.equal(button.disabled, false, 'the reason cannot be reached with the button disabled');
+  a.click('mark-up');
+  await a.flush();
+  assert.equal(a.internals.state.markup, null);
+  assert.equal(
+    a.banner(),
+    'Item 1 cannot be marked up: a panel keeps the full screenshot only of the captures it took, and only while it ' +
+      'stays open. Capture it again to mark it up.'
+  );
+  assert.equal(a.R('markupBlocked')(items(a)[0]), a.banner());
+});
+
+test('sheet: a panel closed while a marked copy saves takes that download back and keeps the capture', async () => {
+  const { downloads, panels: [a] } = await world();
+  await capture(a);
+  const held = holdNextDownload(downloads);
+  await markAndSave(a);
+  assert.ok(held.record, 'the marked copy was not started');
+  a.R('flushOnClose')();
+  assert.deepEqual(downloads.calls.cancel, [2]);
+  assert.ok(!downloads.calls.removeFile.includes(1), 'the capture the stored item names was deleted');
+});
+
+test('sheet: a panel closed while a discarded item\'s marked copy saves takes back both', async () => {
+  const { downloads, panels: [a] } = await world();
+  await capture(a);
+  const held = holdNextDownload(downloads);
+  await markAndSave(a);
+  assert.ok(held.record);
+  a.click('preview-clear');
+  a.R('flushOnClose')();
+  assert.ok(downloads.calls.cancel.includes(2), 'the marked copy was left running');
+  assert.ok(downloads.calls.removeFile.includes(1), 'the discarded capture was left');
+});
+
+test('sheet: an item marked up after a blocked copy keeps the capture the copied prompt names', async () => {
+  const { downloads, panels: [a] } = await world();
+  a.R('document').execCommand = () => false;
+  await capture(a);
+  a.click('submit');
+  await a.clock.advance(500);
+  await settle(a);
+  assert.match(a.element('result-text').textContent, /blocked/);
+  const named = items(a)[0].path;
+  assert.ok(a.internals.state.lastPrompt !== undefined);
+  await markAndSave(a);
+  await settle(a);
+  assert.notEqual(items(a)[0].path, named);
+  assert.deepEqual(downloads.calls.removeFile, [], 'the file the hand copied prompt names was deleted');
+});
+
+test('sheet: an item copied in another window while its marked copy saves keeps its capture, and the copy goes', async () => {
+  const { storage, downloads, time, panels: [a, b] } = await world({ panels: 2 });
+  await capture(a);
+  await settle(a, b);
+  const [item] = items(a);
+  const held = holdNextDownload(downloads);
+  await markAndSave(a);
+  time.now += 1000;
+  b.click('submit');
+  await b.clock.advance(500);
+  await settle(a, b);
+  assert.equal(items(a).length, 0, 'the copy elsewhere did not take the item off this sheet');
+  assert.equal(item.full, null, 'the full screenshot of an item gone elsewhere was kept');
+  assert.deepEqual(Array.from(a.internals.state.fulls), []);
+  await held.finish(a);
+  assert.deepEqual(downloads.calls.removeFile, [2], 'the file the copied prompt names was deleted, or the copy kept');
+  assert.equal(storedItems(storage).length, 0);
+});
+
+test('sheet: the panel keeps the full screenshots of its newest captures only, and says so of the others', async () => {
+  const big = 40 * 1024 * 1024;
+  const { time, panels: [a] } = await world({
+    fetches: [async (url) => ({ blob: async () => ({ type: 'image/png', size: a?.big ? big : 4, source: url }) })],
+  });
+  for (let i = 0; i < 11; i += 1) {
+    time.now += 1000;
+    await capture(a);
+  }
+  const held = () => items(a).map((item) => Boolean(item.full));
+  assert.deepEqual(held(), [false, ...Array(10).fill(true)]);
+  pickRow(a, 0);
+  assert.equal(a.element('mark-up').getAttribute('aria-disabled'), 'true');
+  a.click('mark-up');
+  await a.flush();
+  assert.equal(
+    a.banner(),
+    'Item 1 can no longer be marked up: the panel keeps the full screenshots of its 10 newest captures only, ' +
+      'about 100 MB at most. Capture it again to mark it up.'
+  );
+  pickRow(a, 10);
+  assert.equal(a.element('mark-up').getAttribute('aria-disabled'), null);
+  // Large captures: about 100 MB holds two of 40 MB, and the oldest go first
+  // to make room for the third, small ones too.
+  a.big = true;
+  for (let i = 0; i < 2; i += 1) {
+    time.now += 1000;
+    await capture(a);
+  }
+  const sizes = () => items(a).filter((item) => item.full).map((item) => item.full.size);
+  assert.deepEqual(sizes(), [4, 4, 4, 4, 4, 4, 4, 4, big, big]);
+  time.now += 1000;
+  await capture(a);
+  assert.deepEqual(sizes(), [big, big]);
+  assert.equal(items(a).at(-1).full.size, big, 'the newest capture was let go');
+});
+
+test('sheet: a copied item lets its full screenshot go', async () => {
+  const { panels: [a] } = await world();
+  await capture(a);
+  const [item] = items(a);
+  assert.ok(item.full);
+  a.click('submit');
+  await a.clock.advance(500);
+  await settle(a);
+  assert.equal(items(a).length, 0);
+  assert.equal(item.full, null);
+  assert.deepEqual(Array.from(a.internals.state.fulls), []);
+});
+
+test('sheet: a copy of other items leaves the markup open on its item, though a newer one is left', async () => {
+  const { time, panels: [a] } = await world();
+  await captures(a, time);
+  tickRow(a, 0, false);
+  tickRow(a, 2, false);
+  pickRow(a, 0);
+  a.click('mark-up');
+  await a.flush();
+  const markup = a.internals.state.markup;
+  assert.ok(markup);
+  drawArrow(a);
+  a.click('submit');
+  await a.clock.advance(500);
+  await settle(a);
+  assert.deepEqual(sentences(a), ['one', 'three']);
+  assert.equal(a.internals.state.markup, markup, 'the copy closed the markup');
+  assert.equal(a.internals.state.selectedId, items(a)[0].id);
+  assert.equal(markup.marks.length, 1);
+});
+
+test('sheet: a write from a window closed before it heard of the marked copy does not leave the capture stored', async () => {
+  // Window B stops hearing storage once it is closed.
+  const closed = { b: false };
+  const deaf = (chrome) => {
+    const api = chrome.storage;
+    chrome.storage = {
+      ...api,
+      onChanged: { addListener: (fn) => api.onChanged.addListener((...args) => closed.b || fn(...args)) },
+    };
+  };
+  const { storage, downloads, time, panels: [a, b] } = await world({ panels: 2, setups: [undefined, deaf] });
+  await capture(a);
+  await settle(a, b);
+  time.now += 1000;
+  storage.hold();
+  await markAndSave(a);
+  await a.flush();
+  const marked = items(a)[0].path;
+  assert.match(marked, /_marked\.png$/);
+  // B types before it has heard of the swap, writes the capture's path, and
+  // its window is closed.
+  time.now += 1000;
+  type(b, 'typed in B');
+  await b.flush();
+  closed.b = true;
+  assert.notEqual(storedItems(storage)[0].path, marked, 'the writes did not cross');
+  storage.release();
+  await settle(a, b);
+  assert.equal(storedItems(storage)[0].path, marked, 'the deleted capture stayed in storage');
+  assert.equal(storedItems(storage)[0].marked, true);
+  assert.equal(storedItems(storage)[0].description, 'typed in B');
+  assert.deepEqual(downloads.calls.removeFile, [1]);
+});
+
+test('sheet: an item whose file went missing is whole again once marked up, and the banner about it goes', async () => {
+  const { panels: [a] } = await world();
+  await capture(a);
+  const [item] = items(a);
+  a.R('markMissing')(item);
+  assert.match(a.banner(), /no longer on disk/);
+  assert.equal(a.element('submit').disabled, true);
+  await markAndSave(a);
+  await settle(a);
+  assert.equal(item.missing, false);
+  assert.equal(item.marked, true);
+  assert.equal(a.banner(), null, 'the banner about the missing file stayed');
+  assert.equal(a.element('item-missing').hidden, true);
+  assert.equal(a.element('submit').disabled, false);
 });

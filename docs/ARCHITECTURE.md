@@ -12,7 +12,8 @@ Toolbar icon or Alt+Shift+C
 sidepanel/panel.js ......... orchestrates everything. Captures the tab, crops
    |                         with a canvas, saves each capture via
    |                         chrome.downloads as it happens, keeps the list of
-   |                         items, builds and copies the prompt.
+   |                         items, lets the user mark a capture up, builds
+   |                         and copies the prompt.
    |
    +-- background.js ....... service worker. Side panel behaviour, the keyboard
    |                         command, injecting the capture scripts, starting
@@ -466,9 +467,13 @@ copied either, so its files go the same way. The reset after a successful copy m
 opposite and leave every file alone, because the prompt on the clipboard names each one by path
 and Claude Code is about to open them.
 
-It also means the panel never has to keep a full image. Each item holds a WebP thumbnail no
+It also means nothing stored ever holds a full image. Each item holds a WebP thumbnail no
 wider than the frame can display, and the original data URL is released once the download
-has started. That is what makes the report safe to persist: `cdrReport` in
+has started. The one full image kept is the clean capture as a `Blob`, in the memory of the
+panel that took it, so that it can be marked up (see
+[Marking up a capture](#marking-up-a-capture)): for that panel's 10 newest captures, about
+100 MB together at most, never written to storage and gone when the panel closes. That is what
+makes the report safe to persist: `cdrReport` in
 `chrome.storage.local` holds every item minus its pixels and is rewritten on every keystroke,
 and `cdrThumbs` holds the thumbnails and is rewritten only when an item is added or removed.
 An item is only written once it has a path, so a panel closed mid-save cannot come back
@@ -1292,13 +1297,76 @@ stays disabled until no item is in that state. If the save fails the item is rem
 rather than kept without a path: nothing reached the disk, and an item with no screenshot
 would be a sentence about nothing. The banner says to capture it again.
 
+## Marking up a capture
+
+**Mark up** draws arrows and ellipses on the capture in the frame and saves them as a copy that
+takes the item's file over. It is offered only by the panel that took the capture, and only while
+it stays open, because only that panel holds the capture without marks: the `Blob` the save was
+given, kept on the item as `item.full` (`holdFull`). A `Blob` lives in Chrome's blob store rather
+than on the page's heap, and Chrome may page a large one out to a temporary file in the profile.
+The panel keeps those of its 10 newest captures, about 100 MB together at most, letting the oldest
+go first (`trimFulls`), never the newest and never the one being marked up, and lets one go as soon
+as its item is copied, its discard is final, its first save fails, or it leaves the sheet in another
+window. Whether an
+item can be marked up is decided in one place, `markupBlocked`, which returns the reason it cannot
+or null. An item that cannot still shows the button, dimmed with `aria-disabled` rather than
+disabled, so that a press can say why: it came from storage, from another window, or was let go
+to keep within the bound. Mark up also waits while a copy or a capture runs, while the item's
+previous marked copy is being saved, and while its own capture is being decoded.
+
+Opening decodes `item.full` with `createImageBitmap` and puts a canvas in the image's place, sized
+to show the whole capture as large as the frame's width and 70% of the panel's height allow, with
+as many canvas pixels as the screen has under it, and sized and drawn again when the panel is
+resized. The canvas draws in the capture's own pixels through a transform. The marking tools take the place of the capture buttons, which are hidden and
+disabled meanwhile, also against a tab event (`applyModesDisabled`). `renderFrame` runs on every
+move and every adopted write, and leaves an open markup alone: only the readout and the buttons
+follow the item. Each mark is a record of a tool and two points as shares of the capture's width
+and height, and `drawMarks` is the only code that draws one, on the canvas through its transform
+and on the saved copy at full size, so what is seen while marking is what is saved. The marks are
+one fixed magenta over a white edge, whatever the theme, because the prompt names that colour; the
+stroke is a 200th of the capture's longer side and never under 4 pixels.
+
+A drag draws: the canvas takes pointer capture, so a drag that leaves it ends on its edge, and a
+shape shorter than 4 CSS pixels is not drawn. From the keyboard, on the model Region teaches, the
+first arrow key or Enter shows a crosshair in the middle, the arrows move it by a fiftieth of the
+capture (with Alt, one CSS pixel of the canvas as shown), Enter fixes the first point, and Enter again draws the shape;
+each step is announced. Cmd or Ctrl+Z takes back the last mark and nothing else: one listener
+handles both undos, and while a markup is open a discard waiting to be undone is left alone, and in
+the description field the key is the text's own. Esc closes the row tooltip first, then drops a
+shape half drawn, then closes the markup, and only after that reaches an armed mode. `forwardsKey`
+hands no key to the page while marking. Closing the markup by Esc, Done, another row, + New item or
+a capture arriving saves marks that changed (`commitMarks`), so a stray key never loses them; only
+Cancel closes without saving, and a discard takes the item with its marks unsaved. A ticked item
+being marked up holds Copy back, and so does Cmd or Ctrl+Enter, through `blocked`.
+
+**Saving the marked copy.** Done draws the capture and the marks on a canvas of the capture's own
+size, and `canvas.toBlob` hands the PNG to `saveScreenshot` as a `Blob`, with no data URL in
+between. It is named for the capture's own time and mode with `_marked`, so it sits beside the
+capture it replaces; with every mark taken back it is the clean capture again, takes the capture's
+own name without `_marked`, and leaves the item no longer `marked`. Done with the marks as they
+were last saved saves nothing, and drops marks kept from a failed save that were taken back since.
+Meanwhile the item says SAVING and Copy waits for it, as for a first save. When
+Chrome has the path, `swapFile` points the item at the copy, stamps it with `fileAt`, stores it with
+its thumbnail, and only then deletes the file it replaced. In the other order the old file's
+removal reaches `downloads.onChanged` while the item still names it, and marks it missing. The old
+file stays when the prompt being copied by hand names it (`state.handCopy`). An item discarded
+while its copy saves is swapped where it waits in the discard, so Undo brings it back marked and a
+lapse deletes both files once each. An item that has left for good meanwhile, copied here or in
+another window or its discard settled, keeps the file it had, which a prompt may name, and the copy
+nothing names is deleted. A save that fails, or is cancelled in a "Save as" dialog, changes
+nothing on the item, says so, and keeps the marks for the next Done. On `pagehide` a marked copy
+still saving is taken back like any save in flight, and the stored item keeps the file it had.
+
 ## The sheet in storage
 
 **Keys.** `cdrReport` holds `{ items, removed, updatedAt, writer }`. Each stored item keeps `id`,
 `mode`, `width`, `height`, `url`, `title`, `intent`, `description`, `included`, `element`,
 `capturedAt`, `armedAt`, `rank` (only once it has been moved, see Order below), `editedAt`,
-`wordsAt`, `path` and `downloadId` (`storedForm` in `sidepanel/panel.js`); its tab, its thumbnail
-and whether its file is missing are not stored.
+`wordsAt`, `path` and `downloadId`, and once it has been marked up, `marked` (only as `true`) and
+`fileAt` (`storedForm` in `sidepanel/panel.js`); its tab, its thumbnail, whether its file is
+missing, its clean capture and its marks are not stored. A version without `marked` and `fileAt`
+drops them on its next write: the item goes on naming its marked file and loses its MARKED label
+and the prompt's sentence about the marks.
 `cdrThumbs` holds `{ items, writer }`, the thumbnails by id. `cdrIntent` and `cdrInclude` are
 keys of their own, each written only when that setting changes, and every panel adopts both.
 
@@ -1309,7 +1377,8 @@ items and 50 000 characters per description, paths without control characters or
 (the prompt prints each on a line of its own), an unknown mode shown as `other`, element data only
 for element items, stamps capped at the current time, a rank only as a finite number no further
 than 2^52 from zero (past 2^53 adding one changes nothing, and a capture could no longer land
-after it), and thumbnails only as base64 WebP, PNG or JPEG data URLs, since anything else in an
+after it), `marked` only as `true`, and thumbnails only as base64 WebP, PNG or JPEG data URLs,
+since anything else in an
 `img` would be a request to the network. Content scripts can write an extension's local storage
 unless it says otherwise, so the worker restricts `chrome.storage.local` to trusted contexts at
 every start.
@@ -1317,13 +1386,37 @@ every start.
 **Merging.** Every panel merges another panel's write into its own sheet item by item, instead of
 replacing the sheet. Each item carries two stamps: `wordsAt` for the description, and `editedAt`
 for the intent, the tick and the place on the sheet. Each field keeps whichever copy was changed
-last, and a side holding something newer writes it back. Which window has focus decides nothing.
+last, and a side holding something newer writes it back. An item marked up carries a third,
+`fileAt`, for its file: `path`, `downloadId` and `marked` go together to the side that marked it
+up last, whose panel has deleted the file before, so a write that crossed the swap cannot store
+the deleted path again. A file taken over this way is checked afresh, as any file this session has
+not asked about. Which window has focus decides nothing.
 When an item leaves the sheet through a discard or a copy, its id and time go into `removed`,
 kept for ten minutes and capped at 200 entries, so a write that crossed the removal cannot bring
 the item back. An edit made after the removal, an undo included, does bring it back. A removal of
 the whole report (another panel's weekly expiry) is ignored by a panel that is still showing it.
 A change that keeps the sheet's shape updates rows in place, with no storage read, list rebuild
 or page read.
+
+The marked copy has two cross window races of the same shape as two writes crossing, and neither
+is closed. Whether an item's marked copy is still saving is not stored, so another window does not
+hold Copy back for it. When window B copies the item in the milliseconds between window A's copy
+reaching the disk and A hearing of B's copy, A has not yet seen the removal, swaps, and deletes the
+capture that the prompt on B's clipboard names. Once A has heard of the removal it keeps that file
+and deletes its copy instead.
+
+The other is a discard in B in the same gap, after A has swapped but before B has heard of the
+swap. B's discard holds the item as B knew it, naming the capture and its download id, and A,
+hearing of the removal, leaves the files to that discard, as it leaves any discard made in another
+window. When B's undo lapses, B asks to delete the capture, which A has already deleted and erased
+from Chrome's list, so `recordFor` finds no record naming it and refuses. Nothing deletes the
+marked copy, which stays on disk with no item naming it. If B's undo is pressed instead, the item
+comes back in every window naming the capture A deleted, without its marks, and it cannot be
+marked up again, since A let its clean capture go with the removal.
+
+In both, the window is the storage delivery gap, which in Chrome was not measured. Holding the
+delete back until a round trip through storage, or storing that a save is under way, would close
+them, though an undo in B would still bring the item back without its marks.
 
 **Order.** Every panel sorts the sheet the same way (`bySheetOrder`), at every open and on every
 write it adopts: by each item's place, which is its `rank` once it has been moved and its
@@ -1382,9 +1475,11 @@ the field after a discard that leaves an item, and the field has nothing of its 
 since a value set by script is not on its undo stack. An undo puts an item back at the index it
 left and then sorts the sheet, so when rows were moved in the meantime it goes where its own place
 puts it, as every other panel and the next open put it. Cmd or Ctrl+Z undoes a discard and nothing
-else: a move is undone by moving the row back. When the time is up, the files are deleted with
+else: a move is undone by moving the row back, and while a markup is open the key takes back the
+last mark instead, and the discard waits on. When the time is up, the files are deleted with
 `downloads.removeFile` and their history entries with `downloads.erase`. On `pagehide` the
-panel settles the pending discard and takes back any save still in flight by sending `cancel`,
+panel settles the pending discard and takes back any save still in flight, a marked copy included,
+by sending `cancel`,
 `removeFile` and `erase` without waiting for them; Chrome completes those calls after the page has
 gone.
 
@@ -1500,7 +1595,8 @@ screen is the actual code; only the platform is faked. What it does not reproduc
 * **Downloads.** They complete instantly unless `?save=<ms>` slows them, and there is no "Save as"
   dialog to take focus away. No file is written: the path is made up, and
   `conflictAction: 'uniquify'` is ignored, so two captures in the same second get the same path
-  where Chrome would add ` (1)` to the second. Nothing removes a file behind the panel's back
+  where Chrome would add ` (1)` to the second, and so does a capture marked up twice, whose second
+  marked copy is written while the first is still there. Nothing removes a file behind the panel's back
   unless a driver says so through `__shim.downloadChanged`. Download ids and records live on the
   stage, beside storage, so they survive the panel frame reloading, as Chrome's download history
   survives the side panel closing, and start again when the stage itself reloads.

@@ -1089,6 +1089,30 @@ test('prompt: a log the panel started late says when it began', () => {
   assert.ok(!buildPrompt({ ...report, startedLate: 'yes' }).includes('collected only from'));
 });
 
+// Marking up (0.7.0). The sentence about the marks is said only of an item
+// whose file the panel says carries them, as the value true: anything else,
+// such as a string from a forged or older stored item, prints the screenshot
+// as it always printed. And never of an item with no screenshot to carry them.
+test('prompt: only an item marked as exactly true says its marks are the user\'s', () => {
+  const plainOne = buildPrompt(sampleReport('bug'));
+  const plainList = buildPrompt(sampleReport('mixed'));
+  for (const marked of ['yes', 1, {}, [], 'true', false, null]) {
+    const one = sampleReport('bug');
+    one.items[0].marked = marked;
+    assert.equal(buildPrompt(one), plainOne, `marked: ${JSON.stringify(marked)} changed a single report`);
+    const list = sampleReport('mixed');
+    list.items[1].marked = marked;
+    assert.equal(buildPrompt(list), plainList, `marked: ${JSON.stringify(marked)} changed a list`);
+  }
+  const unsaved = sampleReport('mixed');
+  delete unsaved.items[1].screenshotPath;
+  unsaved.items[1].marked = true;
+  assert.ok(!buildPrompt(unsaved).includes('magenta'), 'marks said of an item with no screenshot');
+  const one = sampleReport('bug');
+  one.items[0].marked = true;
+  assert.equal(buildPrompt(one).match(/magenta/g).length, 1);
+});
+
 // V5: an item captured before a late start recorded no load (the panel
 // leaves item.armedAt unset when the collector came after the capture), and
 // was cautioned as captured before a reload that never happened.

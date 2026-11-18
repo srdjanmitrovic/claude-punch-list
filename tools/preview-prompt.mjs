@@ -560,6 +560,25 @@ EXTRA.reordered = () => {
   return report;
 };
 
+// A capture marked up in the panel before the copy: its file is the copy with
+// the marks drawn on, saved beside the clean one under the same name with
+// `_marked`, and the prompt says whose the marks are.
+EXTRA.marked = () => {
+  const report = sampleReport('bug');
+  report.items[0].screenshotPath = report.items[0].screenshotPath.replace(/\.png$/, '_marked.png');
+  report.items[0].marked = true;
+  return report;
+};
+
+// The walkthrough with only item 2 marked up: the sentence is that item's
+// alone.
+EXTRA['list-marked'] = () => {
+  const report = sampleReport('mixed');
+  report.items[1].screenshotPath = report.items[1].screenshotPath.replace(/\.png$/, '_marked.png');
+  report.items[1].marked = true;
+  return report;
+};
+
 // The page toggle off, one capture on /checkout, the log read on /cart.
 EXTRA['page-off-elsewhere'] = () => {
   const report = sampleReport('bug');

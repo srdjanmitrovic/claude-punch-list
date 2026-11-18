@@ -6,7 +6,10 @@
  * their classes, text, flags and listeners, and build a tree only as deep as
  * the sheet needs. Nothing is laid out or painted, so what a test here proves
  * is the panel's bookkeeping (which mode is lit, what the banner says, what is
- * sent to the worker and when), not how any of it looks.
+ * sent to the worker and when), not how any of it looks. A canvas records
+ * what is drawn on it instead (recordingContext), images and bitmaps decode
+ * to the size a test sets for their source (imageSizes), and an element can
+ * hold pointer capture, so the drawing code can be followed call by call.
  *
  * The worker is a function the test supplies, which answers each message the
  * panel sends or holds the answer back. Time is a fake clock the test moves.
@@ -38,6 +41,64 @@ class FakeClassList {
     else this.names.delete(name);
     return on;
   }
+}
+
+/** What a 2D context can be asked to do, each recorded with its arguments. */
+const CONTEXT_METHODS = [
+  'drawImage',
+  'setTransform',
+  'resetTransform',
+  'transform',
+  'scale',
+  'translate',
+  'rotate',
+  'save',
+  'restore',
+  'beginPath',
+  'closePath',
+  'moveTo',
+  'lineTo',
+  'quadraticCurveTo',
+  'bezierCurveTo',
+  'arc',
+  'arcTo',
+  'ellipse',
+  'rect',
+  'stroke',
+  'fill',
+  'clearRect',
+  'fillRect',
+  'strokeRect',
+  'setLineDash',
+  'fillText',
+  'strokeText',
+];
+
+/**
+ * A 2D context that draws nothing and records everything: each call as
+ * { op, args } and each property set as { set, value }, in order, in
+ * `calls`. The property keeps the value set, as a real context does.
+ */
+function recordingContext(canvas) {
+  const calls = [];
+  const target = { canvas, calls };
+  for (const name of CONTEXT_METHODS) {
+    target[name] = (...args) => {
+      calls.push({ op: name, args });
+    };
+  }
+  target.measureText = (text) => {
+    calls.push({ op: 'measureText', args: [text] });
+    return { width: String(text).length * 6 };
+  };
+  target.getLineDash = () => [];
+  return new Proxy(target, {
+    set(object, name, value) {
+      calls.push({ set: name, value });
+      object[name] = value;
+      return true;
+    },
+  });
 }
 
 class FakeElement {
@@ -127,26 +188,78 @@ class FakeElement {
   getBoundingClientRect() {
     return { left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0 };
   }
+  /** One recording context per canvas, as a real canvas hands back one context. */
   getContext() {
-    return { drawImage() {} };
+    this.context ??= recordingContext(this);
+    return this.context;
   }
   toDataURL(type = 'image/png') {
     return `data:${type};base64,AAAA`;
   }
+  /**
+   * A PNG of the canvas, as a stand-in Blob that says which canvas made it,
+   * handed over a task later, as Chrome encodes off the caller's turn. Each
+   * one is kept in `blobs`. A test that wants the encoder to fail replaces
+   * this on the prototype and hands over null.
+   */
+  toBlob(callback, type = 'image/png') {
+    const blob = { type, size: Math.max(4, (this.width || 0) * (this.height || 0)), canvas: this };
+    (this.blobs ??= []).push(blob);
+    setImmediate(() => callback(blob));
+  }
+  /** Pointer capture, as far as a test can see it: which pointers this element holds. */
+  setPointerCapture(pointerId) {
+    (this.captured ??= new Set()).add(pointerId);
+  }
+  releasePointerCapture(pointerId) {
+    this.captured?.delete(pointerId);
+  }
+  hasPointerCapture(pointerId) {
+    return Boolean(this.captured?.has(pointerId));
+  }
 }
 
-class FakeImage {
-  constructor() {
-    this.naturalWidth = 1280;
-    this.naturalHeight = 720;
+const DEFAULT_IMAGE = { width: 1280, height: 720 };
+
+/**
+ * The size an image or bitmap made from `source` decodes to: what the test
+ * set for that source in `sizes`, or for the data URL a stand-in Blob was
+ * made from; a canvas's own size; else 1280×720. A size of { error: true }
+ * fails to decode.
+ */
+function sizeIn(sizes, source) {
+  if (sizes.has(source)) return sizes.get(source);
+  if (source && typeof source === 'object') {
+    if (sizes.has(source.source)) return sizes.get(source.source);
+    if (source instanceof FakeElement) return { width: source.width || 0, height: source.height || 0 };
   }
-  set src(value) {
-    this.source = value;
-    setImmediate(() => this.onload?.());
-  }
-  get src() {
-    return this.source;
-  }
+  return DEFAULT_IMAGE;
+}
+
+/** An Image whose natural size, once loaded, is the one `sizes` gives its src. */
+function imageClass(sizes) {
+  return class FakeImage {
+    constructor() {
+      this.naturalWidth = DEFAULT_IMAGE.width;
+      this.naturalHeight = DEFAULT_IMAGE.height;
+    }
+    set src(value) {
+      this.source = value;
+      const size = sizeIn(sizes, value);
+      setImmediate(() => {
+        if (size.error) {
+          this.onerror?.();
+          return;
+        }
+        this.naturalWidth = size.width;
+        this.naturalHeight = size.height;
+        this.onload?.();
+      });
+    }
+    get src() {
+      return this.source;
+    }
+  };
 }
 
 /**
@@ -189,29 +302,40 @@ export function defaultWorker(message) {
 }
 
 /**
- * @param {{ worker?: (message: object) => any, tab?: object, setup?: (chrome: object) => void, globals?: object }} options
+ * @param {{ worker?: (message: object) => any, tab?: object, setup?: (chrome: object) => void, globals?: object, scripting?: (details: object) => any }} options
  *   worker answers each runtime.sendMessage: a value, a promise of one, or a
  *   throw for a worker that did not answer. setup can change the chrome fake
  *   before the panel loads. globals are more names in the panel's global
- *   scope from its first line, such as a navigator.
+ *   scope from its first line, such as a navigator. scripting answers each
+ *   chrome.scripting.executeScript, as the page would (an array of
+ *   { result }), or throws for a page that refused it.
  */
 export function loadPanel({
   worker = defaultWorker,
   tab = { id: 7, windowId: 1, url: 'https://example.test/', title: 'Example' },
   setup = () => {},
   // The panel's fetch, in place before panel.js runs, so what it asks for
-  // at load is seen too.
-  fetch = async () => ({ blob: async () => ({}) }),
+  // at load is seen too. Its Blob is a stand-in that says which URL it was
+  // made from, so a size set for that URL in imageSizes holds for it too.
+  fetch = async (url) => ({ blob: async () => ({ type: 'image/png', size: 4, source: url }) }),
   globals = {},
+  scripting = () => [{ result: undefined }],
 } = {}) {
   const clock = makeClock();
   const elements = new Map();
   const documentListeners = new Map();
+  const windowListeners = new Map();
   const runtimeListeners = [];
   const sent = [];
   const shots = { next: [] };
   const ports = []; // every port the panel opened, with what it posted
   const tabPorts = []; // every port the panel opened to a tab (chrome.tabs.connect)
+  // What an image or a bitmap made from a source decodes to, by source (see
+  // sizeIn); a test sets it before the panel decodes that source.
+  const imageSizes = new Map();
+  const bitmaps = []; // every bitmap createImageBitmap made, with whether it was closed
+  const objectUrls = []; // every { url, blob } URL.createObjectURL made, in order
+  const scripted = []; // every chrome.scripting.executeScript call, as it was made
 
   const document = {
     // An open side panel is visible from its first line.
@@ -232,8 +356,32 @@ export function loadPanel({
   };
 
   class PanelURL extends URL {}
-  PanelURL.createObjectURL = () => 'blob:panel';
-  PanelURL.revokeObjectURL = () => {};
+  PanelURL.createObjectURL = (blob) => {
+    const url = `blob:panel/${objectUrls.length + 1}`;
+    objectUrls.push({ url, blob, revoked: false });
+    return url;
+  };
+  PanelURL.revokeObjectURL = (url) => {
+    const made = objectUrls.find((entry) => entry.url === url);
+    if (made) made.revoked = true;
+  };
+
+  /** A decoded bitmap of the size sizeIn gives its source, with close(). */
+  async function createImageBitmap(source) {
+    const size = sizeIn(imageSizes, source);
+    if (size.error) throw new Error('The source image could not be decoded.');
+    const bitmap = {
+      width: size.width,
+      height: size.height,
+      source,
+      closed: false,
+      close() {
+        bitmap.closed = true;
+      },
+    };
+    bitmaps.push(bitmap);
+    return bitmap;
+  }
 
   const chrome = {
     runtime: {
@@ -331,6 +479,14 @@ export function loadPanel({
       show() {},
       onChanged: { addListener() {} },
     },
+    // The page's half of executeScript: `scripting` answers, and every call
+    // is kept in `scripted`.
+    scripting: {
+      executeScript: async (details) => {
+        scripted.push(details);
+        return scripting(details);
+      },
+    },
   };
 
   setup(chrome);
@@ -338,8 +494,15 @@ export function loadPanel({
   const window = {
     innerWidth: 400,
     innerHeight: 800,
-    addEventListener() {},
-    removeEventListener() {},
+    addEventListener(type, listener) {
+      if (!windowListeners.has(type)) windowListeners.set(type, []);
+      windowListeners.get(type).push(listener);
+    },
+    removeEventListener(type, listener) {
+      const list = windowListeners.get(type) || [];
+      const index = list.indexOf(listener);
+      if (index !== -1) list.splice(index, 1);
+    },
   };
 
   const context = vm.createContext({
@@ -349,8 +512,9 @@ export function loadPanel({
     window,
     console,
     crypto: globalThis.crypto,
-    Image: FakeImage,
+    Image: imageClass(imageSizes),
     URL: PanelURL,
+    createImageBitmap,
     fetch,
     setTimeout: clock.setTimeout,
     clearTimeout: clock.clearTimeout,
@@ -376,9 +540,14 @@ export function loadPanel({
     shots,
     ports,
     tabPorts,
+    imageSizes,
+    bitmaps,
+    objectUrls,
+    scripted,
     internals,
     element,
     document,
+    window,
     /** Which mode buttons are lit. */
     lit() {
       return ['region', 'element'].filter((mode) => element(`mode-${mode}`).classList.contains('armed'));
@@ -398,6 +567,10 @@ export function loadPanel({
     /** Fire the document's own listeners for `type` with `event`. */
     documentEvent(type, event = {}) {
       for (const listener of documentListeners.get(type) || []) listener(event);
+    },
+    /** Fire the window's listeners for `type`, such as 'resize' or 'pagehide'. */
+    windowEvent(type, event = {}) {
+      for (const listener of [...(windowListeners.get(type) || [])]) listener({ type, ...event });
     },
     /**
      * Lay the sheet's rows out for getBoundingClientRect, each `height` px

@@ -341,6 +341,63 @@ main {
   cursor: pointer;
 }
 
+/* The discard button's twin at the other corner: what can be done to the
+   capture on the left, taking it away on the right. Dimmed, not gone, for an
+   item that cannot be marked up, so a press can still say why. */
+.mark-up {
+  position: absolute;
+  z-index: 3;
+  top: 7px;
+  left: 7px;
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  border-radius: 2px;
+  background: var(--fg);
+  color: var(--bg);
+  cursor: pointer;
+}
+
+.mark-up svg {
+  width: 12px;
+  height: 12px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.mark-up[aria-disabled="true"],
+.mark-up:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* The capture as it is marked up, in the image's place and larger than it:
+   panel.js sizes it to the frame's width and most of the panel's height. A
+   drag on it draws, so it must not scroll the panel or pick text. The outline
+   sits inside, where the frame's overflow does not clip it. */
+.frame canvas {
+  display: block;
+  touch-action: none;
+  user-select: none;
+  cursor: crosshair;
+}
+
+.frame canvas:focus-visible {
+  outline-offset: -2px;
+}
+
+/* The readout stays on the canvas, but a drag that starts under it still
+   draws. */
+.frame.marking .gauge {
+  pointer-events: none;
+}
+
 /* Dimension readout, bottom-right, like a viewfinder. */
 .gauge {
   position: absolute;
@@ -692,6 +749,55 @@ main {
 .mode svg.fill {
   fill: currentColor;
   stroke-width: 0.9;
+}
+
+/* The marking tools, in the same hairline grid as .modes, whose place they
+   take while marking. The tool in use is lit the quiet way .intent.on is,
+   since one is always lit; magenta stays the marks' own. Done is the step
+   that ends it, in ink. */
+.marks {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  margin-top: 10px;
+  border: 1px solid var(--rule);
+  background: var(--rule);
+  gap: 1px;
+}
+
+.mark {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  min-height: 44px;
+  padding: 8px 2px;
+  border: none;
+  background: var(--bg);
+  color: var(--fg);
+  font: 500 9px/1 var(--mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.mark.on {
+  background: var(--rule-strong);
+}
+
+.mark.done {
+  color: var(--bg);
+  background: var(--fg);
+}
+
+.mark svg {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
 /* ------------------------------------------------------------- annotation -- */

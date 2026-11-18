@@ -1725,3 +1725,492 @@ test('reorder: after a move the rows, the frame, the line under Copy and the ban
     'The total shows NaN once a coupon is applied. It should show the discounted price.'
   );
 });
+
+// ----------------------------------------------------------------- markup --
+
+/**
+ * Downloads that each get an id and a path of their own, so a marked copy
+ * and the capture it replaces can be told apart.
+ */
+function ownDownloads(chrome) {
+  const records = new Map();
+  let next = 1;
+  chrome.downloads.download = async ({ filename }) => {
+    const id = next++;
+    records.set(id, { id, state: 'complete', filename: `/tmp/${filename}`, exists: true });
+    return id;
+  };
+  chrome.downloads.search = async ({ id }) => (records.has(id) ? [{ ...records.get(id) }] : []);
+}
+
+/** Press Mark up and let the capture decode. */
+async function markUp(panel) {
+  panel.click('mark-up');
+  await panel.flush();
+}
+
+/** A key on the markup's canvas; whether the panel took it. */
+function canvasKey(panel, key, extra = {}) {
+  let prevented = false;
+  panel.element('markup-canvas').dispatch('keydown', {
+    key,
+    isComposing: false,
+    metaKey: false,
+    ctrlKey: false,
+    shiftKey: false,
+    altKey: false,
+    preventDefault() {
+      prevented = true;
+    },
+    ...extra,
+  });
+  return prevented;
+}
+
+/** Draw one shape with the keys, from where the crosshair is to `steps` steps right and down. */
+function drawByKeys(panel, steps = 5) {
+  if (!panel.internals.state.markup.cursor) canvasKey(panel, 'Enter');
+  canvasKey(panel, 'Enter');
+  for (let i = 0; i < steps; i += 1) {
+    canvasKey(panel, 'ArrowRight');
+    canvasKey(panel, 'ArrowDown');
+  }
+  canvasKey(panel, 'Enter');
+}
+
+/** The marks the open markup holds, copied out of the panel's realm. */
+function drawn(panel) {
+  return [...panel.internals.state.markup.marks].map((mark) => ({ ...mark }));
+}
+
+test('markup: Mark up sits on the frame before the discard button, says what it does, and waits for a copy or a capture', async () => {
+  const frame = HTML.slice(HTML.indexOf('id="preview"'), HTML.indexOf('id="preview-meta"'));
+  const at = (id) => frame.indexOf(`id="${id}"`);
+  assert.ok(at('mark-up') > 0, 'Mark up is not on the frame');
+  assert.ok(at('preview-img') < at('markup-canvas') && at('markup-canvas') < at('mark-up'), 'the canvas is not in the image\'s place');
+  assert.ok(at('mark-up') < at('preview-clear'), 'Tab reaches the discard button first');
+  assert.match(HTML, /<button class="mark-up" id="mark-up" type="button" title="Mark up this screenshot" hidden>.*?<span class="sr">Mark up this screenshot<\/span>/);
+  assert.match(HTML, /<canvas class="markup" id="markup-canvas" tabindex="0" role="application" hidden><\/canvas>/);
+
+  const panel = await started();
+  const button = panel.element('mark-up');
+  await captureRegion(panel);
+  assert.equal(button.hidden, false);
+  assert.equal(button.disabled, false);
+  assert.equal(button.getAttribute('aria-disabled'), null);
+
+  let finish;
+  panel.shots.next.push(() => new Promise((resolve) => (finish = resolve)));
+  panel.click('mode-visible');
+  await panel.flush();
+  assert.equal(button.disabled, true, 'Mark up could be pressed while a capture ran');
+  finish();
+  await panel.flush();
+  await panel.flush();
+  assert.equal(button.disabled, false);
+
+  panel.click('submit');
+  assert.equal(button.disabled, true, 'Mark up could be pressed while a copy ran');
+  await panel.flush();
+  await panel.clock.advance(500);
+  await panel.flush();
+  assert.equal(button.hidden, true, 'Mark up stayed on an empty frame');
+});
+
+test('markup: the canvas takes the image\'s place and the tools the capture buttons\', which are off, and Cancel gives both back', async () => {
+  const panel = await started();
+  await captureRegion(panel);
+  await markUp(panel);
+  const canvas = panel.element('markup-canvas');
+  assert.ok(panel.internals.state.markup, 'the markup did not open');
+  assert.equal(canvas.hidden, false);
+  assert.equal(panel.element('preview-img').hidden, true);
+  assert.equal(panel.element('preview').classList.contains('marking'), true);
+  assert.equal(panel.element('marks').hidden, false);
+  assert.equal(panel.element('modes').hidden, true, 'the capture buttons stayed in view');
+  for (const id of ['mode-region', 'mode-element', 'mode-visible']) {
+    assert.equal(panel.element(id).disabled, true, `${id} could be pressed while marking`);
+  }
+  // A tab event while marking leaves them off.
+  await panel.internals.resolveTab();
+  assert.equal(panel.element('mode-visible').disabled, true, 'a tab event turned the capture buttons back on');
+  assert.equal(panel.element('mark-up').hidden, true, 'Mark up stayed on the canvas');
+  assert.equal(panel.element('preview-clear').hidden, false);
+  assert.equal(panel.element('preview-meta').textContent, 'REGION · PNG 50×50 · MARKING');
+  assert.equal(row(panel, 0).node.children[1].children[1].children[0].textContent, '1 · REGION · MARKING');
+  assert.equal(
+    canvas.getAttribute('aria-label'),
+    'Screenshot of item 1. Drag to draw an arrow, or use the arrow keys and Enter.'
+  );
+  assert.equal(panel.element('mark-arrow').getAttribute('aria-pressed'), 'true');
+  panel.click('mark-ellipse');
+  assert.equal(panel.element('mark-ellipse').getAttribute('aria-pressed'), 'true');
+  assert.equal(panel.element('mark-arrow').getAttribute('aria-pressed'), 'false');
+  assert.match(canvas.getAttribute('aria-label'), /Drag to draw an ellipse/);
+  assert.match(HTML, /<button class="mark" id="mark-undo" type="button" aria-label="Undo the last mark">/);
+
+  drawByKeys(panel);
+  panel.click('mark-cancel');
+  assert.equal(panel.internals.state.markup, null);
+  assert.equal(canvas.hidden, true);
+  assert.equal(panel.element('preview-img').hidden, false);
+  assert.equal(panel.element('modes').hidden, false);
+  assert.equal(panel.element('marks').hidden, true);
+  assert.equal(panel.element('mode-visible').disabled, false);
+  assert.equal(panel.element('preview-meta').textContent, 'REGION · PNG 50×50');
+  assert.equal(panel.element('announce').textContent, 'Marks not saved.');
+  assert.equal(sheet(panel)[0].markSave ?? null, null, 'Cancel saved the marks');
+  assert.equal(panel.internals.state.markTool, 'ellipse', 'the tool did not stick');
+});
+
+test('markup: drawn with the arrow keys and Enter, each step said, a shape too small refused', async () => {
+  const panel = await started();
+  await captureRegion(panel);
+  await markUp(panel);
+  const said = () => panel.element('announce').textContent;
+  assert.equal(canvasKey(panel, 'ArrowLeft'), true);
+  assert.equal(said(), 'Crosshair in the middle. The arrow keys move it, and Enter sets the first point.');
+  assert.deepEqual({ ...panel.internals.state.markup.cursor }, { x: 0.5, y: 0.5 });
+  canvasKey(panel, 'ArrowLeft');
+  assert.ok(Math.abs(panel.internals.state.markup.cursor.x - 0.48) < 1e-9, 'an arrow key did not step 2%');
+  canvasKey(panel, 'Enter');
+  assert.equal(said(), 'First point set. Move to where the arrow ends, and press Enter.');
+  canvasKey(panel, 'Enter');
+  assert.equal(said(), 'Move the second point away from the first, then press Enter.');
+  assert.deepEqual(drawn(panel), []);
+  for (let i = 0; i < 4; i += 1) canvasKey(panel, 'ArrowDown');
+  canvasKey(panel, 'Enter');
+  assert.equal(said(), 'Arrow 1 drawn.');
+  const [mark] = drawn(panel);
+  assert.equal(mark.tool, 'arrow');
+  assert.ok(Math.abs(mark.x1 - 0.48) < 1e-9 && Math.abs(mark.y1 - 0.5) < 1e-9);
+  assert.ok(Math.abs(mark.x2 - 0.48) < 1e-9 && Math.abs(mark.y2 - 0.58) < 1e-9);
+  // Alt moves one CSS pixel of the canvas as shown, not 2% of the image.
+  panel.element('markup-canvas').getBoundingClientRect = () => ({ left: 0, top: 0, right: 400, bottom: 400, width: 400, height: 400 });
+  const before = panel.internals.state.markup.cursor.x;
+  canvasKey(panel, 'ArrowRight', { altKey: true });
+  assert.ok(Math.abs(panel.internals.state.markup.cursor.x - before - 1 / 400) < 1e-9, 'Alt did not step one pixel');
+  // Keys that are not the markup's are left alone.
+  assert.equal(canvasKey(panel, 'a'), false);
+  assert.equal(canvasKey(panel, 'Enter', { metaKey: true }), false);
+});
+
+test('markup: Esc drops a shape half drawn first, then closes and saves the marks, before an armed mode hears it', async () => {
+  const { panel } = await armedWithScripting('region', { captures: 1 });
+  assert.deepEqual(panel.lit(), ['region']);
+  await markUp(panel);
+  drawByKeys(panel);
+  canvasKey(panel, 'Enter');
+  canvasKey(panel, 'ArrowRight');
+  assert.ok(panel.internals.state.markup.pending, 'no shape half drawn');
+  assert.equal(press(panel, 'Escape'), true);
+  assert.ok(panel.internals.state.markup, 'Esc closed the markup with a shape half drawn');
+  assert.equal(panel.internals.state.markup.pending, null);
+  assert.equal(panel.element('announce').textContent, 'The arrow being drawn was dropped.');
+  assert.equal(drawn(panel).length, 1);
+  assert.deepEqual(panel.lit(), ['region'], 'the first Esc reached the armed mode');
+
+  assert.equal(press(panel, 'Escape'), true);
+  assert.equal(panel.internals.state.markup, null, 'the second Esc left the markup open');
+  assert.ok(sheet(panel)[0].markSave, 'Esc closed without saving the marks');
+  assert.deepEqual(panel.lit(), ['region'], 'the second Esc reached the armed mode');
+  await panel.flush();
+  press(panel, 'Escape');
+  await panel.flush();
+  assert.deepEqual(panel.lit(), [], 'the third Esc did not reach the armed mode');
+});
+
+test('markup: Esc with nothing changed closes without a save', async () => {
+  const panel = await started();
+  await captureRegion(panel);
+  await markUp(panel);
+  press(panel, 'Escape');
+  assert.equal(panel.internals.state.markup, null);
+  assert.equal(sheet(panel)[0].markSave ?? null, null);
+  assert.equal(panel.element('mark-up').hidden, false);
+});
+
+test('markup: Cmd/Ctrl+Z takes back the last mark and leaves a discard waiting; in the field it is the text\'s', async () => {
+  const panel = await started();
+  await captureRegion(panel);
+  await captureRegion(panel);
+  const realm = realmOf(panel);
+  // Item 1 discarded, its undo waiting.
+  realm.selectItem(sheet(panel)[0].id);
+  panel.click('preview-clear');
+  assert.equal(sheet(panel).length, 1);
+  assert.ok(panel.internals.state.trash, 'no discard waiting');
+  await markUp(panel);
+  realm.document.activeElement = panel.element('markup-canvas');
+  drawByKeys(panel);
+  drawByKeys(panel, 3);
+  assert.equal(drawn(panel).length, 2);
+
+  assert.equal(press(panel, 'z', { ctrlKey: true }), true);
+  assert.equal(drawn(panel).length, 1, 'the last mark stayed');
+  assert.equal(panel.element('announce').textContent, 'Arrow 2 removed.');
+  assert.equal(sheet(panel).length, 1, 'the key undid the discard too');
+  assert.ok(panel.internals.state.trash, 'the discard went');
+  assert.equal(press(panel, 'z', { metaKey: true }), true);
+  assert.equal(drawn(panel).length, 0);
+  press(panel, 'z', { metaKey: true });
+  assert.equal(panel.element('announce').textContent, 'No marks to take back.');
+  assert.equal(sheet(panel).length, 1);
+
+  // In the description field the key is the text's own undo, marking or not.
+  drawByKeys(panel);
+  realm.document.activeElement = panel.element('description');
+  assert.equal(press(panel, 'z', { ctrlKey: true }), false, 'the panel took the field\'s undo');
+  assert.equal(drawn(panel).length, 1);
+  assert.equal(sheet(panel).length, 1);
+  panel.click('mark-undo');
+  assert.equal(drawn(panel).length, 0);
+});
+
+test('markup: Copy and Cmd/Ctrl+Enter wait while a ticked item is marked up, and say why', async () => {
+  const panel = await started();
+  await captureRegion(panel);
+  await markUp(panel);
+  assert.equal(panel.element('submit').disabled, true);
+  assert.equal(text(panel.element('submit-note')), 'Finish marking up item 1 to copy it.');
+  press(panel, 'Enter', { metaKey: true });
+  await panel.flush();
+  await panel.clock.advance(500);
+  await panel.flush();
+  assert.equal(sheet(panel).length, 1, 'Cmd+Enter copied an item being marked up');
+  assert.ok(!panel.internals.state.lastPrompt, 'a prompt was built');
+  panel.click('mark-done');
+  assert.equal(panel.internals.state.markup, null);
+  assert.equal(panel.element('submit').disabled, false);
+});
+
+test('markup: with a mode armed, the arrows and Enter stay in the panel while marking', async () => {
+  const { panel, handed } = await armedWithScripting('element', { captures: 1 });
+  await markUp(panel);
+  const realm = realmOf(panel);
+  realm.document.activeElement = panel.element('markup-canvas');
+  press(panel, 'ArrowUp');
+  press(panel, 'Enter');
+  realm.document.activeElement = null;
+  press(panel, 'ArrowDown');
+  await panel.flush();
+  assert.deepEqual(handed, [], 'a key went on to the page while marking');
+});
+
+test('markup: picking another row saves the marks and opens that item', async () => {
+  const panel = await started({ setup: ownDownloads });
+  await captureRegion(panel);
+  await captureRegion(panel);
+  const [first, second] = sheet(panel);
+  await markUp(panel);
+  drawByKeys(panel);
+  row(panel, 0).pick.dispatch('click');
+  assert.equal(panel.internals.state.markup, null);
+  assert.equal(panel.internals.state.selectedId, first.id);
+  assert.ok(second.markSave, 'leaving the item dropped its marks');
+  await panel.flush();
+  await panel.flush();
+  assert.equal(second.marked, true);
+  assert.match(second.path, /_region_marked\.png$/);
+  assert.equal(row(panel, 1).node.children[1].children[1].children[0].textContent, '2 · REGION · MARKED');
+  assert.match(row(panel, 1).pick.getAttribute('aria-label'), /^Item 2, region, marked/);
+});
+
+test('markup: a move and a write from another window leave the canvas as it is', async () => {
+  const panel = await started();
+  await captureRegion(panel);
+  await captureRegion(panel);
+  const realm = realmOf(panel);
+  await markUp(panel);
+  drawByKeys(panel);
+  const markup = panel.internals.state.markup;
+
+  realm.document.activeElement = row(panel, 1).pick;
+  press(panel, 'ArrowUp', { altKey: true });
+  assert.equal(panel.internals.state.markup, markup, 'a move closed the markup');
+  assert.equal(panel.element('markup-canvas').hidden, false);
+  assert.equal(panel.element('preview-img').hidden, true, 'the image came back over the canvas');
+  assert.equal(panel.element('preview-meta').textContent, '1/2 · REGION · PNG 50×50 · MARKING');
+
+  const report = {
+    items: sheet(panel).map((item) => ({ ...realm.storedForm(item), description: 'from the other window', wordsAt: Date.now() })),
+    writer: 'elsewhere',
+  };
+  realm.adoptStored(report, null);
+  assert.equal(panel.internals.state.markup, markup, 'a write from elsewhere closed the markup');
+  assert.equal(panel.element('description').value, 'from the other window');
+  assert.equal(panel.element('markup-canvas').hidden, false);
+  assert.equal(panel.element('preview-img').hidden, true);
+  assert.equal(drawn(panel).length, 1);
+});
+
+test('markup: the marks are drawn the same on the canvas and in the saved copy, magenta over a white edge', async () => {
+  const fetched = [];
+  const panel = await started({
+    setup: ownDownloads,
+    fetch: async (url) => {
+      fetched.push(url);
+      return { blob: async () => ({ type: 'image/png', size: 4, source: url }) };
+    },
+  });
+  panel.click('mode-visible');
+  await panel.flush();
+  await panel.flush();
+  const [item] = sheet(panel);
+  assert.deepEqual([item.width, item.height], [1280, 720]);
+  // A frame 320 px wide shows the capture at a quarter of its size.
+  panel.element('preview').getBoundingClientRect = () => ({ left: 0, top: 0, right: 320, bottom: 180, width: 320, height: 180 });
+  await markUp(panel);
+  const canvas = panel.element('markup-canvas');
+  assert.deepEqual([canvas.width, canvas.height, canvas.style.width], [320, 180, '320px']);
+  canvasKey(panel, 'Enter');
+  canvasKey(panel, 'Enter');
+  for (let i = 0; i < 10; i += 1) canvasKey(panel, 'ArrowRight');
+  canvasKey(panel, 'Enter');
+  panel.click('mark-ellipse');
+  canvasKey(panel, 'Enter');
+  for (let i = 0; i < 5; i += 1) canvasKey(panel, 'ArrowDown');
+  canvasKey(panel, 'Enter');
+  assert.equal(drawn(panel).length, 2);
+
+  const shown = canvas.context.calls;
+  const lastImage = shown.findLastIndex((call) => call.op === 'drawImage');
+  const transform = shown.slice(0, lastImage).findLast((call) => call.op === 'setTransform');
+  assert.deepEqual(transform.args, [0.25, 0, 0, 0.25, 0, 0]);
+  assert.deepEqual(shown[lastImage].args.slice(1), [0, 0, 1280, 720]);
+
+  const fetches = fetched.length;
+  const madeUrls = panel.objectUrls.length;
+  panel.click('mark-done');
+  await panel.flush();
+  await panel.flush();
+  // The PNG went from the canvas to the save as the Blob toBlob gave.
+  assert.equal(fetched.length, fetches, 'the marked copy went through fetch');
+  const { blob } = panel.objectUrls[madeUrls];
+  const full = blob.canvas;
+  assert.ok(full?.blobs?.includes(blob), 'the save was not given the canvas\'s own Blob');
+  assert.equal(blob.type, 'image/png');
+  assert.deepEqual([full.width, full.height], [0, 0], 'the full size canvas kept its pixels');
+  const saved = full.context.calls;
+  const image = saved.findIndex((call) => call.op === 'drawImage');
+  assert.deepEqual(saved[image].args.slice(1), [0, 0, 1280, 720]);
+  const marksSaved = saved.slice(image + 1);
+  // The same calls draw the marks at both scales: image pixels, through the
+  // canvas's transform on screen.
+  assert.deepEqual(shown.slice(lastImage + 1, lastImage + 1 + marksSaved.length), marksSaved);
+
+  const colours = marksSaved.filter((call) => call.set === 'strokeStyle').map((call) => call.value);
+  assert.deepEqual(colours, ['rgba(255, 255, 255, 0.85)', '#e6007e', 'rgba(255, 255, 255, 0.85)', '#e6007e']);
+  const widths = marksSaved.filter((call) => call.set === 'lineWidth').map((call) => call.value);
+  // A 200th of 1280, never under 4; the edge 2 px wider each side.
+  assert.ok(widths.includes(6) && widths.includes(10), `widths ${widths}`);
+  assert.ok(widths.every((width) => width >= 4));
+  // A small crop still gets a stroke that shows.
+  assert.equal(realmOf(panel).markStroke(50, 50), 4);
+  assert.ok(marksSaved.some((call) => call.op === 'ellipse'));
+  assert.ok(marksSaved.some((call) => call.op === 'fill'), 'the arrow has no head');
+  assert.equal(item.thumb.startsWith('data:image/webp'), true, 'the thumbnail was not made from the marked copy');
+  assert.equal(panel.bitmaps.every((bitmap) => bitmap.closed), true, 'a decoded capture was kept');
+});
+
+test('markup: a shape is drawn by dragging on the canvas, held to its edges, and a click draws nothing', async () => {
+  const panel = await started();
+  await captureRegion(panel);
+  await markUp(panel);
+  const canvas = panel.element('markup-canvas');
+  canvas.getBoundingClientRect = () => ({ left: 10, top: 20, right: 210, bottom: 220, width: 200, height: 200 });
+  const pointer = (type, x, y, extra = {}) => canvas.dispatch(type, { pointerId: 3, button: 0, clientX: x, clientY: y, ...extra });
+  pointer('pointerdown', 60, 70);
+  assert.equal(canvas.hasPointerCapture(3), true, 'the canvas did not hold the pointer');
+  pointer('pointermove', 150, 120);
+  pointer('pointerup', 400, 120);
+  assert.equal(canvas.hasPointerCapture(3), false);
+  assert.deepEqual(drawn(panel), [{ tool: 'arrow', x1: 0.25, y1: 0.25, x2: 1, y2: 0.5 }]);
+  assert.equal(panel.element('announce').textContent, 'Arrow 1 drawn.');
+  // A click, and a drag the system took away.
+  pointer('pointerdown', 60, 70);
+  pointer('pointerup', 62, 71);
+  pointer('pointerdown', 60, 70);
+  pointer('pointermove', 150, 150);
+  pointer('pointercancel', 150, 150);
+  // Another button, or a second pointer while one draws.
+  pointer('pointerdown', 60, 70, { button: 2 });
+  pointer('pointerup', 150, 150, { button: 2 });
+  assert.equal(drawn(panel).length, 1);
+});
+
+test('markup: a panel resized while marking draws the canvas afresh, and a drag the canvas loses draws nothing', async () => {
+  const panel = await started();
+  await captureRegion(panel);
+  const frame = panel.element('preview');
+  frame.getBoundingClientRect = () => ({ left: 0, top: 0, right: 200, bottom: 200, width: 200, height: 200 });
+  await markUp(panel);
+  const canvas = panel.element('markup-canvas');
+  assert.deepEqual([canvas.width, canvas.height, canvas.style.width, canvas.style.height], [200, 200, '200px', '200px']);
+  drawByKeys(panel);
+
+  // The panel dragged wider: the 50 px crop is shown 300 px wide.
+  frame.getBoundingClientRect = () => ({ left: 0, top: 0, right: 300, bottom: 300, width: 300, height: 300 });
+  const before = canvas.context.calls.length;
+  panel.windowEvent('resize');
+  assert.deepEqual([canvas.width, canvas.height, canvas.style.width, canvas.style.height], [300, 300, '300px', '300px']);
+  const after = canvas.context.calls.slice(before);
+  const image = after.findIndex((call) => call.op === 'drawImage');
+  assert.ok(image >= 0, 'the canvas was not drawn again at its new size');
+  assert.deepEqual(after.slice(0, image).findLast((call) => call.op === 'setTransform').args, [6, 0, 0, 6, 0, 0]);
+  assert.ok(after.slice(image).some((call) => call.op === 'lineTo'), 'the marks were not drawn again');
+  assert.equal(drawn(panel).length, 1);
+
+  // The system takes the pointer away in the middle of a drag.
+  canvas.getBoundingClientRect = () => ({ left: 0, top: 0, right: 300, bottom: 300, width: 300, height: 300 });
+  const pointer = (type, x, y) => canvas.dispatch(type, { pointerId: 4, button: 0, clientX: x, clientY: y });
+  pointer('pointerdown', 30, 30);
+  pointer('pointermove', 200, 200);
+  assert.ok(panel.internals.state.markup.pending, 'no shape half drawn');
+  canvas.dispatch('lostpointercapture', { pointerId: 4 });
+  assert.equal(panel.internals.state.markup.pending, null, 'the shape stayed half drawn');
+  assert.equal(panel.internals.state.markup.pointerId, null);
+  pointer('pointerup', 250, 250);
+  assert.equal(drawn(panel).length, 1, 'a drag the canvas lost drew a shape');
+});
+
+test('markup: an item discarded while marked up goes with its marks unsaved, and Undo brings it back as it was', async () => {
+  const panel = await started();
+  await captureRegion(panel);
+  await markUp(panel);
+  drawByKeys(panel);
+  panel.click('preview-clear');
+  assert.equal(panel.internals.state.markup, null);
+  assert.equal(panel.element('markup-canvas').hidden, true);
+  assert.equal(panel.element('modes').hidden, false);
+  assert.equal(panel.element('mode-visible').disabled, false);
+  panel.element('undo').children[1].dispatch('click');
+  await panel.flush();
+  const [item] = sheet(panel);
+  assert.ok(item, 'the undo brought nothing back');
+  assert.equal(item.markSave ?? null, null, 'the discard saved the marks');
+  assert.equal(item.marked, undefined);
+  assert.equal(panel.element('preview-meta').textContent, 'REGION · PNG 50×50');
+});
+
+test('markup: a second press while the capture decodes opens one markup', async () => {
+  const panel = await started();
+  await captureRegion(panel);
+  panel.click('mark-up');
+  assert.equal(panel.element('mark-up').disabled, true, 'Mark up could be pressed while its capture decoded');
+  panel.click('mark-up');
+  await panel.flush();
+  assert.ok(panel.internals.state.markup);
+  assert.equal(panel.bitmaps.length, 1, 'the capture was decoded twice');
+});
+
+test('markup: a capture that cannot be decoded says so and opens nothing', async () => {
+  const panel = await started();
+  await captureRegion(panel);
+  const [item] = sheet(panel);
+  panel.imageSizes.set(item.full.source, { error: true });
+  await markUp(panel);
+  assert.equal(panel.internals.state.markup, null);
+  assert.equal(panel.banner(), "Item 1's screenshot could not be opened to mark it up.");
+  assert.equal(panel.element('mark-up').disabled, false);
+});

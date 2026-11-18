@@ -8,7 +8,8 @@ what it reads, and for how long. It applies to every version published from
 kind. It has no server, no account, no analytics and no telemetry, and it loads no code from
 anywhere. What it collects goes to three places on your own machine: your Downloads folder,
 the extension's local storage in Chrome, and, when you ask for it, your clipboard. Where that
-text goes after you paste it is up to you.
+text goes after you paste it is up to you. While the side panel is open, it also holds the full
+screenshots of its newest captures in its own memory, so that you can mark them up.
 
 Punch List for Claude Code is an independent project. It is not affiliated with, endorsed by
 or sponsored by Anthropic. Claude and Claude Code are products of Anthropic.
@@ -54,6 +55,10 @@ enabled.
 **What you type**: the sentence you write for each item, and whether it is a bug or a
 suggestion.
 
+**What you draw**: the arrows and ellipses you draw on a screenshot when you mark it up. They
+are drawn into the copy saved next to that screenshot, and the panel keeps them in its memory
+while it stays open, so that you can change them.
+
 Values that look secret are replaced with `<redacted>` where they are read, before anything is
 stored: props, markup and logged objects whose names look like a password, token, key, session or
 card number, the values of password and hidden fields, any prop that holds what a password, one
@@ -66,7 +71,8 @@ does not, among them free text, the page title and the screenshot itself.
 
 | What | Where | How long |
 | :--- | :--- | :--- |
-| Screenshots, as PNG files | `claude-punch-list` in your Downloads folder | A screenshot whose item you copied stays until you delete it, because the prompt names it by path. One whose item was never copied is deleted by the extension when you discard the item (once the six seconds in which the discard can be undone have run out) or when a sheet left untouched for a week is dropped. |
+| Screenshots, as PNG files | `claude-punch-list` in your Downloads folder | A screenshot whose item you copied stays until you delete it, because the prompt names it by path. One whose item was never copied is deleted by the extension when you discard the item (once the six seconds in which the discard can be undone have run out) or when a sheet left untouched for a week is dropped. When you mark an item up, a copy with your marks drawn in is saved next to its screenshot, and once the item names the copy the screenshot it replaced is deleted, unless a prompt you are copying by hand names it. |
+| The full screenshots of the panel's newest captures, kept so that they can be marked up | The side panel's memory. Chrome may page a large one out to a temporary file in your Chrome profile while the panel holds it. | Never written to storage. Each goes when the panel closes, when its item is copied or its discard is final, or when it is no longer among the panel's 10 newest captures (about 100 MB together at most). |
 | The sheet: each item's sentence, thumbnail, screenshot path, page address and title, and element details | `chrome.storage.local`, in your Chrome profile, readable only by the extension's own pages | Until you copy the items or discard them. A sheet left untouched for a week is dropped the next time the panel opens, with its screenshots, unless a panel in another window is showing it. |
 | Your settings: which kinds of evidence to attach, bug or suggestion | `chrome.storage.local` | Until you uninstall the extension. |
 | The console and network record | The memory of the page it was collected on | Until that page is closed or reloaded. |
@@ -95,7 +101,7 @@ Chrome offers no setting to turn it on there.
 | :--- | :--- |
 | Access to all sites (`<all_urls>`) | Taking the screenshot (`captureVisibleTab` requires it), putting the capture overlay and the element picker on the page, reading the tab's address, and running the collector and the picker's press listener |
 | `scripting` | Putting the capture overlay and the element picker on the page when you press Region or Element, and starting the collector on a tab that was already open when the extension was installed or enabled, only where the collector is set to run |
-| `downloads` | Saving each screenshot to your Downloads folder, reading back where it was saved, checking that it is still there, and deleting the screenshot of an item that was never copied |
+| `downloads` | Saving each screenshot to your Downloads folder, and a marked copy of one when you mark it up, reading back where it was saved, checking that it is still there, and deleting the screenshot of an item that was never copied, or one that a marked copy has replaced |
 | `storage` | Keeping the sheet and your settings between panel sessions |
 | `sidePanel` | The panel itself |
 
