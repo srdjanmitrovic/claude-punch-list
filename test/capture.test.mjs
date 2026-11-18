@@ -4,11 +4,14 @@
  *
  * The overlay and the bridge run here for real, in a node:vm realm against a
  * stub of the few DOM calls they make. The stub keeps a tree, attributes,
- * listeners, a top layer, the focused element, the page's open shadow roots
- * and the slots their hosts' children are drawn in, and lays nothing out, so what these prove is where the overlay puts
- * its host, what it listens to and what it sends, not how it looks. How it
- * looks under a modal dialog (one in a shadow root, one opened, closed or
- * removed while armed), a transformed body, a pinch zoom and a touch drag was
+ * listeners, a top layer, the focused element, the fullscreen element, the
+ * page's shadow roots, open and closed, and the slots their hosts' children
+ * are drawn in, walks it as a TreeWalker does, tells MutationObservers of
+ * changes to it, and lays nothing out, so what these prove is where the
+ * overlay puts its host, what it listens to and what it sends, not how it
+ * looks. How it looks under a modal dialog (one in a shadow root, open or
+ * closed, one opened, closed or removed while armed), over a fullscreen
+ * element, under a transformed body, a pinch zoom and a touch drag was
  * checked in Chrome.
  *
  * The crop is lifted out of sidepanel/panel.js and run against a canvas that
@@ -19,6 +22,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import v8 from 'node:v8';
 import vm from 'node:vm';
 import { FakePage, PANEL_SENDER, flush, loadWorker } from './support/worker-realm.mjs';
 import { defaultWorker, loadPanel } from './support/panel-realm.mjs';
@@ -31,12 +35,16 @@ const PANEL = read('sidepanel/panel.js');
 
 const ARMED_DURING_SCREEN =
   'A capture mode was armed while this screenshot waited, so its overlay may show in it.';
+const MOVED_UNDER_OVERLAY =
+  'The page moved its fullscreen content while Region was armed and moved it back for the screenshot, so this crop may be off.';
 
 // ------------------------------------------------------------ a stub DOM --
 
 class StubElement {
   constructor(tag, doc) {
     this.tagName = tag.toUpperCase();
+    this.localName = tag.toLowerCase();
+    this.namespaceURI = 'http://www.w3.org/1999/xhtml';
     this.nodeType = 1;
     this.ownerDocument = doc;
     this.attributes = new Map();
@@ -49,7 +57,9 @@ class StubElement {
     this.modal = false;
     this.popoverOpen = false;
     this.shadowRoot = null; // an open shadow root of the page's, see StubShadowRoot
+    this.closedRoot = null; // a closed one, which only chrome.dom.openOrClosedShadowRoot answers with
     this.assignedSlot = null; // the slot in a shadow tree this child of its host is drawn in
+    this.drawsChildren = true; // false for a video, a canvas or a frame, see getClientRects()
   }
   get parentElement() {
     return this.parentNode instanceof StubElement ? this.parentNode : null;
@@ -65,6 +75,23 @@ class StubElement {
     this.ownerDocument.topLayer.push(this);
     this.ownerDocument.focus(focus);
   }
+  /**
+   * What requestFullscreen() does, as far as the overlay can see: in the top
+   * layer, and the fullscreen element of the document and of each shadow
+   * root on the way, retargeted as Chrome reports it.
+   */
+  requestFullscreen() {
+    const document = this.ownerDocument;
+    document.fullscreenNode = this;
+    document.topLayer.push(this);
+    let at = this;
+    while (at.getRootNode() instanceof StubShadowRoot) {
+      const root = at.getRootNode();
+      root.fullscreenElement = at;
+      at = root.host;
+    }
+    document.fullscreenElement = at;
+  }
   /** What close() does: not modal, out of the top layer, and a close event later. */
   close() {
     this.modal = false;
@@ -74,6 +101,7 @@ class StubElement {
   }
   setAttribute(name, value) {
     this.attributes.set(name, String(value));
+    if (name === 'popover') mutated(this, { type: 'attributes', attributeName: name });
   }
   getAttribute(name) {
     return this.attributes.has(name) ? this.attributes.get(name) : null;
@@ -82,12 +110,14 @@ class StubElement {
     return this.attributes.has(name);
   }
   removeAttribute(name) {
-    this.attributes.delete(name);
+    const had = this.attributes.delete(name);
+    if (had && name === 'popover') mutated(this, { type: 'attributes', attributeName: name });
   }
   appendChild(node) {
     if (node.parentNode) node.parentNode.removeChild(node);
     node.parentNode = this;
     this.children.push(node);
+    mutated(this, { type: 'childList', addedNodes: [node] });
     return node;
   }
   removeChild(node) {
@@ -96,6 +126,7 @@ class StubElement {
     // Taken out of the tree, a popover leaves the top layer, and so does one
     // inside what was taken out, shadow roots included.
     for (const one of composed(node)) if (one.popoverOpen) one.hidePopover();
+    mutated(this, { type: 'childList', removedNodes: [node] });
     return node;
   }
   get isConnected() {
@@ -161,6 +192,13 @@ class StubElement {
   getBoundingClientRect() {
     return { left: 0, top: 0, width: 0, height: 0 };
   }
+  /** No box inside an element that draws no children, as in a video in Chrome; one box elsewhere. */
+  getClientRects() {
+    for (let at = this.parentNode; at; at = at.parentNode || (at instanceof StubShadowRoot ? at.host : null)) {
+      if (at.drawsChildren === false) return [];
+    }
+    return [{}];
+  }
   attachShadow() {
     const shadow = { classes: new Map(), styleText: '' };
     Object.defineProperty(shadow, 'innerHTML', {
@@ -177,6 +215,11 @@ class StubElement {
     this.shadow = shadow;
     return shadow;
   }
+  /** Whether node is this or inside it, in this tree only, as Node.contains goes. */
+  contains(node) {
+    for (let at = node; at; at = at.parentNode) if (at === this) return true;
+    return false;
+  }
   /** Every descendant, depth first, in the light DOM only, as querySelectorAll goes. */
   *walk() {
     for (const child of this.children) {
@@ -186,10 +229,17 @@ class StubElement {
   }
 }
 
-/** A node and every node under it, through open shadow roots too. */
+/** A change to the tree under `target`, for the page's MutationObservers, see makePage(). */
+function mutated(target, record) {
+  const document = target.ownerDocument || target.host?.ownerDocument;
+  document?.mutated?.({ target, addedNodes: [], removedNodes: [], attributeName: null, ...record });
+}
+
+/** A node and every node under it, through shadow roots too. */
 function* composed(node) {
   yield node;
-  for (const child of [...(node.shadowRoot?.children || []), ...node.children]) yield* composed(child);
+  const shadow = node.shadowRoot || node.closedRoot;
+  for (const child of [...(shadow?.children || []), ...node.children]) yield* composed(child);
 }
 
 /** Whether node is ancestor or inside it, through shadow roots to their hosts. */
@@ -203,43 +253,68 @@ function within(ancestor, node) {
 /**
  * querySelectorAll in one scope (a document or a shadow root), its own tree
  * only, for the selectors the overlay asks: dialog:modal and :popover-open,
- * alone or in a list.
+ * and [popover] and dialog, alone or in a list.
  */
 function queryScope(nodes, selector) {
   const parts = selector.split(',').map((part) => part.trim());
-  for (const part of parts) if (part !== 'dialog:modal' && part !== ':popover-open') throw new Error(`stub cannot answer ${selector}`);
-  return nodes.filter((node) => parts.some((part) => node.matches(part)));
+  const test = {
+    'dialog:modal': (node) => node.matches('dialog:modal'),
+    ':popover-open': (node) => node.matches(':popover-open'),
+    '[popover]': (node) => node.hasAttribute('popover'),
+    dialog: (node) => node.localName === 'dialog',
+  };
+  for (const part of parts) if (!test[part]) throw new Error(`stub cannot answer ${selector}`);
+  return nodes.filter((node) => parts.some((part) => test[part](node)));
 }
 
 /**
- * Hit testing, as Chrome was seen to do it under a modal dialog: the last
- * thing in the top layer that is not inert is hit, everything outside the
- * last modal dialog there being inert, and the modal's ::backdrop, which
- * covers the viewport, is hit as the dialog. With nothing in the top layer,
- * the body. Retargeted to `scope`, as document.elementFromPoint and a shadow
- * root's are. The stub lays nothing out, so every point is the same point.
+ * Hit testing, as Chrome was seen to do it under a modal dialog and over a
+ * fullscreen element: the last thing in the top layer that is not inert and
+ * has a box is hit, everything outside the last modal dialog there, or with
+ * none the fullscreen element, being inert, and the modal's ::backdrop,
+ * which covers the viewport, is hit as the dialog. With nothing in the top
+ * layer, the body. The stub lays nothing out, so every point is the same
+ * point.
  */
-function hitTest(document, scope) {
+function rawHit(document) {
   const layer = document.topLayer;
   const modal = [...layer].reverse().find((node) => node.tagName === 'DIALOG' && node.modal) || null;
+  const inertRoot = modal || document.fullscreenNode || null;
   let hit = null;
-  for (let i = layer.length - 1; i >= 0 && !hit; i -= 1) if (!modal || within(modal, layer[i])) hit = layer[i];
-  if (!hit && !modal) hit = document.body;
+  for (let i = layer.length - 1; i >= 0 && !hit; i -= 1) {
+    if ((!inertRoot || within(inertRoot, layer[i])) && layer[i].getClientRects().length) hit = layer[i];
+  }
+  if (!hit && !inertRoot) hit = document.body;
+  return hit;
+}
+
+/** rawHit() retargeted to `scope`, as document.elementFromPoint and a shadow root's are. */
+function hitTest(document, scope) {
+  let hit = rawHit(document);
   while (hit && hit.getRootNode() !== scope && hit.getRootNode() instanceof StubShadowRoot) hit = hit.getRootNode().host;
   return hit;
 }
 
 /**
- * An open shadow root of the page's, such as a component library's dialog
- * lives in. Its nodes are out of the document's querySelectorAll, and its
- * activeElement is the focused node inside it.
+ * A shadow root of the page's, such as a component library's dialog lives
+ * in. Its nodes are out of the document's querySelectorAll, and its
+ * activeElement is the focused node inside it. A closed one is not the
+ * host's shadowRoot.
  */
 class StubShadowRoot {
-  constructor(host) {
+  constructor(host, { mode = 'open' } = {}) {
     this.host = host;
+    this.nodeType = 11;
+    this.mode = mode;
     this.children = [];
     this.activeElement = null;
-    host.shadowRoot = this;
+    this.fullscreenElement = null;
+    this.queried = 0; // how often querySelectorAll was asked here
+    if (mode === 'closed') host.closedRoot = this;
+    else host.shadowRoot = this;
+  }
+  getRootNode() {
+    return this;
   }
   appendChild(node) {
     return StubElement.prototype.appendChild.call(this, node);
@@ -248,7 +323,11 @@ class StubShadowRoot {
     return StubElement.prototype.removeChild.call(this, node);
   }
   querySelectorAll(selector) {
+    this.queried += 1;
     return queryScope(this.children.flatMap((child) => [child, ...child.walk()]), selector);
+  }
+  querySelector(selector) {
+    return queryScope(this.children.flatMap((child) => [child, ...child.walk()]), selector)[0] || null;
   }
   elementFromPoint() {
     return hitTest(this.host.ownerDocument, this);
@@ -258,10 +337,46 @@ class StubShadowRoot {
 /**
  * A page for a content script: a document with a body, a window with the
  * listeners and frames a test drives, and a runtime that records what is
- * sent. `popovers: false` is a browser without them.
+ * sent. `popovers: false` is a browser without them, `observers: false` one
+ * without MutationObserver. Each frame moves performance.now() on by one
+ * frame of a display at `hz`.
  */
-function makePage({ popovers = true, visual = null, width = 1000, height = 700 } = {}) {
+function makePage({ popovers = true, visual = null, width = 1000, height = 700, observers = true, hz = 60 } = {}) {
+  // MutationObservers, as Chrome keeps them: each sees the changes in the
+  // trees it observes (the document's or a shadow root's), and is told of
+  // them in a batch before the next task, here before each frame and event.
+  const watchers = [];
+  class MutationObserver {
+    constructor(callback) {
+      this.callback = callback;
+      this.targets = [];
+      this.records = [];
+      watchers.push(this);
+    }
+    observe(target) {
+      if (!this.targets.includes(target)) this.targets.push(target);
+    }
+    disconnect() {
+      this.targets = [];
+      this.records = [];
+    }
+    takeRecords() {
+      return this.records.splice(0);
+    }
+  }
+  const deliver = () => {
+    for (const watcher of watchers) {
+      const records = watcher.takeRecords();
+      if (records.length) watcher.callback(records, watcher);
+    }
+  };
+
   const document = {
+    walks: 0, // tree walkers made from the top, one for each walk of a page under half the overlay's budget
+    mutated(record) {
+      const scope = record.target.getRootNode();
+      for (const watcher of watchers) if (watcher.targets.includes(scope)) watcher.records.push(record);
+    },
     topLayer: [],
     activeElement: null,
     /** Focus a node, or none: retargeted to the host at each shadow root, as Chrome reports it. */
@@ -288,15 +403,74 @@ function makePage({ popovers = true, visual = null, width = 1000, height = 700 }
     elementFromPoint() {
       return hitTest(document, document);
     },
+    /**
+     * A TreeWalker showing elements, as the DOM standard moves one: in tree
+     * order under its root (the document, an element or a shadow root),
+     * shadow trees not entered, and the root itself shown only when it is
+     * an element.
+     */
+    createTreeWalker(root) {
+      if (root === document || root === document.documentElement) document.walks += 1;
+      const kids = (node) => (node === document ? [document.documentElement] : node.children);
+      const parentOf = (node) => (node === document.documentElement ? document : node.parentNode);
+      let current = root;
+      return {
+        get currentNode() {
+          return current;
+        },
+        set currentNode(node) {
+          current = node;
+        },
+        nextNode() {
+          let node = current;
+          if (kids(node).length) return (current = kids(node)[0]);
+          while (node !== root) {
+            const siblings = kids(parentOf(node));
+            const next = siblings[siblings.indexOf(node) + 1];
+            if (next) return (current = next);
+            node = parentOf(node);
+          }
+          return null;
+        },
+        previousNode() {
+          if (current === root) return null;
+          const parent = parentOf(current);
+          const siblings = kids(parent);
+          let node = siblings[siblings.indexOf(current) - 1];
+          if (node) {
+            while (kids(node).length) node = kids(node).at(-1);
+            return (current = node);
+          }
+          if (parent === root && !(parent instanceof StubElement)) return null;
+          return (current = parent);
+        },
+        lastChild() {
+          const list = kids(current);
+          return list.length ? (current = list.at(-1)) : null;
+        },
+      };
+    },
+    fullscreenElement: null,
+    fullscreenNode: null, // the element itself, not retargeted, see requestFullscreen()
+    exitFullscreen() {
+      const node = document.fullscreenNode;
+      if (!node) return;
+      for (let at = node; at.getRootNode() instanceof StubShadowRoot; at = at.getRootNode().host) at.getRootNode().fullscreenElement = null;
+      document.topLayer.splice(document.topLayer.indexOf(node), 1);
+      document.fullscreenNode = document.fullscreenElement = null;
+    },
   };
   document.documentElement = new StubElement('html', document);
   document.body = document.documentElement.appendChild(new StubElement('body', document));
 
   const sent = [];
   const frames = [];
+  let frame = 0; // frames run, the clock performance.now() reads
   const windowListeners = new Map();
+  const asked = []; // what chrome.dom.openOrClosedShadowRoot was asked about
   const window = {
     document,
+    NodeFilter: { SHOW_ELEMENT: 1 },
     innerWidth: width,
     innerHeight: height,
     devicePixelRatio: 2,
@@ -309,8 +483,18 @@ function makePage({ popovers = true, visual = null, width = 1000, height = 700 }
           return Promise.resolve();
         },
       },
+      dom: {
+        // As Chrome answers a content script: the root, open or closed, a
+        // user agent's own root never, and a throw for what is no element.
+        openOrClosedShadowRoot(node) {
+          if (!(node instanceof StubElement)) throw new Error('Error in invocation of dom.openOrClosedShadowRoot(HTMLElement element)');
+          asked.push(node);
+          return node.shadowRoot || node.closedRoot || null;
+        },
+      },
     },
     requestAnimationFrame: (callback) => frames.push(callback),
+    performance: { now: () => Math.floor((frame * 1000) / hz) }, // whole ms, so a second is a whole number of frames
     addEventListener(type, listener) {
       if (!windowListeners.has(type)) windowListeners.set(type, []);
       windowListeners.get(type).push(listener);
@@ -322,19 +506,26 @@ function makePage({ popovers = true, visual = null, width = 1000, height = 700 }
     },
   };
   window.window = window;
+  if (observers) window.MutationObserver = MutationObserver;
   const realm = vm.createContext(window);
 
   return {
     window,
     document,
     sent,
+    asked,
     /** Run a content script as executeScript does; returns its completion value. */
     inject(source, filename = 'content/overlay.js') {
+      deliver();
       return vm.runInContext(source, realm, { filename });
     },
     /** Run every animation frame queued so far, and the ones they queue, `n` deep. */
     frames(n = 2) {
-      for (let i = 0; i < n; i += 1) for (const callback of frames.splice(0)) callback();
+      for (let i = 0; i < n; i += 1) {
+        deliver();
+        frame += 1;
+        for (const callback of frames.splice(0)) callback();
+      }
     },
     key(key, init = {}) {
       let prevented = false;
@@ -351,12 +542,18 @@ function makePage({ popovers = true, visual = null, width = 1000, height = 700 }
       for (const listener of [...(windowListeners.get('keydown') || [])]) listener(event);
       return prevented;
     },
+    /** Whether a press on the page would reach the overlay: drawn, on top and not inert. */
+    reached() {
+      const host = this.host();
+      return Boolean(host) && rawHit(document) === host;
+    },
     /** The overlay's host, wherever it was put in the document, shadow roots included. */
     host() {
       return [...composed(document.documentElement)].find((node) => node.hasAttribute?.('data-cdr-overlay')) || null;
     },
     /** An event that reaches the window's own listeners, as focusin and a light DOM dialog's close do. */
     event(type, target, init = {}) {
+      deliver();
       for (const listener of [...(windowListeners.get(type) || [])]) listener({ type, target, ...init });
     },
   };
@@ -616,6 +813,67 @@ test('overlay: armed with no focus, the host goes into the modal on top, in a sh
   assert.equal(usable(page), true);
 });
 
+// F37, in 0.6.0 and at a0c9335 too: a closed shadow root answers null to
+// shadowRoot, so a modal dialog a component keeps in one was found neither
+// through the focus nor by the walk nor by hit testing. The host went on the
+// body, where the modal made it inert, and a drag reached the page, where it
+// could close the dialog. A content script can ask for a closed root with
+// chrome.dom.openOrClosedShadowRoot (seen in Chrome for Testing 156).
+test('overlay: a modal dialog in a closed shadow root gets the host, through the focus or with none', () => {
+  const closedModal = (page) => {
+    const element = page.document.body.appendChild(page.document.createElement('x-modal'));
+    const shadow = new StubShadowRoot(element, { mode: 'closed' });
+    return { element, shadow, dialog: shadow.appendChild(page.document.createElement('dialog')) };
+  };
+
+  // Through the focus, which Chrome reports as the host.
+  let page = makePage();
+  let closed = closedModal(page);
+  const button = closed.dialog.appendChild(page.document.createElement('button'));
+  closed.dialog.showModal(button);
+  assert.equal(closed.element.shadowRoot, null);
+  assert.equal(page.document.activeElement, closed.element);
+  page.inject(OVERLAY);
+  assert.equal(page.host().parentNode, closed.dialog, 'the host went outside the closed root\'s modal, where it is inert');
+  assert.equal(page.reached(), true);
+  assert.equal(drag(page)?.type, 'cdr:region-selected');
+
+  // With no focus, found by the walk.
+  page = makePage();
+  closed = closedModal(page);
+  closed.dialog.showModal();
+  page.document.focus(null);
+  closed.shadow.activeElement = null;
+  page.inject(OVERLAY);
+  assert.equal(page.host().parentNode, closed.dialog);
+  page.frames(32);
+  assert.equal(page.host().parentNode, closed.dialog);
+  assert.equal(page.reached(), true);
+
+  // On top of a light DOM modal opened before it, with no focus: found on
+  // top by hit testing through the closed root, and once it closes (which
+  // sends nothing from there), the host goes into the one left.
+  page = makePage();
+  const light = page.document.body.appendChild(page.document.createElement('dialog'));
+  light.showModal();
+  closed = closedModal(page);
+  closed.dialog.showModal();
+  page.document.focus(null);
+  closed.shadow.activeElement = null;
+  page.inject(OVERLAY);
+  assert.equal(page.host().parentNode, closed.dialog, 'the host went into the light DOM modal underneath');
+  assert.equal(page.reached(), true);
+  closed.dialog.close();
+  page.frames(1);
+  assert.equal(page.host().parentNode, light);
+  assert.equal(page.reached(), true);
+
+  // A custom element is asked about once an arm, however many frames go by.
+  const plain = page.document.body.appendChild(page.document.createElement('x-plain'));
+  page.frames(64);
+  assert.equal(page.asked.filter((node) => node === plain).length, 1);
+});
+
 // Low in the third verification (T2), the limit the second fix round stated:
 // a popover a component shows from its shadow root while armed sends its
 // toggle no further than that root, so the host was never raised over it,
@@ -642,6 +900,183 @@ test('overlay: a popover shown from a shadow root while armed is raised over wit
   toast.showPopover();
   page.frames(16);
   assert.equal(usable(page), true, 'the toast shown again stayed over the overlay');
+});
+
+// F51, in 0.6.0 and at a0c9335 too: the shadow roots were walked only when
+// the host was placed, so a component attached after that could show a
+// popover over the overlay, which a drag then went to, or a modal dialog
+// that took no focus the overlay heard, until the shortcut was pressed again.
+test('overlay: a shadow root attached after the arm is found within a few frames', () => {
+  const page = makePage();
+  page.inject(OVERLAY);
+  page.frames(3);
+  const element = page.document.body.appendChild(page.document.createElement('x-toast'));
+  const shadow = new StubShadowRoot(element);
+  const toast = shadow.appendChild(page.document.createElement('div'));
+  toast.setAttribute('popover', 'manual');
+  toast.showPopover();
+  assert.equal(page.reached(), false, 'the stub does not put a popover shown later above');
+  page.frames(16);
+  assert.equal(page.reached(), true, 'the popover of a component attached after the arm stayed over the overlay');
+  assert.equal(drag(page)?.type, 'cdr:region-selected');
+
+  // A modal dialog, with the focus dropped before the overlay heard it.
+  page.inject(OVERLAY);
+  page.frames(3);
+  const other = page.document.body.appendChild(page.document.createElement('x-dialog'));
+  const dialog = new StubShadowRoot(other).appendChild(page.document.createElement('dialog'));
+  dialog.showModal();
+  page.document.focus(null);
+  other.shadowRoot.activeElement = null;
+  assert.equal(page.reached(), false);
+  page.frames(16);
+  assert.equal(page.host().parentNode, dialog, 'the host stayed outside the modal of a component attached after the arm');
+  assert.equal(page.reached(), true);
+});
+
+/** `count` plain elements in the body, fifty to a section, as a long page has them. */
+function fill(page, count) {
+  let section = null;
+  for (let i = 0; i < count; i += 1) {
+    if (i % 50 === 0) section = page.document.body.appendChild(page.document.createElement('section'));
+    section.appendChild(page.document.createElement('div'));
+  }
+}
+
+/** A component whose shadow root holds a popover, as a toast stack does. */
+function toastIn(page, mode = 'open') {
+  const element = page.document.createElement('x-toast');
+  const toast = new StubShadowRoot(element, { mode }).appendChild(page.document.createElement('div'));
+  toast.setAttribute('popover', 'manual');
+  return { element, toast };
+}
+
+// V4-2 (F51): the walk went in document order within its budget, so on a
+// page larger than that it missed a component at the end of the body, where
+// toast stacks and dialog portals are put, which 0.6.0 (walking from the
+// end) found. Seen in Chrome for Testing 156 on 30 000 elements.
+test('overlay: on a page larger than the walk, a component at either end is found', () => {
+  for (const at of ['end', 'top']) {
+    const page = makePage();
+    const { element, toast } = toastIn(page);
+    if (at === 'top') page.document.body.appendChild(element);
+    fill(page, 30000);
+    if (at === 'end') page.document.body.appendChild(element);
+    page.inject(OVERLAY);
+    page.frames(5);
+    toast.showPopover();
+    assert.equal(page.reached(), false, 'the stub does not put a popover shown later above');
+    page.frames(16);
+    assert.equal(page.reached(), true, `the popover of a component at the ${at} of a large page stayed over the overlay`);
+  }
+});
+
+// V4-8 (F51): the walk ran every fifteenth frame whatever the page did, and
+// queried every shadow root at each look: on 6000 components with closed
+// roots 99 ms of the main thread every 3 s, 15 times 0.6.0 (Chrome for
+// Testing 156). It now walks again only once the page has changed, at most
+// once a second (60 frames here), and queries only the roots that held a
+// popover or a dialog when walked (see W4-2 below).
+test('overlay: the shadow roots are walked again only once the page changed, and at most once in 60 frames', () => {
+  const page = makePage();
+  const quiet = [];
+  for (let i = 0; i < 40; i += 1) {
+    const button = page.document.body.appendChild(page.document.createElement('x-button'));
+    const shadow = new StubShadowRoot(button, { mode: i % 2 ? 'closed' : 'open' });
+    shadow.appendChild(page.document.createElement('span'));
+    quiet.push(shadow);
+  }
+  page.inject(OVERLAY);
+  const armed = page.document.walks;
+  page.frames(300);
+  assert.equal(page.document.walks, armed, 'a page that did not change was walked again');
+  assert.deepEqual(quiet.map((shadow) => shadow.queried).filter(Boolean), [], 'a root with no popover or dialog was queried at the looks');
+
+  // A popover put into a closed root walked as holding none is seen at the
+  // next look: the change inside that root is heard.
+  const late = quiet[1].appendChild(page.document.createElement('div'));
+  late.setAttribute('popover', 'manual');
+  late.showPopover();
+  page.frames(16);
+  assert.equal(page.reached(), true, 'a popover put in a quiet root stayed over the overlay');
+  page.frames(120);
+
+  // A component added: walked at the next look, and its popover raised over.
+  const walked = page.document.walks;
+  const { element, toast } = toastIn(page, 'closed');
+  page.document.body.appendChild(element);
+  toast.showPopover();
+  page.frames(16);
+  assert.equal(page.document.walks, walked + 1);
+  assert.equal(page.reached(), true, 'the popover of a component added after the arm stayed over the overlay');
+
+  // A page that changes all the time is walked once in 60 frames at most.
+  const before = page.document.walks;
+  for (let i = 0; i < 300; i += 1) {
+    const span = page.document.body.appendChild(page.document.createElement('span'));
+    page.document.body.removeChild(span);
+    page.frames(1);
+  }
+  const walks = page.document.walks - before;
+  assert.ok(walks >= 4 && walks <= 5, `${walks} walks in 300 frames of changes`);
+});
+
+// Without MutationObserver nothing tells a change: every chance is taken.
+test('overlay: with no MutationObserver the walk runs once in 60 frames', () => {
+  const page = makePage({ observers: false });
+  page.inject(OVERLAY);
+  page.frames(3);
+  const { element, toast } = toastIn(page);
+  page.document.body.appendChild(element);
+  toast.showPopover();
+  page.frames(16);
+  assert.equal(page.reached(), true);
+  const before = page.document.walks;
+  page.frames(300);
+  assert.equal(page.document.walks - before, 5);
+});
+
+// W4-2 (F51): once the page changed at all, every shadow root known was
+// queried at each look until the next walk, so a page that changes all the
+// time cost ten times 0.6.0 on 6000 closed roots. And the walk was gated by
+// frames, so a 120 Hz display walked twice a second (Chrome for Testing 156).
+test('overlay: a page that changes all the time has only its popover and dialog roots queried, and is walked once a second at any frame rate', () => {
+  for (const hz of [60, 120, 240]) {
+    const page = makePage({ hz });
+    const quiet = [];
+    for (let i = 0; i < 40; i += 1) {
+      const button = page.document.body.appendChild(page.document.createElement('x-button'));
+      const shadow = new StubShadowRoot(button, { mode: i % 2 ? 'closed' : 'open' });
+      shadow.appendChild(page.document.createElement('span'));
+      quiet.push(shadow);
+    }
+    const { element, toast } = toastIn(page, 'closed');
+    page.document.body.appendChild(element);
+    page.inject(OVERLAY);
+    const before = page.document.walks;
+    const busy = (frames) => {
+      for (let i = 0; i < frames; i += 1) {
+        page.document.body.removeChild(page.document.body.appendChild(page.document.createElement('span')));
+        page.frames(1);
+      }
+    };
+    busy(hz * 5);
+    const walks = page.document.walks - before;
+    assert.ok(walks >= 4 && walks <= 5, `${walks} walks in 5 s of changes at ${hz} Hz`);
+    assert.deepEqual(quiet.map((shadow) => shadow.queried).filter(Boolean), [], `a root with no popover or dialog was queried at the looks at ${hz} Hz`);
+    toast.showPopover();
+    busy(hz / 4 + 1);
+    assert.equal(page.reached(), true, 'a popover in a root walked as holding one was not raised over at the next look');
+
+    // A popover put into a root walked as holding none is found by the
+    // next walk: a second after the last, at the next look.
+    busy(hz);
+    const late = quiet[1].appendChild(page.document.createElement('div'));
+    late.setAttribute('popover', 'manual');
+    late.showPopover();
+    busy(hz * 1.25 + 1);
+    assert.equal(page.reached(), true, `a popover put in a quiet root stayed over the overlay at ${hz} Hz`);
+  }
 });
 
 // Low in the second verification (R2), and in 0.5.0 too: a popover the page
@@ -741,6 +1176,308 @@ test('overlay: without a modal dialog the host is still shown in the top layer, 
   assert.equal(host.hasAttribute('popover'), false);
 });
 
+// V4-7 (F37): after a disarm the overlay still held the shadow roots of its
+// last walk, closed ones included, and through them their components, taken
+// out of the page or not, until the next arm. 0.6.0 held the open ones.
+test('overlay: a disarmed overlay holds none of the page\'s nodes', async () => {
+  v8.setFlagsFromString('--expose-gc');
+  const gc = vm.runInNewContext('gc');
+  // Built in a function of its own, so that no slot of this one keeps a node.
+  const { page, refs } = (() => {
+    const page = makePage();
+    const refs = [];
+    for (const mode of ['closed', 'open']) {
+      const element = page.document.body.appendChild(page.document.createElement(`x-${mode}`));
+      const shadow = new StubShadowRoot(element, { mode });
+      shadow.appendChild(page.document.createElement('dialog'));
+      const toast = shadow.appendChild(page.document.createElement('div'));
+      toast.setAttribute('popover', 'manual');
+      refs.push(new WeakRef(element));
+    }
+    page.inject(OVERLAY);
+    page.frames(20);
+    for (const element of [...page.document.body.children]) {
+      const shadow = element.shadowRoot || element.closedRoot;
+      shadow?.children.at(-1).showPopover(); // into the overlay's view of the top layer
+    }
+    page.frames(16);
+    page.key('Escape');
+    for (const element of [...page.document.body.children]) {
+      const shadow = element.shadowRoot || element.closedRoot;
+      shadow?.children.at(-1).hidePopover();
+      page.document.body.removeChild(element);
+    }
+    page.asked.length = 0; // the stub's own record of what chrome.dom was asked
+    return { page, refs };
+  })();
+  for (let i = 0; i < 3; i += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+    gc();
+  }
+  assert.equal(page.window.__cdrRegionOverlay.isActive(), false);
+  assert.deepEqual(
+    refs.map((ref) => ref.deref() === undefined),
+    [true, true],
+    'a component taken out of the page after the disarm was kept (closed, open)'
+  );
+});
+
+// F36, in 0.6.0 and at a0c9335 too: everything outside an element shown
+// fullscreen is inert, as outside a modal dialog. The host, on the body, was
+// drawn above the fullscreen element and every press went through it to the
+// page, armed before or after the element went fullscreen (seen in Chrome
+// for Testing 156, where a popover inside a fullscreen div was hit).
+test('overlay: an element shown fullscreen gets the host, armed before or after, and gives it back on leaving', () => {
+  // Armed after.
+  let page = makePage();
+  let player = page.document.body.appendChild(page.document.createElement('div'));
+  player.requestFullscreen();
+  page.inject(OVERLAY);
+  assert.equal(page.host().parentNode, player, 'the host stayed outside the fullscreen element, where it is inert');
+  assert.equal(page.reached(), true);
+  assert.equal(drag(page)?.type, 'cdr:region-selected');
+
+  // Armed before: fullscreenchange reaches the window.
+  page = makePage();
+  player = page.document.body.appendChild(page.document.createElement('div'));
+  page.inject(OVERLAY);
+  player.requestFullscreen();
+  assert.equal(page.reached(), false);
+  page.event('fullscreenchange', player);
+  assert.equal(page.host().parentNode, player);
+  assert.equal(page.reached(), true);
+
+  // Leaving fullscreen puts it back on the body.
+  page.document.exitFullscreen();
+  page.event('fullscreenchange', player);
+  assert.equal(page.host().parentNode, page.document.body);
+  assert.equal(usable(page), true);
+  assert.equal(page.reached(), true);
+
+  // One the listener does not hear is found within a few frames, also when
+  // the element is in a component's shadow root.
+  const component = page.document.body.appendChild(page.document.createElement('x-player'));
+  const stage = new StubShadowRoot(component).appendChild(page.document.createElement('div'));
+  stage.requestFullscreen();
+  page.frames(16);
+  assert.equal(page.host().parentNode, stage);
+  assert.equal(page.reached(), true);
+  assert.equal(drag(page)?.type, 'cdr:region-selected');
+});
+
+// Where F36 stays: a video, a canvas or a frame draws no children, and the
+// host got no box inside one in Chrome. The whole page shown fullscreen
+// holds the body, where the host was never inert.
+test('overlay: a fullscreen element that draws no children, or holds the body, leaves the host on the body', () => {
+  let page = makePage();
+  page.document.documentElement.requestFullscreen();
+  page.inject(OVERLAY);
+  assert.equal(page.host().parentNode, page.document.body);
+  assert.equal(page.reached(), true);
+
+  page = makePage();
+  const video = page.document.body.appendChild(page.document.createElement('video'));
+  video.drawsChildren = false;
+  let tries = 0;
+  video.appendChild = (node) => {
+    tries += 1;
+    return StubElement.prototype.appendChild.call(video, node);
+  };
+  video.requestFullscreen();
+  page.inject(OVERLAY);
+  assert.equal(page.host().parentNode, page.document.body, 'the host was left where it gets no box');
+  assert.equal(usable(page), true);
+  page.event('fullscreenchange', video);
+  page.frames(64);
+  assert.ok(tries <= 1, `the host was put into the video ${tries} times`);
+  assert.equal(page.host().parentNode, page.document.body);
+});
+
+// V4-1 (F36): the host was put into the fullscreen element before asking
+// whether it got a box there. Chrome loads an <object>'s document again when
+// a child is added to it, so arming over a fullscreen PDF or page in one
+// reloaded it on every arm (seen in Chrome for Testing 156).
+test('overlay: an element that draws no children, or whose children are its content, is never touched in fullscreen', () => {
+  const tags = ['object', 'embed', 'iframe', 'frame', 'video', 'audio', 'canvas', 'img', 'input', 'textarea', 'select'];
+  for (const tag of tags) {
+    const page = makePage();
+    const element = page.document.body.appendChild(page.document.createElement(tag));
+    let touched = 0;
+    element.appendChild = (node) => {
+      touched += 1;
+      return StubElement.prototype.appendChild.call(element, node);
+    };
+    element.requestFullscreen();
+    page.inject(OVERLAY);
+    page.event('fullscreenchange', element);
+    page.frames(64);
+    page.inject(OVERLAY); // the shortcut again
+    assert.equal(touched, 0, `the host was put into the fullscreen <${tag}>`);
+    assert.equal(page.host().parentNode, page.document.body);
+    assert.equal(usable(page), true);
+  }
+
+  // Nor into an element outside the HTML namespace.
+  const page = makePage();
+  const svg = page.document.body.appendChild(page.document.createElement('svg'));
+  svg.namespaceURI = 'http://www.w3.org/2000/svg';
+  svg.requestFullscreen();
+  page.inject(OVERLAY);
+  assert.equal(page.host().parentNode, page.document.body, 'the host was put into a fullscreen <svg>');
+});
+
+// V4-3 (F36): as the fullscreen element's last child, the host fired the
+// component's slotchange, with itself among the slotted, and a component
+// whose shadow tree has no default slot gave it no box at all.
+test('overlay: a fullscreen element with a shadow root, open or closed, gets the host in that root', () => {
+  for (const mode of ['open', 'closed']) {
+    const page = makePage();
+    const player = page.document.body.appendChild(page.document.createElement('x-player'));
+    const light = player.appendChild(page.document.createElement('span'));
+    const shadow = new StubShadowRoot(player, { mode });
+    light.assignedSlot = shadow.appendChild(page.document.createElement('slot'));
+    player.requestFullscreen();
+    page.inject(OVERLAY);
+    assert.equal(page.host().parentNode, shadow, `the host was not put in the ${mode} shadow root`);
+    assert.deepEqual(player.children, [light], 'the host went among the element\'s own children');
+    assert.equal(page.reached(), true);
+    const sent = drag(page);
+    assert.equal(sent?.type, 'cdr:region-selected');
+    assert.equal('moved' in sent, false);
+  }
+});
+
+// W4-3 (F36): in a fullscreen component's shadow root the component's own
+// rules reach the host and beat the overlay's :host rule, and one of
+// `* { pointer-events: none }` left the overlay drawn but passed through, the
+// drag going to the component (Chrome for Testing 156). The host's inline
+// style beats such rules. Not display, which would show a popover not shown.
+test('overlay: the host\'s own style keeps it hit and seen whatever a component\'s rules say, and leaves display alone', () => {
+  const page = makePage();
+  page.inject(OVERLAY);
+  const style = page.host().style.cssText.split(';');
+  for (const rule of ['pointer-events:auto', 'visibility:visible', 'opacity:1']) {
+    assert.ok(style.includes(rule), `the host's inline style has no ${rule}`);
+  }
+  assert.equal(style.some((rule) => rule.startsWith('display')), false);
+});
+
+// V4-3 (F36): without a shadow root the host is the fullscreen element's last
+// child, and a rule on :last-child (Tailwind's space-y) moved the slide while
+// armed. The screenshot is taken once the host is gone and the slide back, so
+// the crop was 20 px off what was selected, and nothing said so.
+test('overlay: a fullscreen element whose children the host moves says so with the capture', () => {
+  const page = makePage();
+  const slide = page.document.body.appendChild(page.document.createElement('div'));
+  const cards = [0, 1, 2].map(() => slide.appendChild(page.document.createElement('div')));
+  // Every card but the last has a margin below it, and the column is centred.
+  cards.forEach((card, i) => {
+    card.getBoundingClientRect = () => {
+      const lastIsCard = slide.children.at(-1) === cards.at(-1);
+      return { left: 400, top: 220 + i * 100 - (lastIsCard ? 0 : 20), width: 200, height: 60 };
+    };
+  });
+  slide.requestFullscreen();
+  page.inject(OVERLAY);
+  assert.equal(page.host().parentNode, slide);
+  assert.equal(drag(page)?.moved, true, 'the capture did not say the page moved under the selection');
+
+  // One whose children stay where they were says nothing.
+  const still = makePage();
+  const player = still.document.body.appendChild(still.document.createElement('div'));
+  player.appendChild(still.document.createElement('div'));
+  player.requestFullscreen();
+  still.inject(OVERLAY);
+  assert.equal(still.host().parentNode, player);
+  assert.equal('moved' in drag(still), false);
+});
+
+// V4-4 (F36): inside the fullscreen element, the overlay's moves, wheels and
+// touches reached that element's own handlers: a player's box showing its
+// controls on a move would show them under the selection. pointerenter and
+// mouseenter go to each element on their own and cannot be stopped.
+test('overlay: inside a fullscreen element, moves, wheels and touches over the overlay are kept from the page', () => {
+  const HOVER = ['mousemove', 'mouseover', 'mouseout', 'pointerover', 'pointerout', 'wheel', 'touchstart', 'touchmove', 'touchend', 'touchcancel'];
+  const heard = (page) => HOVER.filter((type) => !root(page.host()).dispatch(type, { clientX: 5, clientY: 5 }).stopped);
+
+  // On the body they reach the page, as they always did.
+  let page = makePage();
+  page.inject(OVERLAY);
+  assert.deepEqual(heard(page), HOVER);
+
+  page = makePage();
+  const player = page.document.body.appendChild(page.document.createElement('div'));
+  player.requestFullscreen();
+  page.inject(OVERLAY);
+  assert.equal(page.host().parentNode, player);
+  assert.deepEqual(heard(page), [], 'these reached the fullscreen element\'s own handlers');
+
+  // In a modal dialog inside it, too, where they would bubble on to it.
+  const dialog = player.appendChild(page.document.createElement('dialog'));
+  dialog.showModal();
+  page.event('focusin', dialog);
+  assert.equal(page.host().parentNode, dialog);
+  assert.deepEqual(heard(page), []);
+
+  // Once out of fullscreen, back to the page.
+  dialog.close();
+  page.document.exitFullscreen();
+  page.event('fullscreenchange', player);
+  assert.equal(page.host().parentNode, page.document.body);
+  assert.deepEqual(heard(page), HOVER);
+});
+
+// V4-5 (F36), in 0.6.0 too: the body put fullscreen after the arm went into the
+// top layer above the host, which stays in the body, and a drag reached the
+// page. Nothing raised the host: only a popover's toggle did.
+test('overlay: the body put fullscreen after the arm does not cover the overlay', () => {
+  let page = makePage();
+  page.inject(OVERLAY);
+  page.document.body.requestFullscreen();
+  assert.equal(page.reached(), false, 'the stub does not put the body above the host');
+  page.event('fullscreenchange', page.document.body);
+  assert.equal(page.host().parentNode, page.document.body);
+  assert.equal(page.reached(), true, 'the body put fullscreen stayed over the overlay');
+  assert.equal(drag(page)?.type, 'cdr:region-selected');
+
+  // One the listener does not hear is seen at the next look.
+  page = makePage();
+  page.inject(OVERLAY);
+  page.frames(3);
+  page.document.body.requestFullscreen();
+  page.frames(16);
+  assert.equal(page.reached(), true, 'the next look did not see the body go fullscreen');
+});
+
+// V4-6 (F36): a fullscreen element the host once got no box in (hidden for a
+// moment as it went fullscreen) stayed refused for the whole arm, and neither
+// the shortcut nor a new fullscreenchange tried it again.
+test('overlay: a fullscreen element the host got no box in is tried again on the shortcut, and when fullscreen changes', () => {
+  let page = makePage();
+  let player = page.document.body.appendChild(page.document.createElement('div'));
+  player.drawsChildren = false; // display: none as it went fullscreen
+  player.requestFullscreen();
+  page.inject(OVERLAY);
+  assert.equal(page.host().parentNode, page.document.body);
+  player.drawsChildren = true; // shown
+  page.inject(OVERLAY); // the shortcut again
+  assert.equal(page.host().parentNode, player, 'the shortcut left the host where it is inert');
+  assert.equal(page.reached(), true);
+
+  page = makePage();
+  player = page.document.body.appendChild(page.document.createElement('div'));
+  player.drawsChildren = false;
+  player.requestFullscreen();
+  page.inject(OVERLAY);
+  player.drawsChildren = true;
+  page.document.exitFullscreen();
+  page.event('fullscreenchange', player);
+  player.requestFullscreen();
+  page.event('fullscreenchange', player);
+  assert.equal(page.host().parentNode, player, 'going fullscreen again left the host where it is inert');
+  assert.equal(page.reached(), true);
+});
+
 test('overlay: a browser without popovers gets the host on the body as before', () => {
   const page = makePage({ popovers: false });
   page.inject(OVERLAY);
@@ -801,6 +1538,28 @@ test('overlay: a drag does not reach the page as clicks and pointer events', () 
     const page2 = r.dispatch(type, { clientX: 5, clientY: 5 });
     assert.equal(page2.stopped, true, `${type} bubbled out to the page`);
   }
+});
+
+// W4-1 (F36): inside a fullscreen element that sits in a link, a label or a
+// form's button, a press on the overlay shorter than MIN_SIZE was a click
+// only stopped at the overlay: the link was followed, the checkbox toggled,
+// the form submitted, and the page's own guard on the element never ran
+// (Chrome for Testing 156). A cancelled click activates none of them.
+test('overlay: a click on the overlay is cancelled, so a link, label or button around it does nothing', () => {
+  const page = makePage();
+  const card = page.document.body.appendChild(page.document.createElement('a'));
+  const player = card.appendChild(page.document.createElement('div'));
+  player.requestFullscreen();
+  page.inject(OVERLAY);
+  assert.equal(page.host().parentNode, player);
+  const r = root(page.host());
+  for (const [type, button] of [['click', 0], ['dblclick', 0], ['auxclick', 1]]) {
+    const heard = r.dispatch(type, { clientX: 5, clientY: 5, button });
+    assert.equal(heard.stopped, true, `${type} bubbled out to the page`);
+    assert.equal(heard.defaultPrevented, true, `${type} was left for the link around the fullscreen element to follow`);
+  }
+  // A drag still selects.
+  assert.equal(drag(page)?.type, 'cdr:region-selected');
 });
 
 // UX14, the region side. The only key either capture mode heard was Escape.
@@ -1597,6 +2356,18 @@ test('panel: a region captured with nothing else lit says nothing', async () => 
   await panel.flush();
   assert.equal(panel.internals.state.items.length, 1);
   assert.equal(panel.banner(), null);
+});
+
+// V4-3 (F36): the overlay, inside the element shown fullscreen, moved the
+// page's layout while armed, and the screenshot came after it moved back.
+test('panel: a region whose page moved under the overlay says the crop may be off', async () => {
+  const panel = await started();
+  panel.click('mode-region');
+  await panel.flush();
+  panel.broadcast({ type: 'cdr:region-selected', rect: RECT, viewport: VIEWPORT, moved: true }, fromTab);
+  await panel.flush();
+  assert.equal(panel.internals.state.items.length, 1);
+  assert.equal(panel.banner(), MOVED_UNDER_OVERLAY);
 });
 
 // F28. The shortcut armed Region again in the two frames before a drag's late

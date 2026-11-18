@@ -91,16 +91,32 @@ export function makeClock() {
  * listener runs, its world's window.event is the event. A message posted to
  * the window reaches every message listener a task later.
  *
- * The isolated world's chrome.runtime has no id, so every bridge injected is
- * one after a reload of the extension, and ask() goes to the last of them.
+ * The isolated world's chrome.runtime has no id unless `extensionId` is
+ * given, so every bridge injected is one after a reload of the extension, and
+ * ask() goes to the last of them. With an id the first bridge is the live
+ * one, and a second injection beside it adds nothing, as in Chrome; deleting
+ * the id is the extension being reloaded under it.
+ *
+ * `clock` (makeClock) runs both worlds' timers, for a test that times what
+ * the bridge does; without one they are node's. `dispatched` lists the type
+ * of every event dispatched on the window, in order, whichever world sent it.
  */
-export function makeWorlds({ url = 'https://example.test/', title = 'Example', readyState = 'loading' } = {}) {
+export function makeWorlds({
+  url = 'https://example.test/',
+  title = 'Example',
+  readyState = 'loading',
+  extensionId,
+  clock,
+} = {}) {
   const listeners = new Map(); // type -> [{ world, fn, capture }]
   const STATE = new WeakMap(); // an event, in either world -> what both worlds see of it
   const posted = [];
   const errors = []; // thrown by listeners, which Chrome reports and goes on
+  const dispatched = [];
   const worlds = {};
   let onMessage = null;
+  let onConnect = null;
+  const timers = clock ? { setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout } : { setTimeout, clearTimeout };
 
   const listFor = (type) => {
     if (!listeners.has(type)) listeners.set(type, []);
@@ -138,6 +154,7 @@ export function makeWorlds({ url = 'https://example.test/', title = 'Example', r
           world: name,
           custom: false,
           defaultPrevented: false,
+          trusted: false, // only an event fire() sends, as the browser's own
           stopped: false,
           dispatching: false,
           wrappers: new Map(),
@@ -153,6 +170,9 @@ export function makeWorlds({ url = 'https://example.test/', title = 'Example', r
       }
       get defaultPrevented() {
         return stateOf(this).defaultPrevented;
+      }
+      get isTrusted() {
+        return stateOf(this).trusted;
       }
       preventDefault() {
         const state = stateOf(this);
@@ -198,6 +218,7 @@ export function makeWorlds({ url = 'https://example.test/', title = 'Example', r
         const state = STATE.get(event);
         if (!state) throw new TypeError("Failed to execute 'dispatchEvent': parameter 1 is not of type 'Event'.");
         if (state.dispatching) throw new Error('InvalidStateError: the event is already being dispatched.');
+        dispatched.push(state.type);
         state.dispatching = true;
         state.stopped = false;
         const all = [...listFor(state.type)];
@@ -257,7 +278,7 @@ export function makeWorlds({ url = 'https://example.test/', title = 'Example', r
   for (const name of ['main', 'isolated']) {
     const win = { ...shared };
     const classes = classesFor(name);
-    Object.assign(win, classes, eventsFor(name, win), { setTimeout, clearTimeout });
+    Object.assign(win, classes, eventsFor(name, win), timers);
     if (name === 'main') {
       Object.assign(win, {
         console: { error() {}, warn() {}, log() {}, info() {}, debug() {} },
@@ -273,9 +294,16 @@ export function makeWorlds({ url = 'https://example.test/', title = 'Example', r
     } else {
       win.chrome = {
         runtime: {
+          ...(extensionId === undefined ? {} : { id: extensionId }),
+          lastError: undefined,
           onMessage: {
             addListener(listener) {
               onMessage = listener;
+            },
+          },
+          onConnect: {
+            addListener(listener) {
+              onConnect = listener;
             },
           },
         },
@@ -295,6 +323,46 @@ export function makeWorlds({ url = 'https://example.test/', title = 'Example', r
     document,
     posted,
     errors,
+    dispatched,
+    /** An event the browser fires on the window (pagehide, say), trusted in every world. */
+    fire(type) {
+      const event = new worlds.isolated.classes.Event(type);
+      STATE.get(event).trusted = true;
+      return worlds.isolated.window.dispatchEvent(event);
+    },
+    /**
+     * A port the panel opens to the last bridge that listened, as
+     * chrome.tabs.connect does. posted holds what the bridge posted on it
+     * (at, the clock's time of each, when there is a clock); close() is the
+     * panel going away or disconnecting; closed says whether the bridge
+     * shut it.
+     */
+    connect(name, sender = { id: extensionId, url: 'chrome-extension://test-extension/sidepanel/panel.html' }) {
+      if (!onConnect) throw new Error('no bridge ever listened for a port');
+      const onDisconnect = [];
+      const panel = { posted: [], at: [], closed: false, gone: false };
+      const port = {
+        name,
+        sender,
+        postMessage(message) {
+          if (panel.gone || panel.closed) throw new Error('Attempting to use a disconnected port object');
+          panel.posted.push(JSON.parse(JSON.stringify(message)));
+          panel.at.push(clock ? clock.now : null);
+        },
+        disconnect() {
+          panel.closed = true;
+        },
+        onDisconnect: { addListener: (fn) => onDisconnect.push(fn) },
+        onMessage: { addListener() {} },
+      };
+      onConnect(port);
+      panel.close = () => {
+        if (panel.gone || panel.closed) return;
+        panel.gone = true;
+        for (const fn of onDisconnect) fn(port);
+      };
+      return panel;
+    },
     /** Run code in a world: 'main' (the page's, and the collector's) or 'isolated'. */
     run(name, code, filename) {
       return vm.runInContext(code, worlds[name].realm, filename ? { filename } : undefined);

@@ -27,23 +27,44 @@
     let run = null; // this start()'s name, see the header
     let origin = { x: 0, y: 0 };
     let rect = { x: 0, y: 0, width: 0, height: 0 };
-    let mountedIn = null; // the modal dialog the host was put in, see mount()
+    let mountedIn = null; // the modal dialog or fullscreen element the host was put in, see mount()
+    let inFullscreen = false; // the host is inside the element shown fullscreen, see mount() and HOVER
+    let moved = false; // putting the host there moved the fullscreen element's children, see mount()
+    let barren = null; // a fullscreen element the host got no box in, see mount()
     let watching = false; // a frame is asked for, see watch()
     let watchedFrames = 0;
+    let walkedAt = -Infinity; // when watch() last walked for shadow roots, see watch()
     let remounts = 0; // this arm's, see remount()
-    let roots = []; // the page's open shadow roots, see collectRoots()
+    let roots = []; // the page's shadow roots, see collectRoots()
+    let layerRoots = []; // those of them that hold a popover or a dialog, see queryAll()
+    let changed = true; // the page's tree may have changed since the last walk, see watchChanges()
+    let observer = null; // see watchChanges()
+    let asked = new WeakMap(); // custom element -> its closed shadow root or null, this arm, see closedRootOf()
     let layerSeen = []; // the page's top layer when the host last went on top, see watch()
 
     const MIN_SIZE = 10; // px; smaller drags are treated as a misclick
     const KEY_STEP = 10; // px an arrow key moves or resizes by; Alt makes it 1
-    const MODAL_CHECK_FRAMES = 15; // how often watch() looks for a new modal or popover
+    const MODAL_CHECK_FRAMES = 15; // how often watch() looks for a new modal, popover or fullscreen element
+    const ROOT_WALK_MS = 1000; // the least time between two of watch()'s walks for shadow roots, at any frame rate
     const MAX_REMOUNTS = 100; // per arm, see remount()
-    const ROOT_SCAN = 20000; // elements walked looking for open shadow roots, see collectRoots()
+    const ROOT_SCAN = 20000; // elements walked looking for shadow roots, half from each end, see collectRoots()
+    const MOVED_CHECK = 64; // children of the fullscreen element measured, see childBoxes()
+    const HTML_NS = 'http://www.w3.org/1999/xhtml';
+    // Elements that draw no children of theirs, or whose children are what
+    // they show or load: the host never goes inside one (see fullscreenHolder()).
+    const NO_HOST = new Set([
+      'audio', 'canvas', 'embed', 'fencedframe', 'frame', 'iframe', 'img', 'input', 'object',
+      'optgroup', 'option', 'script', 'select', 'style', 'template', 'textarea', 'video',
+    ]);
 
     function build() {
       host = document.createElement('div');
       host.setAttribute('data-cdr-overlay', '');
-      // Max z-index, and reset anything the page's * selector might impose.
+      // Max z-index, and reset anything the page's * selector might impose,
+      // which in a fullscreen component's shadow root (see mount) beats the
+      // :host rule below: a `* { pointer-events: none }` there left the
+      // overlay drawn but passed through. Not display, which would override
+      // the rule that hides a popover not shown.
       // The last few undo a popover's own defaults (see mount): it is sized
       // to its content, centred, bordered and painted, and this host has to
       // cover the viewport and draw nothing itself.
@@ -51,6 +72,9 @@
         'position:fixed',
         'inset:0',
         'z-index:2147483647',
+        'pointer-events:auto',
+        'visibility:visible',
+        'opacity:1',
         'margin:0',
         'padding:0',
         'border:0',
@@ -136,30 +160,116 @@
      * everything already there. The top layer is laid out against the
      * viewport whatever its ancestors do, so a transform or filter on the
      * page's body (or on the dialog) no longer turns position: fixed into
-     * document coordinates that scroll away. Inside a fullscreen element it
-     * does not go: that can be a video, whose children are never drawn. So
-     * while an element of the page is fullscreen the overlay cannot be used:
-     * Chrome draws a popover that is not inside the fullscreen element under
-     * it, also one shown after it (seen in Chrome for Testing 156, armed
-     * before and after the element went fullscreen).
+     * document coordinates that scroll away.
+     *
+     * An element shown fullscreen does what a modal dialog does: everything
+     * outside it is inert. The host, shown after it, was drawn above it and
+     * passed over by every press, which went to the page (seen in Chrome for
+     * Testing 156). So with no modal dialog open the host goes inside the
+     * fullscreen element, unless that holds the body already, and into its
+     * own shadow root when it has one, open or closed: there the element's
+     * light children, its slots and its own `:last-child` rules never see
+     * the host, and a component with no slot draws it all the same. Without
+     * a shadow root the host is its last child, and a `:last-child` rule of
+     * the page's can move the other children while armed: that is measured
+     * (see childBoxes()), in a shadow root too, and said with the capture.
+     *
+     * An element that draws no children, or whose children are what it
+     * shows or loads (a video, a canvas, a frame, an <object>, whose
+     * document Chrome loads again when a child is added), is never touched:
+     * the host stays on the body, drawn above it and inert, and the overlay
+     * cannot be used until the page leaves fullscreen. Any other element
+     * the host gets no box in is found by asking (see drawn()), and is
+     * treated the same until it goes fullscreen again or the shortcut is
+     * pressed again.
      *
      * A browser without popovers, or a page that refuses one, gets the host
      * as it was before, on the body at the highest z-index.
      *
      * The page can move under it while it is armed: close or remove the
-     * dialog it went into, open another, put something else in the top
-     * layer after it, or take the host out of the document. watch() and the
-     * listeners in start() put it back. `previous` is the modal it was in,
-     * which it goes back into while that is still open and no other has
-     * focus (see topModal()).
+     * dialog it went into, open another, go fullscreen or leave it, put
+     * something else in the top layer after it, or take the host out of the
+     * document. watch() and the listeners in start() put it back.
+     * `previous` is the modal it was in, which it goes back into while that
+     * is still open and no other has focus (see topModal()).
      *
-     * A modal dialog in a closed shadow root cannot be found, nor can the
-     * host be put inside it, so the overlay is inert under one.
+     * A modal dialog in a closed shadow root is found and the host put
+     * inside it as in an open one, through the extension's own way into a
+     * closed root (see shadowOf()).
      */
     function mount(previous = null) {
       collectRoots();
-      mountedIn = topModal(previous);
-      const parent = mountedIn || document.body || document.documentElement;
+      const modal = topModal(previous);
+      const full = modal ? null : fullscreenHolder();
+      mountedIn = modal || full;
+      if (full) {
+        const own = shadowOf(full);
+        const before = childBoxes(own || full);
+        place(own || full);
+        if (!drawn()) {
+          barren = full;
+          unmount();
+          place(document.body || document.documentElement);
+        } else {
+          moved = movedSince(before);
+        }
+      } else {
+        place(modal || document.body || document.documentElement);
+      }
+      const holder = modal ? fullscreenHolder() : full;
+      inFullscreen = Boolean(holder) && host.isConnected && inside(holder, host);
+      layerSeen = topLayerNow();
+    }
+
+    /** Whether `node` is `ancestor` or drawn inside it, through slots and shadow roots. */
+    function inside(ancestor, node) {
+      for (let at = node, depth = 0; at && depth < 256; at = composedParent(at), depth += 1) {
+        if (at === ancestor) return true;
+      }
+      return false;
+    }
+
+    /**
+     * Where the last children of `parent` are drawn, to tell whether the
+     * host, put in after them, moved them: a rule on `:last-child` (as
+     * Tailwind's space-y writes) stops matching the child that was last,
+     * and a slide laid out around it shifts while armed. The screenshot is
+     * taken once the host is gone and the page has moved back, so the crop
+     * is then not what was selected, and the capture says so. Reading the
+     * boxes forces a layout, as drawn() does next.
+     */
+    function childBoxes(parent) {
+      const boxes = [];
+      try {
+        const children = parent.children;
+        for (let i = children.length - 1; i >= 0 && boxes.length < MOVED_CHECK; i -= 1) {
+          const node = children[i];
+          const box = node.getBoundingClientRect();
+          boxes.push([node, box.left, box.top, box.width, box.height]);
+        }
+      } catch {
+        /* nothing to compare: nothing said */
+      }
+      return boxes;
+    }
+
+    function movedSince(before) {
+      try {
+        return before.some(([node, left, top, width, height]) => {
+          const box = node.getBoundingClientRect();
+          return (
+            Math.abs(box.left - left) > 0.5 ||
+            Math.abs(box.top - top) > 0.5 ||
+            Math.abs(box.width - width) > 0.5 ||
+            Math.abs(box.height - height) > 0.5
+          );
+        });
+      } catch {
+        return false;
+      }
+    }
+
+    function place(parent) {
       if (typeof host.showPopover === 'function') {
         host.setAttribute('popover', 'manual');
         parent.appendChild(host);
@@ -173,37 +283,240 @@
         host.removeAttribute('popover');
         parent.appendChild(host);
       }
-      layerSeen = topLayerNow();
     }
 
     /**
-     * The page's open shadow roots, where a component keeps its own dialog
-     * or popover and where the document's queries do not look. Walked each
-     * time the host is put somewhere, within a budget, as collector-main.js
-     * bounds its own walk; a root attached after that is known from the
-     * next move on.
+     * Whether the host got a box where it was put. It forces a layout, so it
+     * is asked only of a fullscreen element (see mount()).
+     */
+    function drawn() {
+      try {
+        return host.getClientRects().length > 0;
+      } catch {
+        return true;
+      }
+    }
+
+    /**
+     * The page's shadow roots, where a component keeps its own dialog or
+     * popover and where the document's queries do not look. Walked each
+     * time the host is put somewhere, and by watch() when the page has
+     * changed since (see watchChanges()), at most once a second, so a root
+     * attached while armed is found at the next look or within a second.
+     *
+     * Within a budget, as collector-main.js bounds its own walk: half of it
+     * from the start of the page and half from its end, each shadow tree
+     * walked where its host stands, so a page larger than the budget still
+     * has both its first and its last elements walked. Toast stacks and
+     * dialog portals are put at the end of the body, and a component near
+     * the top is as likely as one at the end. A tree walker takes about
+     * 1.4 ms over 20 000 elements in Chrome for Testing 156, closed roots
+     * included, where reading each element's children for open roots took
+     * 8 ms.
      */
     function collectRoots() {
       const found = [];
-      const pending = document.documentElement ? [document.documentElement] : [];
-      let budget = ROOT_SCAN;
-      while (pending.length && budget > 0) {
-        const node = pending.pop();
+      const half = ROOT_SCAN / 2;
+      let budget = half;
+      let last = null; // the last element the walk from the start reached
+      let whole = false;
+      const ahead = [document.createTreeWalker(document, NodeFilter.SHOW_ELEMENT)];
+      while (budget > 0) {
+        const node = ahead[ahead.length - 1].nextNode();
+        if (!node) {
+          ahead.pop(); // a shadow tree walked: on to its host's own children
+          if (ahead.length) continue;
+          whole = true;
+          break;
+        }
         budget -= 1;
-        const shadow = node.shadowRoot;
+        last = node;
+        const shadow = node.shadowRoot || closedRootOf(node);
         if (shadow) {
           found.push(shadow);
-          for (const child of shadow.children || []) pending.push(child);
+          ahead.push(document.createTreeWalker(shadow, NodeFilter.SHOW_ELEMENT));
         }
-        for (const child of node.children || []) pending.push(child);
+      }
+      if (!whole) {
+        // From the end back, the same order reversed: a host's children,
+        // then its shadow tree, then the host, until the two walks meet.
+        budget += half;
+        const known = new Set(found);
+        const behind = [];
+        const back = [];
+        const enter = (scope) => {
+          const walker = document.createTreeWalker(scope, NodeFilter.SHOW_ELEMENT);
+          let node = null;
+          for (let deeper = walker.lastChild(); deeper; deeper = walker.lastChild()) node = deeper;
+          back.push({ walker, node, entered: false });
+        };
+        enter(document);
+        while (back.length && budget > 0) {
+          const at = back[back.length - 1];
+          if (!at.node) {
+            back.pop();
+            continue;
+          }
+          const shadow = at.entered ? null : at.node.shadowRoot || closedRootOf(at.node);
+          if (shadow) {
+            at.entered = true;
+            if (!known.has(shadow)) behind.push(shadow);
+            enter(shadow);
+            continue;
+          }
+          if (at.node === last) break;
+          budget -= 1;
+          at.node = at.walker.previousNode();
+          at.entered = false;
+        }
+        found.push(...behind.reverse());
       }
       roots = found;
+      layerRoots = found.filter(holdsLayer);
+      watchChanges();
     }
 
-    /** What matches `selector` in the document and in the open shadow roots known, the host aside. */
+    /**
+     * Whether a shadow root has anything that can go in the top layer. Only
+     * a popover can be shown as one and only a dialog opened as a modal, so
+     * a root with neither is not queried at each look until a walk finds
+     * one in it (see queryAll()). A component library's buttons and
+     * icons are most of a page's roots, and querying each cost about 0.6 µs
+     * a look.
+     */
+    function holdsLayer(shadow) {
+      try {
+        return Boolean(shadow.querySelector('[popover], dialog'));
+      } catch {
+        return true;
+      }
+    }
+
+    /**
+     * Notes any change to the page's tree, in the document and in each
+     * shadow root walked, or to an element's popover attribute, so that
+     * watch() walks again only when something has changed (a root walked as
+     * holding no popover may have been given one). A MutationObserver costs
+     * nothing until a change, and is let go at the first, so a page that
+     * changes all the time pays for one batch of records a walk. The host's
+     * own moves are not changes.
+     * Shadow roots attached to an element already in the page (a component
+     * defined after the arm) change no tree, and are found by the next walk
+     * something else brings, the next placement or the shortcut.
+     */
+    function watchChanges() {
+      changed = true;
+      try {
+        if (!observer) observer = new MutationObserver(onChange);
+        observer.disconnect();
+        const options = { childList: true, subtree: true, attributes: true, attributeFilter: ['popover'] };
+        observer.observe(document, options);
+        for (const shadow of roots) observer.observe(shadow, options);
+        changed = false;
+      } catch {
+        /* no observer here: watch() walks at every chance it has */
+      }
+    }
+
+    function onChange(records) {
+      if (!records.some(byPage)) return;
+      changed = true;
+      try {
+        observer.disconnect();
+      } catch {
+        /* it stays connected, and tells again */
+      }
+    }
+
+    function byPage(record) {
+      if (record.target === host) return false; // its popover attribute
+      if (record.type !== 'childList') return true;
+      for (const node of record.addedNodes) if (node !== host) return true;
+      for (const node of record.removedNodes) if (node !== host) return true;
+      return false;
+    }
+
+    /**
+     * The node's shadow root, open or closed. A closed one answers null to
+     * shadowRoot, and only an extension can ask for it, which takes about
+     * half a microsecond and throws for anything but an HTML element. A
+     * user agent's own root (a video's controls) is answered with null.
+     */
+    function shadowOf(node) {
+      if (node.shadowRoot) return node.shadowRoot;
+      try {
+        return chrome.dom.openOrClosedShadowRoot(node) || null;
+      } catch {
+        return null;
+      }
+    }
+
+    /**
+     * A custom element's closed shadow root, asked for once an arm. Asking
+     * every element of the walk took 15 ms over 20 000 elements, and a
+     * closed root is a component's. One attached after the element was
+     * asked is not seen until the next arm.
+     */
+    function closedRootOf(node) {
+      const name = node.localName; // none on the shadow root a walk starts at
+      if (!name || !name.includes('-')) return null;
+      if (!asked.has(node)) asked.set(node, shadowOf(node));
+      return asked.get(node);
+    }
+
+    /** The element shown fullscreen, the innermost through shadow roots, or null. */
+    function fullscreenNow() {
+      try {
+        let node = document.fullscreenElement || null;
+        for (let depth = 0; node && depth < 32; depth += 1) {
+          const shadow = shadowOf(node);
+          const inner = shadow && shadow.fullscreenElement;
+          if (!inner || inner === node) break;
+          node = inner;
+        }
+        return node;
+      } catch {
+        return null;
+      }
+    }
+
+    /**
+     * The fullscreen element, when the host has to go inside it: not when
+     * it holds the body (the whole page shown fullscreen), where the host
+     * is not inert, not one that draws no children or whose children are
+     * its content (NO_HOST, and anything outside the HTML namespace, such
+     * as an <svg>), decided before the page's tree is touched, and not one
+     * the host got no box in (see mount()).
+     */
+    function fullscreenHolder() {
+      const full = fullscreenNow();
+      if (!full || full === barren) return null;
+      if (full.namespaceURI !== HTML_NS || NO_HOST.has(full.localName)) return null;
+      try {
+        if (document.body && full.contains(document.body)) return null;
+      } catch {
+        /* a page in an odd state: try it */
+      }
+      return full;
+    }
+
+    /** Whether what the host was put in still keeps the rest of the page inert. */
+    function holds(node) {
+      return isModal(node) || node === fullscreenNow();
+    }
+
+    /**
+     * What matches `selector` in the document and in the shadow roots known,
+     * the host aside. Of the roots, only those that held a popover or a
+     * dialog when walked (see holdsLayer()). A root given its first one
+     * later is queried from the next walk on, which that change brings
+     * within a second and a look. Querying every root once anything had
+     * changed cost a page that changes all the time ten times 0.6.0 on 6000
+     * closed roots.
+     */
     function queryAll(selector) {
       const found = [];
-      for (const scope of [document, ...roots]) {
+      for (const scope of [document, ...layerRoots]) {
         try {
           if (scope !== document && !scope.host.isConnected) continue;
           for (const node of scope.querySelectorAll(selector)) if (node !== host) found.push(node);
@@ -216,10 +529,15 @@
 
     /**
      * What the page has in the top layer: its open popovers and modal
-     * dialogs, in the document and in the open shadow roots known.
+     * dialogs, in the document and in the shadow roots known, and the
+     * element shown fullscreen, so that one put fullscreen after the host
+     * went on top (the body, which the host stays in) is seen as new.
      */
     function topLayerNow() {
-      return queryAll(':popover-open, dialog:modal');
+      const layer = queryAll(':popover-open, dialog:modal');
+      const full = fullscreenNow();
+      if (full && !layer.includes(full)) layer.push(full);
+      return layer;
     }
 
     function unmount() {
@@ -231,12 +549,14 @@
       host.removeAttribute('popover');
       if (host.parentNode) host.parentNode.removeChild(host);
       mountedIn = null;
+      inFullscreen = false;
+      moved = false;
     }
 
     /**
      * The topmost open modal dialog, or null. Focus cannot leave it, so the
      * modal around the focused element is the one, found also inside a
-     * shadow root (picker.js does the same).
+     * shadow root, open (picker.js does the same) or closed.
      *
      * With no focus to go by, `keep`, the modal the host is in, stays the
      * answer for as long as it is open. A modal opened after it took focus
@@ -245,7 +565,7 @@
      *
      * Otherwise, as when the page dropped the focus before the arm (a
      * framework that re-rendered the focused field), the open modals are
-     * looked for in the document and in the open shadow roots known, and of
+     * looked for in the document and in the shadow roots known, and of
      * several the one on top is taken (see modalOnTop()). Going by document
      * order put the host into one underneath, or on the body under a shadow
      * root's modal, where it was inert. Where hit testing gives no answer,
@@ -266,7 +586,7 @@
      * on top: everything outside it is inert, hit testing passes over what
      * is inert, and its ::backdrop covers the rest of the viewport and is
      * hit as the dialog (checked in Chrome for Testing 156). So the middle
-     * of each is hit tested in turn, through open shadow roots, until a hit
+     * of each is hit tested in turn, through shadow roots, until a hit
      * is inside one of them, the innermost first. A hit on the host, which
      * is not inert where it is, says nothing.
      */
@@ -277,8 +597,9 @@
           const x = box.left + box.width / 2;
           const y = box.top + box.height / 2;
           let node = document.elementFromPoint(x, y);
-          for (let depth = 0; node && node.shadowRoot && depth < 32; depth += 1) {
-            const inner = node.shadowRoot.elementFromPoint(x, y);
+          for (let depth = 0; node && node !== host && depth < 32; depth += 1) {
+            const shadow = shadowOf(node);
+            const inner = shadow && shadow.elementFromPoint(x, y);
             if (!inner || inner === node) break;
             node = inner;
           }
@@ -296,7 +617,11 @@
     function modalOfFocus() {
       try {
         let node = document.activeElement;
-        while (node && node.shadowRoot && node.shadowRoot.activeElement) node = node.shadowRoot.activeElement;
+        for (let depth = 0; node && depth < 32; depth += 1) {
+          const shadow = shadowOf(node);
+          if (!shadow || !shadow.activeElement) break;
+          node = shadow.activeElement;
+        }
         for (let depth = 0; node && node.nodeType === 1 && depth < 256; depth += 1) {
           if (isModal(node)) return node;
           node = composedParent(node);
@@ -333,19 +658,19 @@
     /**
      * Whether the host is no longer where it can be seen and used: out of the
      * document, inside a dialog that has closed (where it is drawn at no
-     * size), or a popover the page has hidden. With `modals`, also when a
-     * modal dialog other than the one it is in is on top, which makes it
-     * inert.
+     * size) or an element no longer fullscreen, or a popover the page has
+     * hidden. With `modals`, also when a modal dialog other than the one it
+     * is in is on top, or an element went fullscreen, which makes it inert.
      */
     function misplaced(modals) {
       if (!host.isConnected) return true;
-      if (mountedIn && !isModal(mountedIn)) return true;
+      if (mountedIn && !holds(mountedIn)) return true;
       try {
         if (host.hasAttribute('popover') && !host.matches(':popover-open')) return true;
       } catch {
         /* no popovers here, and so none hidden */
       }
-      return Boolean(modals) && topModal(mountedIn) !== mountedIn;
+      return Boolean(modals) && (topModal(mountedIn) || fullscreenHolder()) !== mountedIn;
     }
 
     /**
@@ -395,8 +720,10 @@
      * and so is something the page put in the top layer since the host went
      * on top: a popover in a shadow root sends its toggle no further than
      * its root, and is drawn over the overlay until the host is raised
-     * (picker.js looks the same way). A tab in the background runs no
-     * frames, and draws nothing either.
+     * (picker.js looks the same way). The shadow roots are walked again at
+     * a look only when the page has changed, and at most once a second (see
+     * collectRoots()). A tab in the background runs no frames, and draws
+     * nothing either.
      */
     function watch() {
       // A reload of the extension leaves this script running with no id,
@@ -412,6 +739,10 @@
       }
       try {
         const look = watchedFrames % MODAL_CHECK_FRAMES === 0;
+        if (look && changed && watchedFrames > 0 && performance.now() - walkedAt >= ROOT_WALK_MS) {
+          walkedAt = performance.now();
+          collectRoots();
+        }
         if (misplaced(look)) remount();
         else if (look) {
           const layer = topLayerNow();
@@ -426,17 +757,23 @@
     }
 
     /**
-     * A dialog opened, closed or took focus, or a popover came or went:
-     * straight away rather than at the next look from watch(). Focus moves
-     * into a modal dialog as it opens, also inside a shadow root, and the
-     * focusin reaches the window from there; a dialog's toggle and close, and
-     * a popover's toggle, do from the light DOM only. A popover the page
-     * showed after the host is above it, so the host is raised over it.
+     * A dialog opened, closed or took focus, a popover came or went, or an
+     * element went fullscreen or left it: straight away rather than at the
+     * next look from watch(). Focus moves into a modal dialog as it opens,
+     * also inside a shadow root, and the focusin reaches the window from
+     * there, as fullscreenchange does; a dialog's toggle and close, and a
+     * popover's toggle, do from the light DOM only. A popover the page
+     * showed after the host is above it, so the host is raised over it, and
+     * so is an element put fullscreen that the host stays outside of, or in
+     * (the body). A fullscreen element the host got no box in is tried
+     * again once fullscreen changes: it may have been hidden only then.
      */
     function onTopLayer(event) {
       if (!active || (event && event.target === host)) return;
+      const fullscreen = Boolean(event) && event.type === 'fullscreenchange';
+      if (fullscreen) barren = null;
       if (misplaced(true)) remount();
-      else if (event && event.type === 'toggle' && event.newState === 'open') raise();
+      else if (fullscreen || (event && event.type === 'toggle' && event.newState === 'open')) raise();
     }
 
     /**
@@ -495,6 +832,31 @@
      */
     function swallow(event) {
       event.stopPropagation();
+    }
+
+    /**
+     * A click is cancelled as well. Inside the element shown fullscreen the
+     * host has the page's elements around it, and a link, a label, a button
+     * or a <summary> among them acted on a click only stopped here: the link
+     * was followed, the checkbox toggled, the form submitted, and the page's
+     * own handler that would have prevented it was never reached.
+     */
+    function cancel(event) {
+      event.stopPropagation();
+      event.preventDefault();
+    }
+
+    /**
+     * Kept from the page too while the host is inside the element shown
+     * fullscreen: a player's box that shows its controls on a mouse move,
+     * or changes the slide on a wheel, would otherwise do so under the
+     * selection, and the controls be in the screenshot. On the body or in
+     * a modal dialog these reach the page as they did before. pointerenter
+     * and mouseenter go to each element the pointer enters on its own, and
+     * cannot be stopped here.
+     */
+    function swallowInFullscreen(event) {
+      if (inFullscreen) event.stopPropagation();
     }
 
     function onPointerDown(event) {
@@ -675,6 +1037,9 @@
       // This run's name, read now: the shortcut can start a new run in the
       // two frames below, and the message is about this one.
       const finished = run;
+      // The page moved under the host (see childBoxes()), and moves back
+      // once it is gone, before the screenshot: the panel says so.
+      const shifted = moved;
 
       stop();
 
@@ -683,7 +1048,13 @@
       // frames guarantees a paint has actually landed.
       requestAnimationFrame(() => {
         requestAnimationFrame(() => {
-          send({ type: 'cdr:region-selected', rect: captured, viewport, run: finished });
+          send({
+            type: 'cdr:region-selected',
+            rect: captured,
+            viewport,
+            run: finished,
+            ...(shifted && { moved: true }),
+          });
         });
       });
     }
@@ -694,23 +1065,34 @@
       ['pointerup', onPointerUp],
       ['pointercancel', onPointerCancel],
       ['lostpointercapture', onPointerCancel],
-      ['click', swallow],
-      ['dblclick', swallow],
+      ['click', cancel],
+      ['dblclick', cancel],
+      ['auxclick', cancel],
       ['mousedown', swallow],
       ['mouseup', swallow],
       ['contextmenu', swallow],
     ];
 
+    // See swallowInFullscreen(). Passive: none of them is prevented.
+    const HOVER = [
+      'mousemove', 'mouseover', 'mouseout', 'pointerover', 'pointerout', 'wheel',
+      'touchstart', 'touchmove', 'touchend', 'touchcancel',
+    ];
+
     // See onTopLayer().
-    const TOP_LAYER = ['focusin', 'toggle', 'close'];
+    const TOP_LAYER = ['focusin', 'toggle', 'close', 'fullscreenchange'];
 
     function start() {
       if (active) {
         // Armed again while armed: the shortcut, most likely pressed because
         // the overlay is not to be seen. The arm stands, and the host goes
         // back where it can be, or above what covers it, past the bound on
-        // remount() too, since the user asked.
+        // remount() too, since the user asked. A fullscreen element the host
+        // got no box in is tried again.
         remounts = 0;
+        asked = new WeakMap();
+        barren = null;
+        collectRoots();
         if (misplaced(true)) remount();
         else raise();
         return run;
@@ -729,15 +1111,21 @@
       clear();
 
       remounts = 0;
+      asked = new WeakMap();
+      barren = null;
       mount();
 
       for (const [type, listener] of POINTER) root.addEventListener(type, listener);
+      for (const type of HOVER) root.addEventListener(type, swallowInFullscreen, { passive: true });
       window.addEventListener('keydown', onKeyDown, true);
       for (const type of TOP_LAYER) window.addEventListener(type, onTopLayer, true);
       // A page kept in the back/forward cache would come back with the overlay
       // live and nothing outside the page aware of it.
       window.addEventListener('pagehide', stop);
       watchedFrames = 0;
+      // The arm walked just now: the look at the first frame does not walk
+      // again, any look after it may.
+      walkedAt = -Infinity;
       if (!watching) {
         watching = true;
         requestAnimationFrame(watch);
@@ -751,10 +1139,23 @@
       dragging = false;
       keyed = false;
       for (const [type, listener] of POINTER) root.removeEventListener(type, listener);
+      for (const type of HOVER) root.removeEventListener(type, swallowInFullscreen);
       window.removeEventListener('keydown', onKeyDown, true);
       for (const type of TOP_LAYER) window.removeEventListener(type, onTopLayer, true);
       window.removeEventListener('pagehide', stop);
       unmount();
+      // A disarmed overlay holds none of the page's nodes: a component taken
+      // out of the page is let go with its shadow root.
+      try {
+        observer?.disconnect();
+      } catch {
+        /* nothing observed */
+      }
+      roots = [];
+      layerRoots = [];
+      layerSeen = [];
+      barren = null;
+      changed = true;
     }
 
     // isActive is how the worker asks whether the overlay survived a change of

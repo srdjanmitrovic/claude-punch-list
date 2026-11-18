@@ -644,6 +644,53 @@ test('UX13: a double click on the tooltip slower than 300 ms still selects a wor
   assert.equal(state.selectedId, state.items[1].id);
 });
 
+// F41. With the system's double click time slowed past half a second, a
+// double click on the tooltip as slow as that picked the row. The browser
+// counts a press as a second click only inside that time, so a double click
+// it counted anywhere in the panel says how long to wait.
+test('UX13: once the panel has seen a slow double click, one as slow on the tooltip selects a word and passes nothing on', async () => {
+  const { panel, tip, second, view } = await withTipOverRow();
+  const { state } = panel.internals;
+  const field = panel.element('description');
+  // A word selected in the field, 700 ms between the presses.
+  pressOn(panel, field, 1, { timeStamp: 10_000 });
+  pressOn(panel, field, 2, { timeStamp: 10_700 });
+  second.dispatch('mouseenter');
+  clickTip(panel, tip, 1, { timeStamp: 20_000 });
+  await panel.clock.advance(700);
+  assert.deepEqual(view.passed, [], 'the first click of a slow double click went on to the row');
+  assert.equal(tip.hidden, false);
+  clickTip(panel, tip, 2, { timeStamp: 20_700 });
+  await panel.clock.advance(2000);
+  assert.deepEqual(view.passed, []);
+  assert.equal(tip.hidden, false);
+  assert.equal(state.selectedId, state.items[1].id);
+
+  // A single click waits that long too, and no longer than a second however
+  // slow the double clicks seen.
+  pressOn(panel, field, 1, { timeStamp: 30_000 });
+  pressOn(panel, field, 2, { timeStamp: 34_000 });
+  clickTip(panel, tip, 1, { timeStamp: 40_000 });
+  await panel.clock.advance(990);
+  assert.deepEqual(view.passed, []);
+  await panel.clock.advance(20);
+  assert.deepEqual(view.passed, ['row']);
+});
+
+test('UX13: with no slow double click seen, a click on the tooltip still goes after half a second', async () => {
+  const { panel, tip, second, view } = await withTipOverRow();
+  const field = panel.element('description');
+  // A quick double click teaches nothing.
+  pressOn(panel, field, 1, { timeStamp: 10_000 });
+  pressOn(panel, field, 2, { timeStamp: 10_200 });
+  second.dispatch('mouseenter');
+  clickTip(panel, tip, 1, { timeStamp: 20_000 });
+  await panel.clock.advance(490);
+  assert.deepEqual(view.passed, []);
+  await panel.clock.advance(20);
+  assert.deepEqual(view.passed, ['row']);
+});
+
 // Low in verify T1: the tooltip went 300 ms after a click on it, and the
 // user's own press on the control it had covered, 450 ms after the first,
 // was stopped because the system counted it as the second click.
@@ -911,6 +958,119 @@ test('RO11: a change of tab clears the counts of the tab before until the new on
   panel.internals.resolveTab();
   await panel.flush();
   assert.equal(panel.element('count-network').textContent, '1');
+});
+
+// ----------------------------------------------------------------- F46 --
+// The chips were read on focus, when the panel was shown and when the pointer
+// came back, so they stayed a snapshot while the panel was left alone. Once a
+// read finds the tab's collector, the panel holds a port to its bridge, which
+// posts the two counts as they change (see test/bridge.test.mjs).
+
+test('F46: while the panel is open, the chips follow the tab in view through a port, and a read does not undo it', async () => {
+  const page = pageLog();
+  page.counts.errors = 1;
+  const panel = await started({ setup: page.setup });
+  assert.equal(panel.tabPorts.length, 1, 'no port to the tab once its collector answered');
+  const [port] = panel.tabPorts;
+  assert.deepEqual([port.tabId, port.name, port.frameId], [TAB, 'cdr:counts', 0]);
+  assert.equal(panel.element('count-console').textContent, '1');
+
+  // The page logs, and the chips follow with no read.
+  const reads = page.reads;
+  port.receive({ type: 'cdr:counts', console: 4, network: 2 });
+  assert.equal(panel.element('count-console').textContent, '4');
+  assert.equal(panel.element('count-network').textContent, '2');
+  assert.equal(panel.element('count-network').classList.contains('has'), true);
+  assert.equal(page.reads, reads, 'the page was read for it');
+
+  // A read whose reply comes after a newer post, with what it read before it.
+  await realmOf(panel).refreshContext();
+  assert.equal(panel.element('count-console').textContent, '4', 'the read put an older count back');
+  assert.equal(panel.tabPorts.length, 1, 'a second port to the same tab');
+
+  // What is not two counts is not shown.
+  for (const message of [
+    { type: 'cdr:counts', console: -1, network: 2 },
+    { type: 'cdr:counts', console: '9', network: 2 },
+    { type: 'cdr:counts', console: 1.5, network: 2 },
+    { type: 'cdr:other', console: 9, network: 9 },
+  ]) {
+    port.receive(message);
+  }
+  assert.equal(panel.element('count-console').textContent, '4');
+  port.receive({ type: 'cdr:counts', console: 0, network: 0 });
+  assert.equal(panel.element('count-console').textContent, '0');
+  assert.equal(panel.element('count-console').classList.contains('has'), false);
+});
+
+test('F46: the port goes with the tab in view, the page, and the panel being shown', async () => {
+  const page = pageLog();
+  const tab = { id: TAB, windowId: 1, url: 'https://example.test/', title: 'Example' };
+  const panel = await started({
+    tab,
+    setup: (chrome) => {
+      page.setup(chrome);
+      chrome.tabs.query = async () => [tab];
+    },
+  });
+  const first = panel.tabPorts[0];
+
+  // Another tab: the old port closes and says nothing more, a new one opens.
+  Object.assign(tab, { id: TAB + 1, url: 'https://other.test/' });
+  await panel.internals.resolveTab();
+  await panel.flush();
+  assert.equal(first.disconnected, true, 'the port to the tab before stayed open');
+  first.receive({ type: 'cdr:counts', console: 9, network: 9 });
+  assert.equal(panel.element('count-console').textContent, '0');
+  const second = panel.tabPorts.at(-1);
+  assert.equal(second.tabId, TAB + 1);
+  second.receive({ type: 'cdr:counts', console: 3, network: 1 });
+  assert.equal(panel.element('count-console').textContent, '3');
+
+  // Hidden, it holds no port; shown again, it opens one at once.
+  panel.document.visibilityState = 'hidden';
+  panel.documentEvent('visibilitychange');
+  assert.equal(second.disconnected, true, 'a hidden panel kept its port');
+  const opened = panel.tabPorts.length;
+  panel.document.visibilityState = 'visible';
+  panel.documentEvent('visibilitychange');
+  await panel.flush();
+  assert.equal(panel.tabPorts.length, opened + 1);
+  const third = panel.tabPorts.at(-1);
+  assert.equal(third.tabId, TAB + 1);
+
+  // The page went (a reload, a navigation): the next read connects again,
+  // and until a post comes, the read's counts are the chips'.
+  third.close();
+  page.counts.errors = 2;
+  await realmOf(panel).refreshContext();
+  assert.equal(panel.element('count-console').textContent, '2');
+  assert.equal(panel.tabPorts.at(-1).tabId, TAB + 1);
+  assert.equal(panel.tabPorts.at(-1).disconnected, false);
+
+  // A new page in the same tab: the port is the old page's, and closes.
+  const fourth = panel.tabPorts.at(-1);
+  tab.url = 'https://other.test/next';
+  await panel.internals.resolveTab();
+  await panel.flush();
+  assert.equal(fourth.disconnected, true, 'the port of the page before stayed open');
+  assert.equal(panel.tabPorts.at(-1).disconnected, false);
+});
+
+test('F46: no port to a tab where no collector answered, or one the panel may not read', async () => {
+  // Nothing answers the read (the default page): nothing to follow.
+  const panel = await started();
+  assert.deepEqual(panel.tabPorts, []);
+
+  // A tab that turns out to be restricted closes the port it had.
+  const page = pageLog();
+  const other = await started({ setup: page.setup });
+  const [port] = other.tabPorts;
+  other.internals.state.restriction = 'Chrome does not allow extensions on this page.';
+  await realmOf(other).refreshContext();
+  assert.equal(port.disconnected, true);
+  port.receive({ type: 'cdr:counts', console: 5, network: 5 });
+  assert.equal(other.element('count-console').textContent, '–');
 });
 
 // ------------------------------------------------------- late start note --

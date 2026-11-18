@@ -175,6 +175,9 @@ export function loadPanel({
   worker = defaultWorker,
   tab = { id: 7, windowId: 1, url: 'https://example.test/', title: 'Example' },
   setup = () => {},
+  // The panel's fetch, in place before panel.js runs, so what it asks for
+  // at load is seen too.
+  fetch = async () => ({ blob: async () => ({}) }),
 } = {}) {
   const clock = makeClock();
   const elements = new Map();
@@ -183,9 +186,11 @@ export function loadPanel({
   const sent = [];
   const shots = { next: [] };
   const ports = []; // every port the panel opened, with what it posted
-
+  const tabPorts = []; // every port the panel opened to a tab (chrome.tabs.connect)
 
   const document = {
+    // An open side panel is visible from its first line.
+    visibilityState: 'visible',
     activeElement: null,
     body: new FakeElement('body'),
     getElementById(id) {
@@ -248,6 +253,37 @@ export function loadPanel({
       sendMessage: async () => {
         throw new Error('Could not establish connection. Receiving end does not exist.');
       },
+      // A port to a tab's content scripts, which stays open and silent until
+      // the test says otherwise: receive() is a message from the page's end,
+      // close() that end going away. disconnected says the panel closed it.
+      connect: (tabId, { name, frameId } = {}) => {
+        const onMessage = [];
+        const onDisconnect = [];
+        const port = {
+          tabId,
+          name,
+          frameId,
+          disconnected: false,
+          postMessage() {
+            if (port.disconnected) throw new Error('Attempting to use a disconnected port object');
+          },
+          disconnect() {
+            port.disconnected = true;
+          },
+          onMessage: { addListener: (fn) => onMessage.push(fn) },
+          onDisconnect: { addListener: (fn) => onDisconnect.push(fn) },
+          receive(message) {
+            if (!port.disconnected) for (const fn of onMessage) fn(JSON.parse(JSON.stringify(message)), port);
+          },
+          close() {
+            if (port.disconnected) return;
+            port.disconnected = true;
+            for (const fn of onDisconnect) fn(port);
+          },
+        };
+        tabPorts.push(port);
+        return port;
+      },
       // A test can queue what the next calls do: a function that throws for
       // the quota, or one that runs something during the capture.
       captureVisibleTab: async () => {
@@ -290,7 +326,7 @@ export function loadPanel({
     crypto: globalThis.crypto,
     Image: FakeImage,
     URL: PanelURL,
-    fetch: async () => ({ blob: async () => ({}) }),
+    fetch,
     setTimeout: clock.setTimeout,
     clearTimeout: clock.clearTimeout,
   });
@@ -313,8 +349,10 @@ export function loadPanel({
     sent,
     shots,
     ports,
+    tabPorts,
     internals,
     element,
+    document,
     /** Which mode buttons are lit. */
     lit() {
       return ['region', 'element'].filter((mode) => element(`mode-${mode}`).classList.contains('armed'));

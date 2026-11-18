@@ -9,12 +9,26 @@
  * would clip away. Around that it keeps to what was
  * observed in Chrome 156, as recorded in the picker's own comments: a frame
  * takes every pointer event over it and the page hears none, unless an
- * adopted stylesheet of its tree gives it pointer-events:none, a disabled
+ * adopted stylesheet of its tree gives it pointer-events:none and no
+ * important rule of the page's beats that (one inline, one in a cascade
+ * layer, or one with more ids), a disabled
  * control gets pointer events and no mouse events, :hover moves at a frame,
  * everything outside an open modal dialog is inert, and a closed shadow root
- * hides what is inside it from the page. Window listeners run in the order
- * they were added, and an event no capture listener stopped is what "the
- * page" saw.
+ * hides what is inside it from the page, though a content script can ask for
+ * it (chrome.dom). Window listeners run in the order they were added, and an
+ * event no capture listener stopped is what "the page" saw. A mouse's
+ * pointerdown, a finger's pointerup and the mousedown its tap makes, and
+ * every keydown but Escape's give the page transient user activation before
+ * any listener runs, and showPicker() spends it. A popover's toggle comes a
+ * task after it is shown or hidden, and goes no further than its own tree. A
+ * page rule that gives a frame a discrete transition (transition: all .3s
+ * allow-discrete) holds the old pointer-events for half its time, and the
+ * page hears its transition events, unless a sheet of its tree holds
+ * discrete transitions back (transition-behavior: normal). Styles are worked
+ * out again at each frame, at a hit test and at a read of any style, the
+ * whole page at once; a change the page makes waits for that, and a fade it
+ * asks for (opacity, display allow-discrete) begins there, cut short by a
+ * sheet that holds discrete transitions back at that moment.
  *
  * Time is a fake clock the test moves, a frame at a time.
  */
@@ -26,6 +40,7 @@ import vm from 'node:vm';
 import { flush, makeClock } from './support/worker-realm.mjs';
 
 const SOURCE = readFileSync(new URL('../content/picker.js', import.meta.url), 'utf8');
+const GATE = new URL('../content/press-gate.js', import.meta.url);
 
 const VOID = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'source', 'track', 'wbr']);
 const FRAME_TAGS = new Set(['iframe', 'frame', 'embed', 'object']);
@@ -51,6 +66,9 @@ class FakeNode {
   }
   get firstElementChild() {
     return this.children[0] || null;
+  }
+  get lastElementChild() {
+    return this.children.at(-1) || null;
   }
   siblingAt(offset) {
     const list = this.parentNode ? this.parentNode.children : [];
@@ -179,7 +197,13 @@ class FakeElement extends FakeNode {
     this.attached = null;
     this.modal = false;
     this.popoverOpen = false;
-    this.pageWins = false; // a page rule of its own (inline !important) keeps a frame's pointer-events
+    this.pageWins = false; // a page rule of its own (inline !important, or !important in a cascade layer) keeps a frame's pointer-events
+    this.pageIds = 0; // a page rule of its own, !important outside a layer, naming the frame with this many ids (#player is 1)
+    this.discreteMs = 0; // a page rule gives the frame transition: all <discreteMs>ms allow-discrete
+    this.peState = null; // what a running transition of pointer-events holds
+    this.fadeMs = 0; // a page rule gives the frame transition: opacity <fadeMs>ms, display <fadeMs>ms allow-discrete
+    this.fading = null; // where a fade the page asked for is (see FakeDocument.fade())
+    this.defined = true; // false: a custom element not upgraded yet
     this.z = 0; // a z-index: it and what is inside it paint above every lower one
     this.pageNone = false; // a page rule of its own gives it pointer-events:none
     this.captures = new Set(); // pointer ids captured to this element
@@ -197,6 +221,11 @@ class FakeElement extends FakeNode {
   /** As Chrome answers it: display, then opacity 0 up the tree, then the visibility it inherits. */
   checkVisibility(options = {}) {
     if (!this.ownerDocument.rendered(this)) return false;
+    // In skipped content (content-visibility: auto off screen): drawn, but
+    // not laid out, and only contentVisibilityAuto says so. Asked without
+    // it, Chrome lays the content out to answer (checked in Chrome 156).
+    if (options.contentVisibilityAuto && this.skippedContent) return false;
+    if (this.skippedContent) this.layouts = (this.layouts || 0) + 1;
     const looks = [];
     for (let at = this; at && at.nodeType === 1; at = up(at)) looks.push(at.look ? at.look(false) : {});
     if ((options.opacityProperty || options.checkOpacity) && looks.some((look) => look.opacity === '0')) return false;
@@ -231,7 +260,7 @@ class FakeElement extends FakeNode {
   }
   removeAttribute(name) {
     this.attrs.delete(name);
-    if (name === 'popover') this.ownerDocument.hidePopover(this);
+    if (name === 'popover') this.ownerDocument.hidePopover(this, false);
   }
   hasAttribute(name) {
     return this.attrs.has(name);
@@ -259,6 +288,12 @@ class FakeElement extends FakeNode {
   hidePopover() {
     this.ownerDocument.hidePopover(this);
   }
+  /** As Chrome answers it for an input in no document: spends the activation, or throws without one. */
+  showPicker() {
+    if (this.localName !== 'input') throw new TypeError('showPicker is not a function');
+    if (!this.ownerDocument.activationActive()) throw new Error('NotAllowedError');
+    this.ownerDocument.activation.until = 0;
+  }
   get outerHTML() {
     const attributes = [...this.attrs]
       .map(([name, value]) => ` ${name}="${String(value).replace(/&/g, '&amp;').replace(/"/g, '&quot;')}"`)
@@ -278,6 +313,13 @@ class FakeShadowRoot extends FakeNode {
     this.mode = mode;
     this.activeElement = null;
     this.adoptedStyleSheets = [];
+    this.listeners = [];
+  }
+  addEventListener(type, fn, capture) {
+    if (!this.listeners.some((entry) => entry.type === type && entry.fn === fn)) this.listeners.push({ type, fn, capture: Boolean(capture) });
+  }
+  removeEventListener(type, fn) {
+    this.listeners = this.listeners.filter((entry) => !(entry.type === type && entry.fn === fn));
   }
   // Only the picker sets this, to its own template: its divs, by class.
   set innerHTML(html) {
@@ -297,6 +339,32 @@ class FakeShadowRoot extends FakeNode {
 
 /** The ancestor across shadow boundaries: a root's host, else the parent. */
 const up = (node) => (node.nodeType === 11 ? node.host : node.parentNode);
+
+/** Whether a node is inside a closed shadow root, at any depth. */
+function insideClosed(node) {
+  for (let root = node.getRootNode(); root.nodeType === 11; root = root.host.getRootNode()) {
+    if (root.mode === 'closed') return true;
+  }
+  return false;
+}
+
+/** A selector list split at its top level commas: iframe:is(*, #a) stays one selector. */
+function splitTop(list) {
+  const out = [];
+  let depth = 0;
+  let current = '';
+  for (const c of list) {
+    if (c === '(') depth += 1;
+    if (c === ')') depth -= 1;
+    if (c === ',' && depth === 0) {
+      out.push(current);
+      current = '';
+    } else {
+      current += c;
+    }
+  }
+  return [...out, current];
+}
 
 function parseCompound(text) {
   const out = { tag: null, id: null, classes: [], pseudos: [] };
@@ -390,28 +458,174 @@ class FakeDocument extends FakeNode {
     this.pointer = null;
     this.sticky = false;
     this.adoptedStyleSheets = [];
+    // Transient user activation: until when it lasts, and whether the page
+    // ever had it (sticky activation, never withdrawn).
+    this.activation = { until: 0, sticky: false };
+    // Set by the realm: the clock, a timer on it, a popover's toggle, and a
+    // transition event the page hears.
+    this.now = () => 0;
+    this.later = () => {};
+    this.onToggle = () => {};
+    this.onTransition = () => {};
+  }
+  /**
+   * A restyle, as Chrome makes one at each frame, at a hit test and at a
+   * read of any style: every frame's pointer-events is worked out again,
+   * and a transition of it started or not (see transitioned()), and a fade
+   * the page asked for since the last one begins (see fade()). The page's
+   * own changes wait for it; the picker's sheets are read as they stand
+   * when it comes.
+   */
+  restyle() {
+    const visit = (node) => {
+      for (const child of [...(node.attached ? node.attached.childNodes : []), ...node.childNodes]) {
+        if (child.nodeType !== 1) continue;
+        if (FRAME_TAGS.has(child.localName)) {
+          this.pointerEventsOf(child);
+          this.startFade(child);
+        }
+        visit(child);
+      }
+    };
+    visit(this);
+  }
+  /** Whether a sheet of an element's own tree holds its discrete transitions back. */
+  holdsTransitions(element) {
+    return this.sheetRules(element).some((rule) => /transition-behavior:\s*normal/.test(rule.body));
+  }
+  /** A frame's computed transition properties, as its page rule and the sheets give them. */
+  transitionOf(element) {
+    const held = this.holdsTransitions(element);
+    if (element.discreteMs) {
+      return {
+        'transition-property': 'all',
+        'transition-behavior': held ? 'normal' : 'allow-discrete',
+        'transition-duration': `${element.discreteMs / 1000}s`,
+        'transition-delay': '0s',
+      };
+    }
+    if (element.fadeMs) {
+      const time = `${element.fadeMs / 1000}s`;
+      return {
+        'transition-property': 'opacity, display',
+        'transition-behavior': held ? 'normal' : 'normal, allow-discrete',
+        'transition-duration': `${time}, ${time}`,
+        'transition-delay': '0s',
+      };
+    }
+    return { 'transition-property': 'all', 'transition-behavior': 'normal', 'transition-duration': '0s', 'transition-delay': '0s' };
+  }
+  /**
+   * The page fades a frame out: a class that gives it opacity 0 and
+   * display none, under its own transition of both (fadeMs), and it takes
+   * the frame away on the transitionend of its opacity. That begins at the
+   * next restyle. If a sheet of the frame's tree holds discrete transitions
+   * back then, display is none at once, the opacity of a frame not drawn
+   * does not run, no event comes, and the frame stays where it is. One that
+   * has begun runs to its end whatever the sheets hold later. All seen in
+   * Chrome 156.
+   */
+  fade(element) {
+    element.fading = 'asked';
+  }
+  startFade(element) {
+    if (element.fading !== 'asked') return;
+    if (this.holdsTransitions(element)) {
+      element.fading = 'cut';
+      element.style.display = 'none';
+      return;
+    }
+    element.fading = 'running';
+    for (const type of ['transitionrun', 'transitionstart']) {
+      this.onTransition(`${type}:display`);
+      this.onTransition(`${type}:opacity`);
+    }
+    this.later(() => {
+      element.style.display = 'none';
+      this.onTransition('transitionend:display');
+      this.onTransition('transitionend:opacity');
+      element.remove();
+      this.onTransition('removed');
+    }, element.fadeMs);
+  }
+  activationActive() {
+    return this.activation.until > this.now();
+  }
+  /**
+   * The rules of the sheets an element's own tree adopted (the document, or
+   * the shadow root it is in) that name its tag, and are not disabled: the
+   * declarations, and how many ids the selector that names it holds, which
+   * is its specificity as far as the page rules modelled here go.
+   */
+  sheetRules(element) {
+    const found = [];
+    for (const sheet of element.getRootNode().adoptedStyleSheets || []) {
+      if (sheet.disabled) continue;
+      for (const [, list, body] of String(sheet.rules).matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+        for (const selector of splitTop(list)) {
+          if (/^[a-z]+/.exec(selector.trim())?.[0] === element.localName) found.push({ ids: (selector.match(/#/g) || []).length, body });
+        }
+      }
+    }
+    return found;
   }
   /**
    * What pointer-events an element computes to: none when a page rule of its
-   * own says so; for a frame, none when a sheet its own tree adopted (the
-   * document, or the shadow root it is in) names its tag with
-   * pointer-events:none and is not disabled, unless the page's own rule
-   * wins. Otherwise it inherits from its parent, the fallback content of an
-   * <object> included.
+   * own says so; for a frame, none when a sheet of its own tree names its tag
+   * with pointer-events:none !important, unless the page's own rule wins: an
+   * inline !important or an !important in one of the page's cascade layers
+   * always does (pageWins), and an !important outside a layer does when its
+   * selector holds more ids than the sheet's (pageIds; at a tie the sheet,
+   * adopted after the page's own, wins, and classes are not modelled). All as
+   * seen in Chrome 156. Otherwise it inherits from its parent, the fallback
+   * content of an <object> included. A frame's value can be held back by a
+   * transition (see transitioned()).
    */
   pointerEventsOf(element) {
     if (element.pageNone) return 'none';
-    const sheets = (element.getRootNode().adoptedStyleSheets || []).filter((sheet) => !sheet.disabled);
-    if (FRAME_TAGS.has(element.localName)) {
-      if (element.pageWins) return 'auto';
-      const names = (sheet) =>
-        /pointer-events:\s*none/.test(sheet.rules) &&
-        sheet.rules.split('{')[0].split(',').map((part) => part.trim()).includes(element.localName);
-      if (sheets.some(names)) return 'none';
+    const inherited = () => {
+      const parent = element.parentNode;
+      return parent && parent.nodeType === 1 ? this.pointerEventsOf(parent) : 'auto';
+    };
+    if (!FRAME_TAGS.has(element.localName)) return inherited();
+    const rules = this.sheetRules(element);
+    const page = element.pageWins || element.pageIds ? 'auto' : inherited();
+    const passed =
+      !element.pageWins && rules.some((rule) => /pointer-events:\s*none/.test(rule.body) && rule.ids >= element.pageIds);
+    return this.transitioned(element, passed ? 'none' : page, page, this.holdsTransitions(element));
+  }
+  /**
+   * A page rule's discrete transition of a frame's pointer-events: when the
+   * value changes, the old one is kept for half the transition, and the page
+   * hears transitionrun and transitionstart, and transitioncancel for one
+   * replaced while running. transition-behavior: normal in a sheet that wins
+   * starts none (all seen in Chrome 156).
+   */
+  transitioned(element, value, page, steady) {
+    if (!element.discreteMs) return value;
+    // A frame not drawn (display: none) has no style to change from, and
+    // one in skipped content is passed by when the page is restyled: either
+    // takes a new value at once, with no transition, and is drawn with the
+    // value it last took (Chrome 156). A read of the frame's own style in
+    // skipped content lays it out, which the tests count instead
+    // (transitionReads, layouts).
+    if (!this.rendered(element) || element.skippedContent) {
+      element.peState = { from: value, to: value, start: -Infinity };
+      return value;
     }
-    const parent = element.parentNode;
-    if (!parent || parent.nodeType !== 1) return 'auto';
-    return this.pointerEventsOf(parent);
+    const now = this.now();
+    const state = (element.peState ||= { from: page, to: page, start: -Infinity });
+    const shown = now - state.start < element.discreteMs / 2 ? state.from : state.to;
+    if (value === state.to) return shown;
+    if (now - state.start < element.discreteMs) this.onTransition('transitioncancel:pointer-events');
+    if (steady || shown === value) {
+      element.peState = { from: value, to: value, start: -Infinity };
+      return value;
+    }
+    element.peState = { from: shown, to: value, start: now };
+    this.onTransition('transitionrun:pointer-events');
+    this.onTransition('transitionstart:pointer-events');
+    return shown;
   }
   get activeElement() {
     return this.focused && this.focused.isConnected ? this.focused : this.body;
@@ -542,6 +756,7 @@ class FakeDocument extends FakeNode {
     return true;
   }
   hits(x, y, scope) {
+    this.restyle();
     const raw = this.paintOrder()
       .filter((element) => this.hittable(element) && inside(this.rectOf(element), x, y) && this.drawnAt(element, x, y))
       .reverse();
@@ -578,26 +793,34 @@ class FakeDocument extends FakeNode {
   isHovered(element) {
     return this.hoverChain.has(element);
   }
+  // Each sends a toggle a task later, as Chrome does from 132 for a dialog
+  // too; one taken out of the document, or out of the top layer by losing
+  // its popover attribute, sends none.
   showModal(dialog) {
     dialog.setAttribute('open', '');
     dialog.modal = true;
     this.topLayer = this.topLayer.filter((element) => element !== dialog).concat(dialog);
     this.focused = dialog;
+    this.onToggle(dialog);
   }
   showPopover(element) {
+    const was = element.popoverOpen;
     this.topLayer = this.topLayer.filter((node) => node !== element).concat(element);
     element.popoverOpen = true;
+    if (!was) this.onToggle(element);
   }
-  hidePopover(element) {
+  hidePopover(element, events = true) {
+    const was = element.popoverOpen;
     this.topLayer = this.topLayer.filter((node) => node !== element);
     element.popoverOpen = false;
+    if (was && events) this.onToggle(element);
   }
   // A removed node stops matching :hover at once. What stays in the page
   // keeps whatever it matched until the next frame looks again: nothing
   // gains the hover the node had.
   detached(node) {
     for (const element of [...this.topLayer]) {
-      if (this.composedContains(node, element)) this.hidePopover(element);
+      if (this.composedContains(node, element)) this.hidePopover(element, false);
     }
     for (const element of [...this.hoverChain]) {
       if (this.composedContains(node, element)) this.hoverChain.delete(element);
@@ -622,6 +845,8 @@ class FakeDocument extends FakeNode {
         if (!element.popoverOpen) return false;
       } else if (name === 'root') {
         if (element !== this.documentElement) return false;
+      } else if (name === 'defined') {
+        if (element.localName.includes('-') && !element.defined) return false;
       } else if (name === 'host') {
         return false;
       } else {
@@ -668,8 +893,24 @@ function makeRealm() {
   const frames = new Map();
   let nextFrame = 1;
   const sent = [];
-  // What reached the page's own listeners, and what went into a frame.
-  const page = { seen: [], framed: [], events: [] };
+  // What reached the page's own listeners, what went into a frame, and the
+  // transition events the page heard.
+  const page = { seen: [], framed: [], events: [], transitions: [] };
+  doc.now = () => clock.now;
+  doc.later = (fn, ms) => clock.setTimeout(fn, ms);
+  doc.onTransition = (type) => page.transitions.push(type);
+  // A toggle goes no further than the tree its popover is in: from the
+  // document it reaches window's listeners, from a shadow root only that
+  // root's (seen in Chrome 156).
+  doc.onToggle = (element) =>
+    clock.setTimeout(() => {
+      const root = element.getRootNode();
+      if (root === doc) deliver('toggle', { target: element, deep: element, quiet: true });
+      else if (root.nodeType === 11) {
+        const event = { type: 'toggle', target: element, isTrusted: true, composedPath: () => [element] };
+        for (const entry of root.listeners.filter((one) => one.type === 'toggle')) entry.fn.call(root, event);
+      }
+    }, 0);
 
   const window = {
     document: doc,
@@ -690,24 +931,34 @@ function makeRealm() {
       frames.delete(id);
     },
     getComputedStyle(element) {
+      doc.restyle();
       const values = {
         visibility: 'visible',
         'overflow-x': 'visible',
         'overflow-y': 'visible',
         'clip-path': 'none',
+        ...doc.transitionOf(element),
         ...(element.look ? element.look(doc.isHovered(element)) : {}),
       };
       return {
-        getPropertyValue: (name) => (name === 'pointer-events' ? doc.pointerEventsOf(element) : values[name] || ''),
+        getPropertyValue: (name) => {
+          // A read of a transition property lays out skipped content.
+          if (name.startsWith('transition')) element.transitionReads = (element.transitionReads || 0) + 1;
+          return name === 'pointer-events' ? doc.pointerEventsOf(element) : values[name] || '';
+        },
       };
     },
     // A constructable stylesheet: its text, and whether it is disabled,
-    // with a count of the times that was set, each a restyle of the page.
+    // with a count of the times it was switched while in use (disabled set,
+    // or its rules replaced by other rules), each a restyle of the page.
+    // Putting rules in an empty sheet, or emptying it, is not counted.
+    // Every text it was given is kept in `texts`.
     CSSStyleSheet: class {
       constructor() {
         this.off = false;
         this.toggles = 0;
         this.rules = '';
+        this.texts = [];
       }
       get disabled() {
         return this.off;
@@ -717,8 +968,20 @@ function makeRealm() {
         this.off = Boolean(value);
       }
       replaceSync(text) {
+        if (this.rules && String(text)) this.toggles += 1;
         this.rules = String(text);
+        this.texts.push(this.rules);
       }
+    },
+    navigator: {
+      userActivation: {
+        get isActive() {
+          return doc.activationActive();
+        },
+        get hasBeenActive() {
+          return doc.activation.sticky;
+        },
+      },
     },
     addEventListener(type, fn, options) {
       const capture = typeof options === 'object' ? Boolean(options?.capture) : Boolean(options);
@@ -735,6 +998,16 @@ function makeRealm() {
       setImmediate(() => deliver('message', { data }));
     },
     chrome: {
+      // A content script's way to a closed shadow root. Chrome refuses
+      // anything but an HTML element.
+      dom: {
+        openOrClosedShadowRoot(element) {
+          if (!(element instanceof FakeElement) || element.namespaceURI !== 'http://www.w3.org/1999/xhtml') {
+            throw new TypeError('Error in invocation of dom.openOrClosedShadowRoot(HTMLElement element): ');
+          }
+          return element.attached || null;
+        },
+      },
       runtime: {
         // A reload of the extension takes this away from the old scripts.
         id: 'ext',
@@ -752,7 +1025,18 @@ function makeRealm() {
   // object above, and the picker checks event.source against it.
   const self = vm.runInContext('this', context);
 
+  // The events Chrome gives transient user activation with, before any
+  // listener runs (seen in Chrome 156). A press that goes into a frame gives
+  // it to the page too; that is not modelled.
+  const activates = (type, init) =>
+    init.isTrusted !== false &&
+    ((type === 'pointerdown' && (init.pointerType ?? 'mouse') === 'mouse') ||
+      (type === 'pointerup' && (init.pointerType ?? 'mouse') !== 'mouse') ||
+      (type === 'mousedown' && init.fromTap) ||
+      (type === 'keydown' && init.key !== 'Escape'));
+
   function deliver(type, init = {}) {
+    if (activates(type, init)) doc.activation = { until: clock.now + 5000, sticky: true };
     let stopped = false;
     let immediate = false;
     const event = {
@@ -778,10 +1062,12 @@ function makeRealm() {
         stopped = true;
         immediate = true;
       },
+      // As a listener on window sees it: what is inside a closed shadow
+      // root is left out, so the path starts at its host.
       composedPath() {
         const path = [];
-        for (let at = init.deep || init.target; at; at = at.nodeType === 11 ? (at.mode === 'open' ? at.host : null) : at.parentNode) {
-          if (at.nodeType !== 11) path.push(at);
+        for (let at = init.deep || init.target; at; at = up(at)) {
+          if (at.nodeType !== 11 && !insideClosed(at)) path.push(at);
         }
         return path;
       },
@@ -793,7 +1079,7 @@ function makeRealm() {
       }
     };
     run(true);
-    if (!stopped && type !== 'message') {
+    if (!stopped && type !== 'message' && !init.quiet) {
       page.seen.push(type);
       page.events.push(event);
     }
@@ -888,7 +1174,7 @@ function makeRealm() {
       doc.updateHover();
       doc.sticky = true;
       pointerEvent('mousemove', x, y);
-      const down = pointerEvent('mousedown', x, y);
+      const down = pointerEvent('mousedown', x, y, { fromTap: true });
       const hit = doc.rawTop(x, y);
       if (down && !down.defaultPrevented && hit && /^(button|input|select|textarea|a)$/.test(hit.localName)) doc.focused = hit;
       pointerEvent('mouseup', x, y);
@@ -898,7 +1184,7 @@ function makeRealm() {
       deliver('keydown', { key, ...extra });
       deliver('keyup', { key, ...extra });
     },
-    /** Run `count` frames: timers due by then, the hover, then the frame callbacks. */
+    /** Run `count` frames: timers due by then, the hover, the frame callbacks, then a restyle. */
     async frame(count = 1) {
       for (let index = 0; index < count; index += 1) {
         await clock.advance(16);
@@ -906,6 +1192,7 @@ function makeRealm() {
         const due = [...frames.values()];
         frames.clear();
         for (const callback of due) callback(clock.now);
+        doc.restyle();
         await flush();
       }
     },
@@ -1255,11 +1542,6 @@ test('picker events: an element inside an open shadow root is picked, and the se
   save.rect = [120, 120, 80, 30];
   root.appendChild(save);
   save.appendChild(new FakeText(realm.doc, 'Save'));
-  const sealed = realm.add('x-sealed', {}, [100, 300, 300, 100]);
-  const closed = sealed.attachShadow({ mode: 'closed' });
-  const hidden = new FakeElement(realm.doc, 'button', {});
-  hidden.rect = [120, 320, 80, 30];
-  closed.appendChild(hidden);
   realm.arm();
   await realm.frame();
   realm.click(150, 130);
@@ -1267,12 +1549,126 @@ test('picker events: an element inside an open shadow root is picked, and the se
   const [pick] = realm.picks();
   assert.equal(pick.element.html, '<button class="save">Save</button>');
   assert.equal(pick.element.selector, 'x-card >>> button.save');
-  // A closed root is as far as the page lets anyone look.
+});
+
+// F37 (the picker's part): a closed shadow root stopped the pick at its
+// host, and a frame inside one kept the pointer, so a press went into the
+// frame and nothing was picked. A content script can ask Chrome for the
+// root (chrome.dom.openOrClosedShadowRoot, checked in Chrome 156).
+test('picker events: an element and a frame inside a closed shadow root are reached as in an open one', async () => {
+  const realm = makeRealm();
+  const sealed = realm.add('x-sealed', {}, [100, 100, 300, 100]);
+  const closed = sealed.attachShadow({ mode: 'closed' });
+  const hidden = new FakeElement(realm.doc, 'button', { class: 'pay' });
+  hidden.rect = [120, 120, 80, 30];
+  closed.appendChild(hidden);
+  hidden.appendChild(new FakeText(realm.doc, 'Pay'));
+  const player = realm.add('x-player', {}, [100, 300, 400, 200]);
+  const inner = player.attachShadow({ mode: 'closed' });
+  const frame = new FakeElement(realm.doc, 'iframe', { class: 'video', src: '/v' });
+  frame.rect = [100, 300, 400, 200];
+  inner.appendChild(frame);
   realm.arm();
   await realm.frame();
-  realm.click(150, 330);
+  realm.click(150, 130);
   await realm.idle(1500);
-  assert.equal(realm.picks()[1].element.html, '<x-sealed></x-sealed>');
+  assert.equal(realm.picks()[0]?.element.html, '<button class="pay">Pay</button>');
+  assert.equal(realm.picks()[0].element.selector, 'x-sealed >>> button.pay');
+  realm.arm();
+  await realm.frame();
+  realm.click(300, 400);
+  await realm.idle(1500);
+  assert.deepEqual(realm.page.framed, [], 'events went into the frame');
+  assert.equal(realm.picks()[1]?.element.selector, 'x-player >>> iframe.video');
+  assert.equal(inner.adoptedStyleSheets.length, 0, 'the closed root\'s own sheets were not left as they were');
+  // A div's closed root attached after the arm: found as the pointer
+  // reaches the frame in it, by the frame's mouseover, seen from window as
+  // the host's, before the press.
+  const late = realm.add('div', { id: 'late' }, [600, 100, 300, 300]);
+  realm.arm();
+  await realm.frame();
+  const lateRoot = late.attachShadow({ mode: 'closed' });
+  const lateFrame = new FakeElement(realm.doc, 'iframe', { id: 'chat', src: '/chat' });
+  lateFrame.rect = [600, 100, 300, 300];
+  lateRoot.appendChild(lateFrame);
+  realm.move(700, 200);
+  realm.deliver('mouseover', { target: late, deep: lateFrame, clientX: 700, clientY: 200 });
+  realm.press(700, 200);
+  realm.release(700, 200);
+  await realm.idle(1500);
+  assert.deepEqual(pressesFramed(realm), [], 'the press went into the frame');
+  assert.equal(realm.picks()[2]?.element.selector, '#late >>> #chat');
+});
+
+// V3-picker-3 (F37): a pick inside a closed shadow root put its marker on the
+// element, where the page's own world, which reads the component and the
+// handlers, cannot look. The pick lost the component and handlers 0.6.0
+// reported through the host, and the component's own observers saw the
+// marker come and go inside its root. The marker goes on the host of the
+// outermost closed root now, and what is read there is said to be the
+// host's.
+test('picker events: a pick inside a closed shadow root is inspected through its host, and nothing is written inside the root', async () => {
+  const realm = makeRealm();
+  const doc = realm.doc;
+  const sealed = realm.add('x-sealed', { id: 'sealed', class: 'card wide extra' }, [100, 100, 300, 100]);
+  const wrap = sealed.attachShadow({ mode: 'closed' }).appendChild(new FakeElement(doc, 'div', { class: 'wrap' }));
+  const pay = wrap.appendChild(new FakeElement(doc, 'button', { class: 'pay' }));
+  pay.rect = [120, 120, 80, 30];
+  // A closed root holding an open one: x-outer (closed) > section > x-inner (open) > span.
+  const outer = realm.add('x-outer', {}, [100, 300, 300, 100]);
+  const section = outer.attachShadow({ mode: 'closed' }).appendChild(new FakeElement(doc, 'section'));
+  const deep = section.appendChild(new FakeElement(doc, 'x-inner')).attachShadow({ mode: 'open' })
+    .appendChild(new FakeElement(doc, 'span', { class: 'deep' }));
+  deep.rect = [120, 320, 100, 40];
+  // An element in no closed root, for the reply as it always was.
+  realm.add('div', { id: 'plain' }, [600, 100, 200, 100]);
+  const marked = [];
+  const inspected = [];
+  // The page's world finds a mark in the document and in open shadow roots,
+  // and no further, as collector-main's findMarked does.
+  const find = (scope, marker) => {
+    for (const child of scope.children) {
+      if (child.getAttribute('data-cdr-pick') === marker) return child;
+      const found = (child.shadowRoot && find(child.shadowRoot, marker)) || find(child, marker);
+      if (found) return found;
+    }
+    return null;
+  };
+  realm.collector((data) => {
+    if (data.action !== 'inspect') return null;
+    const node = find(doc, data.marker);
+    inspected.push(node);
+    if (!node) return null;
+    return { component: { framework: 'react', names: ['PaymentCard'], hops: 0 }, handlers: { list: ['onClick=ƒ pay'], hops: 0 } };
+  });
+  const setAttribute = FakeElement.prototype.setAttribute;
+  FakeElement.prototype.setAttribute = function (name, value) {
+    if (name === 'data-cdr-pick') marked.push(this);
+    return setAttribute.call(this, name, value);
+  };
+  try {
+    for (const [x, y] of [[150, 130], [150, 330], [650, 150]]) {
+      realm.arm();
+      await realm.frame();
+      realm.click(x, y);
+      await realm.idle(1500);
+    }
+  } finally {
+    FakeElement.prototype.setAttribute = setAttribute;
+  }
+  const [first, second, third] = realm.picks().map((pick) => pick.element);
+  assert.equal(first.selector, '#sealed >>> button.pay');
+  assert.deepEqual(first.component, { framework: 'react', names: ['PaymentCard'], hops: 2, closedHost: 'x-sealed.card.wide' });
+  assert.deepEqual(first.handlers, { list: ['onClick=ƒ pay'], hops: 2, label: 'x-sealed.card.wide' });
+  assert.equal(second.selector, 'x-outer >>> x-inner >>> span.deep');
+  assert.deepEqual(second.component, { framework: 'react', names: ['PaymentCard'], hops: 3, closedHost: 'x-outer' });
+  assert.deepEqual(second.handlers, { list: ['onClick=ƒ pay'], hops: 3, label: 'x-outer' });
+  // Elsewhere the reply is taken as it comes.
+  assert.deepEqual(third.component, { framework: 'react', names: ['PaymentCard'], hops: 0 });
+  assert.deepEqual(third.handlers, { list: ['onClick=ƒ pay'], hops: 0 });
+  assert.deepEqual(inspected.map((node) => node?.localName ?? null), ['x-sealed', 'x-outer', 'div']);
+  assert.deepEqual(marked.filter(insideClosed), [], 'a mark was set inside a closed shadow root');
+  assert.equal([sealed, outer, pay, deep].some((node) => node.hasAttribute('data-cdr-pick')), false, 'a mark was left behind');
 });
 
 test('picker events: an element is read in the hover state it was picked in, and the payload says so', async () => {
@@ -2137,11 +2533,14 @@ test('picker events: of two overlapping frames the one on top is picked', async 
   realm.arm();
   await realm.frame();
   const sheet = realm.doc.adoptedStyleSheets[0];
+  // Away from both, no restyle.
+  const before = sheet.toggles;
+  realm.move(600, 50);
+  await realm.frame();
+  assert.equal(sheet.toggles, before);
   realm.picker.stop();
   await realm.idle(100);
-  // Away from both, no restyle.
   assert.equal((await pickOver(realm, 600, 50)).picked, undefined);
-  assert.equal(sheet.toggles, 0);
   assert.equal((await pickOver(realm, 420, 320)).picked, '#f2');
   const { shown, picked, framed } = await pickOver(realm, 300, 250);
   assert.deepEqual({ shown, picked, framed }, { shown: 'iframe#f1', picked: '#f1', framed: [] });
@@ -2261,4 +2660,518 @@ test('picker events: a frame over content that is not its ancestor, and an objec
   const { picked, framed } = await pickOver(realm, 200, 100);
   assert.equal(picked, '#f1');
   assert.deepEqual(framed, []);
+});
+
+// F38: a pick gave the page transient user activation, which Chrome grants
+// as it dispatches the press, before any listener runs: for five seconds
+// the page could open a popup or start playback as if it had been clicked.
+test('picker events: a pick by click, tap or key leaves the page no transient activation, and Escape spends none', async () => {
+  const realm = makeRealm();
+  const activation = realm.window.navigator.userActivation;
+  realm.add('button', { id: 'go' }, [100, 100, 120, 40]);
+  realm.add('a', { id: 'more', href: '#more' }, [100, 300, 120, 40]);
+  realm.arm();
+  await realm.frame();
+  realm.click(150, 120);
+  assert.equal(activation.isActive, false, 'the press that picked left the page activated');
+  await realm.frame();
+  // The second press of a double click, in the tail.
+  realm.press(150, 120);
+  realm.release(150, 120);
+  assert.equal(activation.isActive, false, 'a press in the tail left the page activated');
+  await realm.idle(1500);
+  assert.equal(realm.picks().length, 1);
+  realm.arm();
+  await realm.frame();
+  realm.tap(150, 320);
+  assert.equal(activation.isActive, false, 'the tap that picked left the page activated');
+  await realm.idle(1500);
+  assert.equal(realm.picks().length, 2);
+  realm.arm();
+  await realm.frame();
+  realm.deliver('focusin', { target: realm.doc.getRootNode().body.children[1] });
+  realm.key('ArrowUp');
+  assert.equal(activation.isActive, false, 'a key the picker answered left the page activated');
+  realm.key('Enter');
+  assert.equal(activation.isActive, false, 'the Enter that picked left the page activated');
+  await realm.idle(1500);
+  assert.equal(realm.picks().length, 3);
+  // The page's own: a click once the pick is over, and a key the picker
+  // leaves to the page. Escape grants nothing, and spends none of it.
+  realm.click(150, 120);
+  assert.equal(activation.isActive, true);
+  realm.arm();
+  await realm.frame();
+  realm.key('Escape');
+  assert.equal(realm.picker.isActive(), false);
+  assert.equal(activation.isActive, true, 'Escape spent an activation the page had of its own');
+  realm.arm();
+  await realm.frame();
+  realm.key('Tab');
+  assert.equal(activation.isActive, true);
+  // Sticky activation stays for the life of the page; nothing withdraws it.
+  assert.equal(activation.hasBeenActive, true);
+});
+
+// F39: a page's capture listener on window added before the arm ran before
+// the picker's, which is added only when it arms, and heard every press
+// that picked, every press of a double click, and the keys. The press gate,
+// declared at document_start, adds its listeners before the page's.
+test('picker events: a page listener on window added before the arm hears nothing of a pick, with the press gate there first', async () => {
+  const realm = makeRealm();
+  realm.inject(readFileSync(GATE, 'utf8'), 'content/press-gate.js');
+  // The page's own scripts, which run after document_start.
+  const heard = [];
+  for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click', 'dblclick', 'keydown', 'keyup', 'selectstart']) {
+    realm.window.addEventListener(type, (event) => heard.push(event.type), true);
+  }
+  realm.add('div', { id: 'card' }, [100, 100, 200, 100]);
+  realm.add('p', { id: 'aside' }, [100, 300, 200, 40]);
+  realm.arm();
+  await realm.frame();
+  realm.click(150, 150);
+  await realm.frame();
+  realm.press(150, 150);
+  realm.pointerEvent('selectstart', 150, 150);
+  realm.release(150, 150);
+  realm.pointerEvent('dblclick', 150, 150);
+  await realm.idle(1500);
+  assert.equal(realm.picks()[0]?.element.selector, '#card');
+  realm.arm();
+  await realm.frame();
+  realm.key('ArrowDown');
+  realm.key('Enter');
+  await realm.idle(1500);
+  assert.equal(realm.picks().length, 2);
+  assert.deepEqual(heard, [], 'the page heard the pick');
+  assert.deepEqual(pressesSeen(realm), []);
+  // Once the pick is over, the page hears its presses again.
+  realm.click(150, 320);
+  assert.deepEqual(heard, ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']);
+});
+
+test('picker events: the press gate goes where the bridge goes, first, and hears every event the picker keeps', () => {
+  const manifest = JSON.parse(readFileSync(new URL('../manifest.json', import.meta.url), 'utf8'));
+  const entry = manifest.content_scripts.find((one) => one.js.includes('content/press-gate.js'));
+  assert.ok(entry, 'the gate is not declared');
+  assert.deepEqual(entry.js, ['content/press-gate.js', 'content/collector-bridge.js']);
+  assert.equal(entry.run_at, 'document_start');
+  assert.equal(entry.world, 'ISOLATED');
+  const list = (source, name) => JSON.parse(`[${new RegExp(`const ${name} = \\[([^\\]]*)\\]`).exec(source)[1].replace(/'/g, '"').replace(/,\s*$/, '')}]`);
+  const kept = [...list(SOURCE, 'CANCELLED'), ...list(SOURCE, 'STOPPED'), ...list(SOURCE, 'HELD_EVENTS'), 'selectstart'];
+  assert.deepEqual([...list(readFileSync(GATE, 'utf8'), 'TYPES')].sort(), kept.sort());
+});
+
+// F50: a popover in a shadow root sends its toggle no further than the
+// root, so the host was raised over it only by the survey every fifteenth
+// frame, and one hidden and shown again between two surveys covered the
+// highlight until it was next shown.
+test('picker events: a popover in a shadow root hidden and shown again at once does not cover the highlight', async () => {
+  const realm = makeRealm();
+  realm.add('div', { id: 'card' }, [100, 100, 200, 100]);
+  const toaster = realm.add('x-toaster', {}, null);
+  const root = toaster.attachShadow({ mode: 'open' });
+  const toast = new FakeElement(realm.doc, 'div', { popover: 'manual', class: 'toast' });
+  toast.rect = [500, 400, 400, 200];
+  root.appendChild(toast);
+  realm.arm();
+  await realm.frame();
+  realm.doc.showPopover(toast);
+  await realm.idle(300);
+  assert.equal(realm.doc.topLayer.at(-1), realm.host());
+  realm.doc.hidePopover(toast);
+  realm.doc.showPopover(toast);
+  await realm.idle(300);
+  assert.equal(realm.doc.topLayer.at(-1), realm.host(), 'the popover hidden and shown again covers the highlight');
+  // Raised a frame after it shows, not by the survey up to 15 frames on;
+  // one in a closed root too.
+  realm.doc.hidePopover(toast);
+  await realm.frame();
+  realm.doc.showPopover(toast);
+  await realm.frame(2);
+  assert.equal(realm.doc.topLayer.at(-1), realm.host(), 'a popover shown in a shadow root covers the highlight');
+  const sealed = realm.add('x-sealed', {}, null);
+  const closedRoot = sealed.attachShadow({ mode: 'closed' });
+  const tip = new FakeElement(realm.doc, 'div', { popover: 'manual' });
+  tip.rect = [0, 0, 100, 100];
+  closedRoot.appendChild(tip);
+  await realm.frame(16);
+  realm.doc.showPopover(tip);
+  await realm.frame(2);
+  assert.equal(realm.doc.topLayer.at(-1), realm.host(), 'a popover shown in a closed shadow root covers the highlight');
+});
+
+// F50: the Enter that picked, held past the tail, repeated to the page, and
+// sent the form whose field had focus once for each repeat.
+test('picker events: the Enter that picked, held past the tail, does not repeat to the page', async () => {
+  const realm = makeRealm();
+  const field = realm.add('input', { id: 'q', name: 'q' }, [100, 100, 200, 30]);
+  realm.arm();
+  await realm.frame();
+  realm.deliver('focusin', { target: field });
+  realm.deliver('keydown', { key: 'Enter' });
+  for (let index = 0; index < 100; index += 1) {
+    realm.deliver('keydown', { key: 'Enter', repeat: true });
+    realm.deliver('keypress', { key: 'Enter', repeat: true });
+    await realm.frame(2);
+  }
+  assert.equal(realm.picks().length, 1);
+  realm.deliver('keyup', { key: 'Enter' });
+  assert.deepEqual(realm.page.seen.filter((type) => type.startsWith('key')), [], 'the page heard the held Enter');
+  // A new press is the page's, its repeats too.
+  realm.deliver('keydown', { key: 'Enter' });
+  realm.deliver('keydown', { key: 'Enter', repeat: true });
+  realm.deliver('keyup', { key: 'Enter' });
+  assert.deepEqual(realm.page.seen.filter((type) => type.startsWith('key')), ['keydown', 'keydown', 'keyup']);
+  // Let go unseen (its keyup went elsewhere): the next press of Enter, no
+  // repeat, ends the hold and is the page's.
+  realm.page.seen = [];
+  realm.arm();
+  await realm.frame();
+  realm.deliver('focusin', { target: field });
+  realm.deliver('keydown', { key: 'Enter' });
+  await realm.idle(2500);
+  assert.equal(realm.picks().length, 2);
+  realm.deliver('keydown', { key: 'Enter' });
+  realm.deliver('keyup', { key: 'Enter' });
+  assert.deepEqual(realm.page.seen.filter((type) => type.startsWith('key')), ['keydown', 'keyup']);
+});
+
+// F50: a frame whose own important id rule beat the sheet got a shield,
+// drawn above everything, so a hover menu over it lost its hover.
+test('picker events: a frame with an important id rule of the page\'s lets the pointer through, and a menu over it keeps its hover', async () => {
+  const realm = makeRealm();
+  const frame = realm.add('iframe', { id: 'player', src: '/embed' }, [0, 100, 600, 300]);
+  frame.pageIds = 3;
+  const menu = realm.add('nav', { class: 'menu' }, [0, 40, 140, 40]);
+  const sub = realm.add('div', { class: 'sub' }, [0, 80, 200, 120], menu);
+  sub.shownWhile = menu;
+  const item = realm.add('a', { id: 'c3', href: '#3' }, [0, 150, 200, 40], sub);
+  realm.text(item, 'Item three');
+  realm.arm();
+  await realm.frame();
+  const shields = realm.part('shields').children;
+  assert.equal(shields.filter((shield) => shield.style.display === 'block').length, 0, 'the frame has a shield');
+  realm.move(50, 60);
+  await realm.frame();
+  realm.move(50, 170);
+  await realm.frame();
+  assert.equal(realm.doc.rendered(item), true, 'the menu closed as the pointer reached the part over the frame');
+  realm.press(50, 170);
+  realm.release(50, 170);
+  await realm.idle(1500);
+  assert.equal(realm.picks()[0]?.element.selector, '#c3');
+  assert.equal(realm.picks()[0].element.hovered, true);
+  assert.equal((await pickOver(realm, 400, 300)).picked, '#player');
+  assert.deepEqual(realm.page.framed, []);
+});
+
+// V3-picker-2 (F50e): appended after body, as the html element's last child,
+// the host took :last-child from body itself, so a page's body:last-child
+// or html > :last-child rule stopped matching body while armed (its
+// background and an outline went, in Chrome 156). It goes at the end of
+// body again, as in 0.6.0, where a page that spaces body's children by
+// margin (space-y) still moves while armed.
+test('picker events: body stays the last child of the html element while armed, so a body:last-child rule keeps matching', async () => {
+  const realm = makeRealm();
+  realm.add('div', { id: 'card' }, [100, 100, 200, 100]);
+  const doc = realm.doc;
+  // body:last-child { background: rgb(1, 2, 3) }
+  const background = () => (doc.documentElement.lastElementChild === doc.body ? 'rgb(1, 2, 3)' : 'rgba(0, 0, 0, 0)');
+  const before = background();
+  realm.arm();
+  await realm.frame();
+  realm.move(150, 150);
+  await realm.frame();
+  assert.equal(background(), before, 'body stopped matching :last-child while armed');
+  assert.equal(realm.host().parentNode, doc.body);
+  realm.press(150, 150);
+  realm.release(150, 150);
+  await realm.idle(1500);
+  assert.equal(realm.picks()[0]?.element.selector, '#card');
+  assert.equal(background(), before);
+});
+
+// F50: a frame with a discrete transition of pointer-events (transition:
+// all .3s allow-discrete) kept auto for half the transition as the sheet
+// came in, and none as the sheet was lifted, so the lifted hit test passed
+// through it and the element under it was picked, and the page heard
+// transition events on every move over it.
+test('picker events: a frame with a discrete transition of the page\'s is passed through at once and picked where it is drawn', async () => {
+  const realm = makeRealm();
+  realm.add('div', { id: 'under' }, [0, 0, 1000, 800]);
+  const frame = realm.add('iframe', { id: 'fr', src: '/embed' }, [100, 100, 400, 300]);
+  frame.discreteMs = 300;
+  realm.arm();
+  await realm.frame();
+  realm.move(300, 250);
+  await realm.frame();
+  realm.move(310, 260);
+  await realm.frame();
+  assert.equal(realm.part('tag').textContent.split(' ')[0], 'iframe#fr');
+  realm.press(310, 260);
+  realm.release(310, 260);
+  await realm.idle(1500);
+  assert.deepEqual(realm.page.framed, [], 'events went into the frame');
+  assert.equal(realm.picks()[0]?.element.selector, '#fr');
+  assert.deepEqual(realm.page.transitions, [], 'the page heard transition events');
+});
+
+// V3-picker-1 (F50f): the sheet held every discrete transition of every
+// frame back for the whole arm and tail (transition-behavior: normal
+// !important), so a frame the page faded out with a display transition
+// went at once, the page heard no transition event, and the transitionend
+// it waited for to take the frame away never came. Nothing is held now
+// unless a frame gives pointer-events a discrete transition of its own.
+const FADED = [
+  'transitionrun:display',
+  'transitionrun:opacity',
+  'transitionstart:display',
+  'transitionstart:opacity',
+  'transitionend:display',
+  'transitionend:opacity',
+  'removed',
+];
+
+test('picker events: a frame the page fades out while armed or just after a pick runs its transition to the end', async () => {
+  const realm = makeRealm();
+  realm.add('div', { id: 'card' }, [50, 50, 200, 100]);
+  const chat = () => {
+    const frame = realm.add('iframe', { class: 'chat', src: '/chat' }, [600, 400, 300, 300]);
+    frame.fadeMs = 400;
+    return frame;
+  };
+  const heard = () => realm.page.transitions.splice(0).sort();
+  // Armed: the pointer on the card, and once over the frame, so the sheet
+  // has come off and gone back on as well.
+  let frame = chat();
+  realm.arm();
+  await realm.frame();
+  const sheet = realm.doc.adoptedStyleSheets[0];
+  realm.move(700, 500);
+  await realm.frame();
+  realm.move(100, 80);
+  await realm.frame();
+  realm.doc.fade(frame);
+  await realm.idle(200);
+  assert.equal(realm.doc.rendered(frame), true, 'the frame went at once');
+  await realm.idle(400);
+  assert.deepEqual(heard(), [...FADED].sort());
+  assert.equal(frame.isConnected, false, 'the page never took the frame away');
+  realm.key('Escape');
+  await realm.idle(100);
+  // In the tail: the card picked, the frame faded 100 ms later.
+  frame = chat();
+  realm.arm();
+  await realm.frame();
+  realm.click(100, 80);
+  await realm.idle(100);
+  realm.doc.fade(frame);
+  await realm.idle(1500);
+  assert.deepEqual(heard(), [...FADED].sort());
+  assert.equal(frame.isConnected, false, 'the page never took the frame away');
+  assert.deepEqual(realm.picks().map((pick) => pick.element.selector), ['#card']);
+  assert.deepEqual(
+    sheet.texts.filter((text) => text.includes('transition')),
+    [],
+    'the sheet held transitions back on a page with no frame that transitions pointer-events'
+  );
+});
+
+// The hold that a frame of the page's own discrete transition of
+// pointer-events needs (see the test above this one) comes only at the
+// moments the sheet changes it, after what the page changed has been
+// restyled, so a fade the page starts on that frame runs to its end too,
+// the pointer moving over the frame all the while.
+test('picker events: a frame that transitions pointer-events itself still runs a fade of the page\'s to the end', async () => {
+  const realm = makeRealm();
+  realm.add('div', { id: 'under' }, [0, 0, 1000, 800]);
+  const frame = realm.add('iframe', { id: 'fr', src: '/embed' }, [100, 100, 400, 300]);
+  frame.discreteMs = 400;
+  frame.fadeMs = 400;
+  realm.arm();
+  await realm.frame();
+  realm.move(300, 250);
+  await realm.frame();
+  assert.equal(realm.part('tag').textContent.split(' ')[0], 'iframe#fr');
+  // The page fades it in the same frame as the next move over it.
+  realm.doc.fade(frame);
+  for (let step = 0; step < 12; step += 1) {
+    realm.move(300 + step, 250);
+    await realm.frame();
+  }
+  await realm.idle(400);
+  assert.deepEqual(realm.page.transitions.slice().sort(), [...FADED].sort());
+  assert.equal(frame.isConnected, false, 'the page never took the frame away');
+  assert.deepEqual(realm.page.framed, []);
+});
+
+// The same, where the page asks for the fade in the very task that ends
+// picking: what it changed is restyled with its own transitions before the
+// sheet holds anything back to come off.
+test('picker events: a fade the page asks for as picking ends runs to the end on a frame that transitions pointer-events', async () => {
+  const realm = makeRealm();
+  realm.add('div', { id: 'under' }, [0, 0, 1000, 800]);
+  const frame = realm.add('iframe', { id: 'fr', src: '/embed' }, [100, 100, 400, 300]);
+  frame.discreteMs = 400;
+  frame.fadeMs = 400;
+  realm.arm();
+  await realm.frame();
+  realm.move(300, 250);
+  await realm.frame();
+  realm.doc.fade(frame);
+  realm.picker.stop();
+  await realm.idle(600);
+  assert.deepEqual(realm.page.transitions.slice().sort(), [...FADED].sort());
+  assert.equal(frame.isConnected, false, 'the page never took the frame away');
+  assert.equal(realm.doc.adoptedStyleSheets.length, 0);
+});
+
+// W3-picker-1 (F50f): a page that sets its own adoptedStyleSheets while
+// armed (a framework that owns its lists) drops the sheet. It went back
+// under a hold that first restyled the frames without it, so the page heard
+// a transition of pointer-events begin and be cancelled at every reset, in
+// the loop's frames and in a survey's. It goes back now before anything
+// restyles, as in 0.6.0, and the frames never leave none.
+test('picker events: a page that sets its own adopted sheets while armed hears no transition of a frame that transitions pointer-events', async () => {
+  const realm = makeRealm();
+  realm.add('div', { id: 'under' }, [0, 0, 1000, 800]);
+  const frame = realm.add('iframe', { id: 'fr', src: '/embed' }, [100, 100, 400, 300]);
+  frame.discreteMs = 300;
+  const widget = realm.add('x-player', {}, [600, 100, 300, 200]);
+  const root = widget.attachShadow({ mode: 'open' });
+  const inner = new FakeElement(realm.doc, 'iframe', { class: 'video', src: '/v' });
+  inner.rect = [600, 100, 300, 200];
+  inner.discreteMs = 300;
+  root.appendChild(inner);
+  realm.arm();
+  await realm.frame(20);
+  assert.deepEqual(realm.page.transitions, [], 'the page heard transition events at the arm');
+  const sheet = realm.doc.adoptedStyleSheets.at(-1);
+  // Before each of 40 frames, two surveys among them.
+  for (let step = 0; step < 40; step += 1) {
+    realm.doc.adoptedStyleSheets = [];
+    root.adoptedStyleSheets = [];
+    await realm.frame();
+  }
+  assert.deepEqual(realm.page.transitions, [], 'the page heard transition events as it set its lists');
+  assert.ok(realm.doc.adoptedStyleSheets.includes(sheet));
+  assert.ok(root.adoptedStyleSheets.includes(sheet));
+  realm.click(300, 250);
+  await realm.idle(1500);
+  assert.deepEqual(realm.page.framed, [], 'events went into the frame');
+  assert.equal(realm.picks()[0]?.element.selector, '#fr');
+  assert.deepEqual(realm.page.transitions, []);
+});
+
+// W3-picker-2 (F50f): only the first 100 frames were asked whether they
+// transition pointer-events, afresh at each survey. A frame past them was
+// passed through with no hold at the arm, so the page heard its transition
+// and for half of it the frame still took a press, and Escape let it go
+// with no hold once a survey had forgotten what a lift found. Every frame
+// found is asked now, and what was found stays until the next arm.
+test('picker events: a frame past the first 100 that transitions pointer-events is held at the arm, for a press right after it, and at Escape', async () => {
+  const realm = makeRealm();
+  for (let index = 0; index < 100; index += 1) realm.add('iframe', { src: `/f${index}` }, [index * 9, 700, 9, 9]);
+  const last = realm.add('iframe', { id: 'last', src: '/last' }, [100, 100, 300, 200]);
+  last.discreteMs = 300;
+  // Pressed in the first frame after the arm.
+  realm.move(200, 200);
+  realm.arm();
+  await realm.frame();
+  realm.click(202, 201);
+  await realm.idle(1500);
+  assert.deepEqual(pressesFramed(realm), [], 'the press went into the frame');
+  assert.equal(realm.picks()[0]?.element.selector, '#last');
+  // Hovered, then Escape two surveys later.
+  realm.arm();
+  await realm.frame();
+  for (let step = 0; step < 4; step += 1) {
+    realm.move(200 + step * 4, 200);
+    await realm.frame();
+  }
+  await realm.idle(600);
+  realm.key('Escape');
+  await realm.idle(500);
+  assert.equal(realm.picker.isActive(), false);
+  assert.deepEqual(realm.page.transitions, [], 'the page heard transition events');
+});
+
+// Round four's survey skipped every frame checkVisibility said no to, so a
+// frame hidden (display: none) at the arm and shown while armed was not
+// known to transition pointer-events until a later survey: a move over
+// another frame in that window let the page hear the shown frame's
+// transition. A frame the survey passed over is asked again before the
+// sheet changes, once it is drawn.
+test('picker events: a frame hidden at the arm and shown while armed is held as soon as it is shown', async () => {
+  const realm = makeRealm();
+  realm.add('div', { id: 'under' }, [0, 0, 1000, 800]);
+  realm.add('iframe', { id: 'plain', src: '/plain' }, [500, 100, 300, 200]);
+  const shown = realm.add('iframe', { id: 'shown', src: '/shown' }, [100, 100, 300, 200]);
+  shown.discreteMs = 300;
+  shown.style.display = 'none';
+  realm.arm();
+  await realm.frame();
+  shown.style.display = '';
+  for (let step = 0; step < 3; step += 1) {
+    realm.move(600 + step * 4, 200);
+    await realm.frame();
+  }
+  await realm.idle(600);
+  realm.key('Escape');
+  await realm.idle(500);
+  assert.deepEqual(realm.page.transitions, [], 'the page heard transition events');
+});
+
+// X3 (round three's survey): every frame found was asked whether it
+// transitions pointer-events, which in Chrome lays out a frame in skipped
+// content (content-visibility: auto off screen): on a page of 1,000 such
+// frames each arm took 37 to 51 ms and the first scroll after it froze the
+// page for 0.3 s. Round five asked checkVisibility() with no options of
+// each such frame instead, which lays it out as well, and cost the same.
+// Such a frame is not asked until it is drawn, and nothing lays it out.
+test('picker events: the survey asks no frame in skipped content whether it transitions pointer-events', async () => {
+  const realm = makeRealm();
+  realm.add('div', { id: 'under' }, [0, 0, 1000, 800]);
+  const drawn = realm.add('iframe', { id: 'drawn', src: '/drawn' }, [100, 100, 300, 200]);
+  const skipped = [];
+  for (let index = 0; index < 200; index += 1) {
+    const frame = realm.add('iframe', { src: `/s${index}` }, [index * 4, 900, 4, 4]);
+    frame.skippedContent = true;
+    skipped.push(frame);
+  }
+  realm.arm();
+  for (let step = 0; step < 40; step += 1) {
+    realm.move(10 + step, 10);
+    await realm.frame();
+  }
+  assert.ok(drawn.transitionReads > 0, 'the drawn frame was never asked');
+  assert.deepEqual(skipped.filter((frame) => frame.transitionReads).length, 0, 'frames in skipped content were asked');
+  assert.deepEqual(skipped.filter((frame) => frame.layouts).length, 0, 'frames in skipped content were laid out');
+  realm.key('Escape');
+  await realm.idle(500);
+});
+
+// The same frame in skipped content at the arm, with a discrete transition
+// of its own, scrolled into view while armed: held from the first move
+// after, not from the next survey, so the page hears nothing of it.
+test('picker events: a frame in skipped content at the arm and scrolled into view while armed is held as soon as it is drawn', async () => {
+  const realm = makeRealm();
+  realm.add('div', { id: 'under' }, [0, 0, 1000, 800]);
+  realm.add('iframe', { id: 'plain', src: '/plain' }, [500, 100, 300, 200]);
+  const later = realm.add('iframe', { id: 'later', src: '/later' }, [100, 100, 300, 200]);
+  later.discreteMs = 300;
+  later.skippedContent = true;
+  realm.arm();
+  await realm.frame();
+  later.skippedContent = false;
+  for (let step = 0; step < 3; step += 1) {
+    realm.move(600 + step * 4, 200);
+    await realm.frame();
+  }
+  await realm.idle(600);
+  realm.key('Escape');
+  await realm.idle(500);
+  assert.deepEqual(realm.page.transitions, [], 'the page heard transition events');
+  assert.equal(later.layouts || 0, 0, 'the frame was laid out while skipped');
 });

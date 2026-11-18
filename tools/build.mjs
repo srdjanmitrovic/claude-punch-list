@@ -27,10 +27,14 @@
  */
 
 import { createHash } from 'node:crypto';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import {
+  closeSync,
   existsSync,
+  lstatSync,
   mkdirSync,
+  mkdtempSync,
+  openSync,
   readdirSync,
   readFileSync,
   realpathSync,
@@ -38,6 +42,7 @@ import {
   statSync,
   writeFileSync,
 } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join, posix, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
@@ -363,48 +368,138 @@ export function resolveSpecifier(specifier, from) {
   return { problem: 'which Chrome cannot resolve: a module path starts with ./, ../ or /' };
 }
 
-// The keyword import up to its '(': not a property (loader.import, or
-// loader.\nimport), and with white space or comments allowed before the '(',
-// as JavaScript allows them, so import /* x */ ('./x.js') is read too. A
-// comment's body cannot hold '*/', so each comment ends at its first.
-const IMPORT_CALL = /(?<![\w$])import(?<!\.\s*import)(?:\s|\/\*(?:[^*]|\*(?!\/))*\*\/|\/\/[^\n]*\n)*\(/.source;
+// White space and comments, which JavaScript allows between any two tokens. A
+// comment's body cannot hold '*/', so each comment ends at its first. A line
+// comment ends at any line terminator (\n, \r, U+2028, U+2029), which \s then
+// takes, and runs to it: ending it earlier would let the pattern read the
+// rest of the line as code, and would let it backtrack through every way of
+// cutting a long comment.
+const LINE_REST = String.raw`[^\n\r\u2028\u2029]*(?![^\n\r\u2028\u2029])`;
+const GAP = String.raw`(?:\s|\/\*(?:[^*]|\*(?!\/))*\*\/|\/\/${LINE_REST})*`;
+
+// The same, with the HTML-like comments a classic script also allows (<!--
+// anywhere, and --> at the start of a line, taken here anywhere). A module
+// refuses them, and mid-line --> is `-- >` anywhere, so these are allowed
+// only between import and its '(', and never around a path. A wrong reading
+// here makes a candidate V8 rules out, and since every `import` is tried on
+// its own (starts), it cannot run through and hide a later import().
+const CALL_GAP = String.raw`(?:\s|\/\*(?:[^*]|\*(?!\/))*\*\/|\/\/${LINE_REST}|<!--${LINE_REST}|-->${LINE_REST})*`;
+
+// The keyword import up to its '(', so import /* x */ ('./x.js') is read too.
+// This finds every dynamic import in a file, and more: a method named import
+// (loader.import(x), import(name) {), and import( in a string, a comment, a
+// template or a regular expression. importCalls asks V8 which are imports.
+// A # before import makes a private name (#import), never an import.
+const IMPORT_CALL = String.raw`(?<![\w$#])import${CALL_GAP}\(`;
+
+// A phase import, import.source(...) or import.defer(...). Node 24 parses
+// the source phase and Chrome does not, so a module that used one would build
+// clean on the Node the release is built with and fail to load in Chrome.
+const PHASE_CALL = String.raw`(?<![\w$#])import${CALL_GAP}\.${GAP}(source|defer)(?![\w$])`;
 
 // import("./x.js") with a literal path: quoted, or a template with nothing
-// put into it. V8 reports only static imports, so this one is found in the
-// text. A literal in a comment or a string is taken for an import too, which
-// can fail a build but never lets a broken one pass.
-const DYNAMIC_IMPORT = new RegExp(IMPORT_CALL + /\s*(?:(['"])([^'"\n]+)\1|`([^`$\\\n]+)`)\s*[,)]/.source, 'g');
+// put into it. Any other path is computed or built from a template
+// (import(`./${name}.js`)), and names no file the build can look for.
+const LITERAL_IMPORT = new RegExp(
+  IMPORT_CALL + GAP + /(?:(['"])([^'"\n]+)\1|`([^`$\\\n]+)`)/.source + GAP + '[,)]',
+  'y'
+);
 
-// Every import( in a file, literal or not. One whose path is computed or
-// built from a template (import(`./${name}.js`)) names no file the build can
-// look for, and so does any import( in a file the build does not follow as a
-// module, so each of those fails the build rather than going unchecked.
-const ANY_DYNAMIC_IMPORT = new RegExp(IMPORT_CALL, 'g');
+/**
+ * Where each match of `pattern` in `text` starts, tried at every keyword
+ * import. Matches found one after another never overlap, so one that starts
+ * at an earlier `import` (in a string "import //", or obj.import-->) and runs
+ * on to a later '(' would hide the import() it ran through.
+ */
+function starts(text, pattern) {
+  const sticky = new RegExp(pattern, 'y');
+  return [...text.matchAll(/(?<![\w$#])import/g)].map((match) => match.index).filter((at) => {
+    sticky.lastIndex = at;
+    return sticky.test(text);
+  });
+}
 
-// A method named import (import(name) {, static import() {), which is no
-// import. Its ')' and '{' share a line, which a call and a block after it
-// cannot, so a dynamic import never reads this way. A method whose
-// parameters hold a '(' or a line break is still taken for an import.
-const IMPORT_METHOD = new RegExp(IMPORT_CALL + /[^()\n]*\)[ \t]*\{/.source, 'y');
+/** Where each match of IMPORT_CALL in `text` starts. */
+function importCandidates(text) {
+  return starts(text, IMPORT_CALL);
+}
 
-/** The specifier of each import( DYNAMIC_IMPORT can read, by where it starts. */
-function literalImports(text) {
-  return new Map([...text.matchAll(DYNAMIC_IMPORT)].map((match) => [match.index, match[2] ?? match[3]]));
+/** The line `at` is on, counted as an editor counts it. */
+function lineOf(text, at) {
+  return text.slice(0, at).split('\n').length;
 }
 
 /**
- * A problem for each import( in a shipped script the build cannot check: one
- * whose path is not a literal, or any in a file the build does not follow as
- * a module (a content script, or a module nothing imports).
+ * Which of `places`, each where the keyword import starts, are code. V8 says:
+ * one is when the file parses, and stops parsing once that `import` is
+ * spelled `class `. An import() or an import.source() is an expression, and
+ * `class (` or `class .` never is one, while a method or property named
+ * import parses as well named class, and a string, a comment, a template or a
+ * regular expression takes any letters. `parse` throws on a syntax error. In
+ * a file that does not parse, every place counts, which can add a problem to
+ * a build that fails anyway but never lets a broken import pass.
  */
-export function uncheckedImports(name, text, followed) {
-  const literal = literalImports(text);
+function inCode(text, places, parse) {
+  if (!places.length) return places;
+  try {
+    parse(text);
+  } catch {
+    return places;
+  }
+  return places.filter((at) => {
+    try {
+      parse(`${text.slice(0, at)}class ${text.slice(at + 'import'.length)}`);
+      return false;
+    } catch {
+      return true;
+    }
+  });
+}
+
+/**
+ * Where each dynamic import in `text` starts. V8 reports only static imports,
+ * so the text is searched, and V8 says which of the places found are imports.
+ */
+function importCalls(text, parse) {
+  return inCode(text, importCandidates(text), parse);
+}
+
+/** Each phase import (import.source(...), import.defer(...)) in `text`, as [line, phase]. */
+function phaseCalls(text, parse) {
+  const word = new RegExp(PHASE_CALL, 'y');
+  return inCode(text, starts(text, PHASE_CALL), parse).map((at) => {
+    word.lastIndex = at;
+    return [lineOf(text, at), word.exec(text)[1]];
+  });
+}
+
+/** The path of each import() starting at `calls` that is written out, by where it starts. */
+function literalImports(text, calls) {
+  const literal = new Map();
+  for (const at of calls) {
+    LITERAL_IMPORT.lastIndex = at;
+    const match = LITERAL_IMPORT.exec(text);
+    if (match) literal.set(at, match[2] ?? match[3]);
+  }
+  return literal;
+}
+
+/** Whether a script the build does not follow as a module is a classic one. */
+const isClassic = (name, followed) => !followed.has(name) && name.startsWith('content/') && name.endsWith('.js');
+
+/**
+ * A problem for each import() in a shipped script the build cannot check: one
+ * whose path is not written out, or any in a file the build does not follow
+ * as a module (a content script, or a module nothing imports). `calls` says
+ * where they start, from importCalls; without it every place IMPORT_CALL
+ * finds is taken for one.
+ */
+export function uncheckedImports(name, text, followed, calls = importCandidates(text)) {
+  const literal = followed ? literalImports(text, calls) : new Map();
   const problems = [];
-  for (const match of text.matchAll(ANY_DYNAMIC_IMPORT)) {
-    if (followed && literal.has(match.index)) continue;
-    IMPORT_METHOD.lastIndex = match.index;
-    if (IMPORT_METHOD.test(text)) continue;
-    const line = text.slice(0, match.index).split('\n').length;
+  for (const at of calls) {
+    if (literal.has(at)) continue;
+    const line = lineOf(text, at);
     problems.push(
       followed
         ? `${name}:${line} calls import() with a path that is not written out, which the build cannot check: ` +
@@ -415,30 +510,46 @@ export function uncheckedImports(name, text, followed) {
   return problems;
 }
 
-/** The specifiers of a module's static imports and re-exports, in V8's own words. */
+/** A module's static imports and re-exports, in V8's own words: {specifier, phase}. */
+function staticRequests(record) {
+  // moduleRequests is the newer name (Node 22.20 and 24.4 on), and the older
+  // is all an earlier 22 or 24 has. Only a Node that parses phase imports
+  // says each request's phase.
+  return record.moduleRequests ?? record.dependencySpecifiers.map((specifier) => ({ specifier }));
+}
+
+/** The specifiers of a module's static imports and re-exports. */
 function staticSpecifiers(record) {
-  // moduleRequests is the newer name (Node 22 on); Node 20 has only the older.
-  return record.moduleRequests?.map((request) => request.specifier) ?? record.dependencySpecifiers;
+  return staticRequests(record).map((request) => request.specifier);
 }
 
 /**
  * The second half of checkImports, in a Node started with
  * --experimental-vm-modules, where vm.SourceTextModule exists. Reads
- * {names, files, roots} on stdin and writes {modules, problems}.
+ * {names, files, roots} from the file `input` and writes {modules, problems,
+ * calls, unparsed} to the file `output`.
  *
  * Each module is parsed by V8 and linked, never run. Linking is the step
  * where Chrome fails a module graph, for an import of a file that is not
  * there or of a name the file does not export, so the answer is V8's own and
  * does not depend on how an import statement is spaced or split over lines.
  */
-async function linkMain() {
-  const { names, files, roots } = JSON.parse(readFileSync(0, 'utf8'));
+async function linkMain(input, output) {
+  const { names, files, roots } = JSON.parse(readFileSync(input, 'utf8'));
   const inBuild = new Set(names);
   const context = vm.createContext({});
   const records = new Map();
   const modules = [];
   const problems = [];
   let linkable = true;
+  // Where each script's dynamic imports start, for uncheckedImports.
+  const calls = {};
+  // Each script parsed as a module that V8 refuses, with V8's message. V8
+  // does not say on which line, so validate() asks Node for that.
+  const unparsed = {};
+  const parsing = vm.createContext({});
+  const asModule = (text) => new vm.SourceTextModule(text, { context: parsing });
+  const asScript = (text) => new vm.Script(text);
 
   const load = (name) => {
     if (records.has(name)) return records.get(name);
@@ -447,8 +558,8 @@ async function linkMain() {
       modules.push(name);
       try {
         record = new vm.SourceTextModule(files[name], { identifier: name, context });
-      } catch {
-        // checkModule reports the syntax error, with its line.
+      } catch (error) {
+        unparsed[name] = `${error.name}: ${error.message}`;
         linkable = false;
       }
     } else {
@@ -466,8 +577,16 @@ async function linkMain() {
     if (records.has(name)) continue;
     const record = load(name);
     if (!(record instanceof vm.SourceTextModule)) continue;
-    const dynamic = [...literalImports(files[name]).values()];
-    for (const specifier of [...staticSpecifiers(record), ...dynamic]) {
+    calls[name] = importCalls(files[name], asModule);
+    const dynamic = [...literalImports(files[name], calls[name]).values()];
+    const requests = staticRequests(record);
+    const phased = requests.filter(({ phase = 'evaluation' }) => phase !== 'evaluation');
+    for (const { specifier, phase } of phased) {
+      problems.push(`${name} imports "${specifier}" with import ${phase}, a phase import Chrome does not support`);
+      linkable = false;
+    }
+    const followedStatic = requests.filter((request) => !phased.includes(request)).map((request) => request.specifier);
+    for (const specifier of [...followedStatic, ...dynamic]) {
       const { path, problem } = resolveSpecifier(specifier, name);
       const missing = problem || (!inBuild.has(path) && 'which is not in the build');
       if (missing) {
@@ -500,32 +619,146 @@ async function linkMain() {
       }
     }
   }
-  process.stdout.write(JSON.stringify({ modules, problems }));
+
+  // Every script, parsed as validate() checks it: for its dynamic imports, its
+  // phase imports, and, for a module nothing imports, its syntax and the
+  // phase of its static imports, as for a module followed above.
+  const followed = new Set(modules);
+  for (const [name, text] of Object.entries(files)) {
+    const classic = isClassic(name, followed);
+    const parse = classic ? asScript : asModule;
+    calls[name] ??= importCalls(text, parse);
+    for (const [line, phase] of phaseCalls(text, parse)) {
+      problems.push(`${name}:${line} calls import.${phase}(), a phase import Chrome does not support`);
+    }
+    if (classic || followed.has(name)) continue;
+    try {
+      for (const { specifier, phase = 'evaluation' } of staticRequests(asModule(text))) {
+        if (phase !== 'evaluation') problems.push(`${name} imports "${specifier}" with import ${phase}, a phase import Chrome does not support`);
+      }
+    } catch (error) {
+      unparsed[name] = `${error.name}: ${error.message}`;
+    }
+  }
+  writeFileSync(output, JSON.stringify({ modules, problems, calls, unparsed }));
+}
+
+// How long the build waits for one of its children, the import check or
+// Node's syntax check of a module. Each takes a fraction of a second on the
+// real tree. The variable is for the tests.
+const CHILD_TIMEOUT_MS = Number(process.env.BUILD_CHECK_TIMEOUT_MS) || 120_000;
+
+/**
+ * Removes the temporary folders of builds that a signal stopped (Ctrl+C, a
+ * kill), which never reach inScratch's finally. Only folders an hour old go:
+ * a running build uses each of its folders for one child, within that
+ * child's time limit.
+ */
+function sweepScratch() {
+  const hourAgo = Date.now() - 3_600_000;
+  try {
+    for (const name of readdirSync(tmpdir())) {
+      if (!/^punch-list-build-[A-Za-z0-9]{6}$/.test(name)) continue;
+      const path = join(tmpdir(), name);
+      try {
+        if (lstatSync(path).mtimeMs < hourAgo) rmSync(path, { recursive: true, force: true });
+      } catch {
+        // Gone already, or another user's.
+      }
+    }
+  } catch {
+    // No temp folder to read; mkdtempSync says so next.
+  }
+}
+
+/**
+ * Runs `work` with a new temporary folder, and removes the folder after. A
+ * folder that cannot be made or written (no temp directory, a full disk)
+ * gives `failed(error)`, so the build names the check that could not run.
+ */
+function inScratch(work, failed) {
+  let dir;
+  try {
+    dir = mkdtempSync(join(tmpdir(), 'punch-list-build-'));
+    return work(dir);
+  } catch (error) {
+    return failed(error);
+  } finally {
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Runs this Node with `args`, and returns its exit status, the signal that
+ * stopped it, and what it wrote to stderr. Nothing passes through a pipe:
+ * each child reads its input from a file and writes its answer to one, its
+ * stdin and stdout are not connected, and its stderr goes to a file in `dir`.
+ * spawnSync's `input`, a pipe to the child's stdin, now and then left the
+ * child waiting on that pipe for good on macOS, with the build waiting on the
+ * child (a few children in a thousand, with six builds at once). A child that
+ * does not finish in time is killed, and the error names it as `what`.
+ */
+function runNode(dir, args, what) {
+  const stderr = join(dir, 'stderr.txt');
+  const fd = openSync(stderr, 'w');
+  let result;
+  try {
+    result = spawnSync(process.execPath, args, {
+      stdio: ['ignore', 'ignore', fd],
+      timeout: CHILD_TIMEOUT_MS,
+      killSignal: 'SIGKILL',
+    });
+  } finally {
+    closeSync(fd);
+  }
+  if (result.error?.code === 'ETIMEDOUT') {
+    throw new Error(`${what} did not finish within ${CHILD_TIMEOUT_MS / 1000} s, so it was stopped`);
+  }
+  if (result.error) throw new Error(`${what} could not start: ${result.error.message}`);
+  return { status: result.status, signal: result.signal, stderr: readFileSync(stderr, 'utf8') };
+}
+
+/** The line of a child's stderr that names its error, or else its first. */
+function errorLine(stderr) {
+  return /^\w*Error\b.*$/m.exec(stderr)?.[0] ?? stderr.trim().split('\n')[0];
 }
 
 /**
  * Follows the imports of every module from `roots`, in the archive's own
  * files: every import must name a file in the build, and every name imported
  * must be one that file exports. Returns which files are modules, so the rest
- * of content/ can be parsed as the classic scripts they are.
+ * of content/ can be parsed as the classic scripts they are, where the
+ * dynamic imports of every script start, and which modules V8 does not parse.
+ * A check that could not run returns only `modules` and `problems`.
  */
 export function checkImports(entries, roots) {
   const files = {};
   for (const entry of entries) {
     if (/\.m?js$/.test(entry.name)) files[entry.name] = entry.data.toString('utf8');
   }
-  const input = JSON.stringify({ names: entries.map((entry) => entry.name), files, roots });
-  try {
-    const output = execFileSync(
-      process.execPath,
-      ['--experimental-vm-modules', '--no-warnings', fileURLToPath(import.meta.url), '--link'],
-      { input, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 }
-    );
-    return JSON.parse(output);
-  } catch (error) {
-    const reason = String(error.stderr || error.message).trim().split('\n')[0];
+  sweepScratch();
+  return inScratch((dir) => {
+    const input = join(dir, 'input.json');
+    const output = join(dir, 'output.json');
+    writeFileSync(input, JSON.stringify({ names: entries.map((entry) => entry.name), files, roots }));
+    const args = ['--experimental-vm-modules', '--no-warnings', fileURLToPath(import.meta.url), '--link', input, output];
+    let result;
+    try {
+      result = runNode(dir, args, 'the import check');
+    } catch (error) {
+      return { modules: roots, problems: [error.message] };
+    }
+    const { status, signal, stderr } = result;
+    let reason = errorLine(stderr) || (signal ? `it was stopped by ${signal}` : `it exited with ${status}`);
+    if (status === 0) {
+      try {
+        return JSON.parse(readFileSync(output, 'utf8'));
+      } catch (error) {
+        reason = `its answer could not be read: ${error.message}`;
+      }
+    }
     return { modules: roots, problems: [`the imports could not be checked: ${reason}`] };
-  }
+  }, (error) => ({ modules: roots, problems: [`the import check could not run: ${error.message}`] }));
 }
 
 function checkClassic(entry) {
@@ -541,23 +774,40 @@ function checkClassic(entry) {
 }
 
 /**
- * Node can check a module's syntax only by being run on it, and then only by
- * file name or from stdin. Stdin, with the type said outright, means it does
- * not matter where the file is or what any package.json beside it says.
+ * Node's own check of a module's syntax, which says on which line it fails.
+ * V8 says only what is wrong (the import check parses every module, but a
+ * SyntaxError from vm.SourceTextModule carries no line), and Node checks a
+ * module only by being run on a file or on stdin. The file is a copy named
+ * .mjs in a folder of its own, so it is a module whatever any package.json
+ * says, and nothing beside it is read.
  */
 function checkModule(entry) {
-  try {
-    execFileSync(process.execPath, ['--input-type=module', '--check'], {
-      input: entry.data,
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-    return null;
-  } catch (error) {
-    const output = String(error.stderr || '');
-    const line = /\[stdin\]:(\d+)/.exec(output)?.[1];
-    const message = /^\w*Error: .*$/m.exec(output)?.[0] || 'node --check failed';
+  return inScratch((dir) => {
+    const path = join(dir, 'module.mjs');
+    writeFileSync(path, entry.data);
+    let result;
+    try {
+      result = runNode(dir, ['--check', path], `the syntax check of ${entry.name}`);
+    } catch (error) {
+      return error.message;
+    }
+    if (result.status === 0) return null;
+    const line = /module\.mjs:(\d+)/.exec(result.stderr)?.[1];
+    const message = /^\w*Error: .*$/m.exec(result.stderr)?.[0] || 'node --check failed';
     return `${entry.name}${line ? `:${line}` : ''} does not parse: ${message}`;
-  }
+  }, (error) => `the syntax check of ${entry.name} could not run: ${error.message}`);
+}
+
+/**
+ * A module's syntax error, if it has one. The import check parsed every
+ * module with V8, so Node is run only on one V8 refused, for the line, or on
+ * each when that check could not run. V8's answer stands if Node's differs.
+ */
+function moduleProblem(entry, unparsed) {
+  if (unparsed && !Object.hasOwn(unparsed, entry.name)) return null;
+  const problem = checkModule(entry);
+  if (problem || !unparsed) return problem;
+  return `${entry.name} does not parse: ${unparsed[entry.name]}`;
 }
 
 /**
@@ -649,14 +899,12 @@ export function validate(entries) {
   problems.push(...imports.problems);
   const seen = new Set(imports.modules);
   for (const entry of entries) {
+    if (!/\.m?js$/.test(entry.name)) continue;
     // An import() whose path the check above could not read, or in a file it
     // did not follow, is one it let through unchecked.
-    if (/\.m?js$/.test(entry.name)) {
-      problems.push(...uncheckedImports(entry.name, entry.data.toString('utf8'), seen.has(entry.name)));
-    }
-    if (!entry.name.endsWith('.js')) continue;
-    const classic = !seen.has(entry.name) && entry.name.startsWith('content/');
-    const problem = classic ? checkClassic(entry) : checkModule(entry);
+    const text = entry.data.toString('utf8');
+    problems.push(...uncheckedImports(entry.name, text, seen.has(entry.name), imports.calls?.[entry.name]));
+    const problem = isClassic(entry.name, seen) ? checkClassic(entry) : moduleProblem(entry, imports.unparsed);
     if (problem) problems.push(problem);
   }
 
@@ -715,6 +963,6 @@ Install it:
 // Compared as real paths: run from a folder reached through a symlink (macOS's
 // /var is one), the script's own URL names the real path and argv does not.
 if (process.argv[1] && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))) {
-  if (process.argv[2] === '--link') await linkMain();
+  if (process.argv[2] === '--link') await linkMain(process.argv[3], process.argv[4]);
   else main();
 }

@@ -189,6 +189,12 @@
   // the throw after it routinely land in the same millisecond, and the prompt
   // prints them in the order they happened, which t alone cannot tell.
   let pushed = 0;
+  // How many of the bridge's channels have a panel watching the counts (see
+  // countsChanged, at the end of this file). While it is 0, as it is
+  // whenever no panel is open on this tab, push() costs one comparison more.
+  let watching = 0;
+  // Whether a change may not have been told to every channel watching.
+  let owed = false;
 
   /**
    * list without its entry at index, in place. Array methods are the page's
@@ -221,21 +227,55 @@
     setOwn(entry, 'seq', pushed);
     const list = buffers[ring];
     append(list, entry);
-    if (list.length > LIMIT) {
-      // A request the page ended itself (an abort, a timeout it set, an
-      // open() over it) goes before any real failure, the newest included: a
-      // type-ahead that cancels a request per keystroke would otherwise push
-      // the failures the report is for out of the ring.
-      let drop = 0;
-      for (let i = 0; i < list.length; i += 1) {
-        if (ownField(list[i], 'outcome')) {
-          drop = i;
-          break;
-        }
+    // A full ring drops one for each it takes, so its count stays as it was.
+    if (list.length <= LIMIT) {
+      if (watching > 0) {
+        owed = true;
+        countsChanged();
       }
-      removeAt(list, drop);
-      dropped[ring] += 1;
+      return;
     }
+    // More than one when a push before this one ran out of stack between
+    // taking its entry and dropping one (a page that logs on its way back
+    // from a stack overflow), which the console wrapper swallows: that left
+    // the ring longer for good, by one each time. All go in one pass: one
+    // at a time, each looked for over the whole ring, took seconds once a
+    // few thousand such pushes had made it long.
+    // A request the page ended itself (an abort, a timeout it set, an
+    // open() over it) goes before any real failure, the newest included: a
+    // type-ahead that cancels a request per keystroke would otherwise push
+    // the failures the report is for out of the ring.
+    const excess = list.length - LIMIT;
+    let kept = 0;
+    let i = 0;
+    try {
+      for (; i < list.length; i += 1) {
+        const item = list[i];
+        if (i - kept < excess && ownField(item, 'outcome')) continue;
+        list[kept] = item;
+        kept += 1;
+      }
+    } finally {
+      // Out of stack part way, what was not looked at yet moves up behind
+      // what was kept, so no entry is left twice. Nothing here calls out.
+      // When nothing has left yet, every entry is already in place: moving
+      // them all onto themselves on each such push cost the deep band the
+      // square of the ring's length.
+      const length = list.length;
+      if (kept === i) kept = length;
+      else for (; i < length; i += 1, kept += 1) list[kept] = list[i];
+      dropped[ring] += length - kept;
+      list.length = kept;
+    }
+    // Then the oldest, when fewer had ended than were too many.
+    const over = list.length - LIMIT;
+    if (over > 0) {
+      for (let k = over; k < list.length; k += 1) list[k - over] = list[k];
+      list.length -= over;
+      dropped[ring] += over;
+    }
+    // A change not told yet (see countsChanged), told with this entry.
+    if (owed && watching > 0) countsChanged();
   }
 
   // SECRET NAMES BEGIN. The same block sits in content/collector-main.js,
@@ -248,13 +288,16 @@
   // "ssn" nor passHref by "pass". A word of five letters or more also matches
   // at either end of a run together lowercase name (authtoken, phonenumber).
   // Deliberately broad: a needlessly hidden value costs a line of the prompt,
-  // and the other kind of mistake cannot be taken back.
+  // and the other kind of mistake cannot be taken back. A nonce is a one time
+  // payment token (Braintree's payment_method_nonce) or a form's CSRF token
+  // (WordPress's _wpnonce).
   const SECRET_WORDS = [
     'password', 'passwd', 'passphrase', 'passcode', 'pwd', 'secret', 'token', 'auth', 'oauth',
     'authorization', 'bearer', 'jwt', 'cookie', 'session', 'credential', 'apikey', 'accesskey',
     'privatekey', 'signingkey', 'csrf', 'xsrf', 'otp', 'totp', 'pin', 'pincode', 'cvv', 'cvc',
     'ssn', 'iban', 'cardnumber', 'creditcard', 'ccnumber', 'account', 'address', 'email', 'phone',
     'dob', 'birth', 'signature', 'jsessionid', 'sessid', 'securitycode', 'verificationcode',
+    'nonce',
   ];
 
   function isSecretName(name) {
@@ -303,9 +346,36 @@
   // Array method would otherwise run on every failure. How a fetch is
   // chained without a then of the page's is with the fetch wrapper below.
   const round = Math.round;
+
+  /**
+   * holder[key], or the native zone.js kept when it replaced it.
+   *
+   * On a tab that was open before the extension could start there, this file
+   * runs after the page's scripts (see startedLate), and zone.js may have
+   * replaced what it takes. zone.js keeps each native it replaces under a
+   * name of its own, and the native is taken from there when it has. At
+   * document_start no such name exists yet, and this is holder[key].
+   */
+  function beforeZone(holder, key) {
+    try {
+      const prefix = window.__Zone_symbol_prefix;
+      const saved = holder[((typeof prefix === 'string' && prefix) || '__zone_symbol__') + key];
+      if (typeof saved === 'function') return saved;
+    } catch {
+      /* the one in place, then */
+    }
+    return holder[key];
+  }
+
   // The constructor V8 consults for stackTraceLimit and prepareStackTrace,
-  // which is this one whatever the page later assigns to window.Error.
-  const NativeError = Error;
+  // which is this one whatever the page later assigns to window.Error. After
+  // a late start, zone.js's error plugin (zone-error, which an Angular
+  // project may load in development) may already have put its
+  // ZoneAwareError there. One made at every request read the stack at once,
+  // ran the page's prepareStackTrace and zone.js's own rewriting each time,
+  // and wrote the zone's name after every frame, so that no caller was ever
+  // recorded. Measured in Chrome for Testing 156.
+  const NativeError = beforeZone(window, 'Error');
 
   // What serialize() reads a logged value with. Each of these reads an
   // object's own state and runs nothing of the page's: no getter, no toJSON,
@@ -1835,23 +1905,13 @@
   //
   // On a tab that was open before the extension could start there, this
   // file runs after the page's scripts (see startedLate), and zone.js may
-  // have replaced both already. It keeps each native it replaces under a
-  // name of its own, and the natives are taken from there when it has.
-  // Through its copies, every listener below would be a task of the zone
-  // the page's request was opened in, and in Angular each task that runs
-  // is a change detection pass. Measured with zone.js in Chrome for Testing
-  // 156: a failed XHR ran 8 tasks in the page's zone instead of 3, three
-  // readystatechange, a loadend and a timer of the collector's.
-  function beforeZone(holder, key) {
-    try {
-      const prefix = window.__Zone_symbol_prefix;
-      const saved = holder[((typeof prefix === 'string' && prefix) || '__zone_symbol__') + key];
-      if (typeof saved === 'function') return saved;
-    } catch {
-      /* the one in place, then */
-    }
-    return holder[key];
-  }
+  // have replaced both already: they are taken from the natives it kept
+  // (see beforeZone). Through its copies, every listener below would be a
+  // task of the zone the page's request was opened in, and in Angular each
+  // task that runs is a change detection pass. Measured with zone.js in
+  // Chrome for Testing 156: a failed XHR ran 8 tasks in the page's zone
+  // instead of 3, three readystatechange, a loadend and a timer of the
+  // collector's.
   const nativeSetTimeout = beforeZone(window, 'setTimeout');
   const nativeAddEventListener = beforeZone(EventTarget.prototype, 'addEventListener');
 
@@ -2006,15 +2066,17 @@
   }
 
   /**
-   * The abort, timeout and loadend listeners, put on once per object rather
-   * than once per send. A page that long-polls by reusing a single
-   * XMLHttpRequest would otherwise accumulate one listener per send and
-   * record the same failure N times, flushing every other entry out of the
-   * ring buffer. They go on at the first open() rather than the first send(),
-   * so that a listener the page adds between the two cannot stop an event
-   * (stopImmediatePropagation) before it reaches them. One added before the
-   * first open() still can, and nothing short of replacing the constructor
-   * would go on earlier.
+   * The listeners, put on once per object rather than once per send. A page
+   * that long-polls by reusing a single XMLHttpRequest would otherwise
+   * accumulate one listener per send and record the same failure N times,
+   * flushing every other entry out of the ring buffer. They go on at the
+   * first open() rather than the first send(), so that a listener the page
+   * adds between the two cannot stop an event (stopImmediatePropagation)
+   * before it reaches them. One added before the first open() runs ahead of
+   * them, since listeners on one target run in the order they were added,
+   * whatever their capture flag (Chrome 156), and nothing short of replacing
+   * the constructor would go on earlier. Such a listener has to stop every
+   * event the request ends with to hide it (see the backstop).
    */
   function hook(xhr, state) {
     if (state.hooked) return;
@@ -2030,6 +2092,7 @@
       } catch {
         /* ignore */
       }
+      backstop();
     };
     reflectApply(nativeAddEventListener, xhr, ['abort', mark]);
     reflectApply(nativeAddEventListener, xhr, ['timeout', mark]);
@@ -2037,16 +2100,19 @@
     // stops the loadend event before it reaches the one below (F10). The
     // object turns DONE, and says so with a readystatechange, before any of
     // load, error, timeout, abort and loadend is dispatched, so a failure
-    // seen here is settled a task later if its loadend has not settled it by
-    // then. A success needs nothing, and costs one property read.
+    // seen at any of them is settled a task later if its loadend has not
+    // settled it by then, by one timer per request. Each of them, since
+    // such a listener can stop the readystatechange too. A success needs
+    // nothing, and costs a property read or two.
     const backstop = () => {
       try {
         if (xhr.readyState !== 4) return;
         const record = currentOf(xhr);
-        if (!record || !record.sent || record.settled || record.ended) return;
+        if (!record || !record.sent || record.settled || record.ended || record.backstop) return;
         const status = xhr.status;
         if (status !== 0 && status < 400) return;
         reflectApply(nativeSetTimeout, window, [() => settle(xhr, record), 0]);
+        record.backstop = true;
       } catch {
         /* ignore */
       }
@@ -2070,6 +2136,8 @@
     // Called through Reflect.apply, taken at the top, rather than through a
     // .call looked up on the page's Function.prototype.
     reflectApply(nativeAddEventListener, xhr, ['readystatechange', backstop]);
+    reflectApply(nativeAddEventListener, xhr, ['load', backstop]);
+    reflectApply(nativeAddEventListener, xhr, ['error', backstop]);
     reflectApply(nativeAddEventListener, xhr, ['loadend', ended]);
   }
 
@@ -2109,6 +2177,7 @@
         // would stop the loadend listener from settling any request at all.
         under: null,
         fallback: false,
+        backstop: false,
       };
     } catch {
       /* ignore */
@@ -2372,6 +2441,10 @@
     typeof DocumentFragment === 'function' ? DocumentFragment.prototype : null,
     'querySelector'
   );
+  const queryAllInRoot = nativeMethod(
+    typeof DocumentFragment === 'function' ? DocumentFragment.prototype : null,
+    'querySelectorAll'
+  );
   // The document is asked for its secret controls too (see documentValues),
   // through its own querySelectorAll and getElementsByTagName, and the
   // lists they answer read through their own natives.
@@ -2390,6 +2463,14 @@
   const GUARD_VALUES = 64; // values of secret controls remembered for one pick
   const DOCUMENT_CONTROLS = 32; // secret controls of the document read for one pick
   const DOCUMENT_NAMED = 256; // form controls of each tag judged by name for one pick
+  const SHADOW_LIGHT = 100000; // elements of the document asked for an open shadow root for one pick
+  const SHADOW_ROOTS = 512; // open shadow roots of the document looked into for one pick
+  // Elements in them asked for a shadow root of their own for one pick, and
+  // as many controls in them judged.
+  const SHADOW_NODES = 10000;
+  // In a shadow root, any element either kind of the document's could be:
+  // one of FIELD_TAGS, or one SECRET_CONTROLS matches.
+  const SHADOW_CONTROLS = 'input,textarea,select,' + SECRET_CONTROLS;
 
   /** Remembers a secret control's value, to withhold any prop that holds it. */
   function holdValue(guard, value) {
@@ -2398,6 +2479,38 @@
     if (!listed(guard.values, text) && guard.values.length < GUARD_VALUES) {
       guard.values[guard.values.length] = text;
     }
+  }
+
+  // Longer than any card number, phone number or account number written in
+  // groups: text past it is never judged by its digits (cardDigits).
+  const CARD_TEXT = 64;
+
+  /**
+   * The digits of a number SEED_LENGTH digits long or longer written with
+   * nothing but digits and what groups them (white space, dashes, dots,
+   * slashes, parentheses or a plus, as seedLike reads a number), in
+   * CARD_TEXT characters or fewer: a card's number however a form groups
+   * it. Otherwise null. Read by index.
+   */
+  function cardDigits(text) {
+    if (text.length > CARD_TEXT) return null;
+    let digits = '';
+    for (let i = 0; i < text.length; i += 1) {
+      const c = text[i];
+      if (c >= '0' && c <= '9') digits += c;
+      else if (!(whiteSpace(c) || c === '-' || c === '.' || c === '/' || c === '(' || c === ')' || c === '+')) return null;
+    }
+    return digits.length >= SEED_LENGTH ? digits : null;
+  }
+
+  /** The digits of each held value that is such a number (cardDigits), once a pick. */
+  function cardForms(held) {
+    const cards = [];
+    for (let i = 0; i < held.length; i += 1) {
+      const digits = cardDigits(held[i]);
+      if (digits !== null) cards[cards.length] = digits;
+    }
+    return cards;
   }
 
   /** What a control's own value getter answers, for a native form control. */
@@ -2475,8 +2588,8 @@
    * DOCUMENT_NAMED inputs, text areas and selects. Measured in Chrome for
    * Testing on a page of 60,000 elements, 20,000 of them inputs: about 3 ms
    * a pick, nearly all of it the selector, which has to look at every
-   * element. A field in a shadow root is not found here unless its host
-   * says it takes a secret, nor one in a frame.
+   * element. The fields in open shadow roots are found by shadowValues; one
+   * in a closed shadow root or in a frame is not found.
    */
   function documentValues(guard) {
     if (!queryAllIn || typeof document !== 'object' || document === null) return;
@@ -2492,34 +2605,209 @@
         for (let i = 0; i < DOCUMENT_NAMED && read < DOCUMENT_CONTROLS; i += 1) {
           const element = itemAt(controls, i);
           if (element === null) break;
-          const name = attributeIn(element, 'name');
-          const id = attributeIn(element, 'id');
-          if ((name && isSecretText(name)) || (id && isSecretText(id))) {
+          if (namedSecret(element)) {
             holdControlValue(guard, element);
             read += 1;
           }
         }
       }
+      shadowValues(guard);
     } catch {
       /* what was read so far */
     }
   }
 
+  /** Whether an element's name or id is a secret name. */
+  function namedSecret(element) {
+    const name = attributeIn(element, 'name');
+    const id = attributeIn(element, 'id');
+    return (name ? isSecretText(name) : false) || (id ? isSecretText(id) : false);
+  }
+
+  /**
+   * The same for the document's open shadow roots, whose hosts need say
+   * nothing of what they hold: a <login-form> of the page's own, with its
+   * password field inside. The first SHADOW_LIGHT elements of the document
+   * are asked for an open shadow root, and each root found is looked into
+   * with the roots inside it (shadowTree) before the next root of the light
+   * DOM, so the roots are taken depth first, in document order. Looked into
+   * after every root of the light DOM, as they were, the roots inside a
+   * shell were never reached on a page whose light DOM held SHADOW_ROOTS
+   * other roots, hundreds of icons with roots of their own, after the
+   * shell included. Bounded: SHADOW_LIGHT elements of the document asked,
+   * SHADOW_ROOTS roots looked into, SHADOW_NODES elements in them asked and
+   * as many controls judged, and DOCUMENT_CONTROLS controls read. Measured
+   * in Chrome for Testing 156 on a page of 60,000 elements, asking each one
+   * for its shadow root takes about 1 ms, less than half of what the
+   * selector of documentValues takes. A closed shadow root answers nothing.
+   */
+  function shadowValues(guard) {
+    if (!shadowOf || !queryAllInRoot || !tagsIn) return;
+    // The light DOM's roots first, as many as could be looked into: asked
+    // between them, a root's querySelectorAll made each next element of the
+    // live list cost more, 1.5 ms more a pick on a page of 60,000 elements.
+    const light = [];
+    const all = tagsIn(document, '*');
+    for (let i = 0; i < SHADOW_LIGHT && light.length < SHADOW_ROOTS; i += 1) {
+      const element = itemAt(all, i);
+      if (element === null) break;
+      const root = shadowOf(element);
+      if (root) append(light, root);
+    }
+    const walk = { roots: SHADOW_ROOTS, asked: SHADOW_NODES, judged: SHADOW_NODES, read: 0, stack: [] };
+    for (let r = 0; r < light.length && walk.roots > 0 && walk.read < DOCUMENT_CONTROLS; r += 1) {
+      shadowTree(guard, light[r], walk);
+    }
+  }
+
+  /**
+   * An open shadow root of the light DOM and the roots inside it, depth
+   * first in document order: a root's controls are judged as the
+   * document's are, by type or autocomplete, or for a form control by name
+   * or id, and the roots of its elements are looked into next, the first of
+   * them first, each with the roots inside it.
+   */
+  function shadowTree(guard, first, walk) {
+    const stack = walk.stack;
+    stack.length = 0;
+    append(stack, first);
+    while (stack.length > 0 && walk.roots > 0 && walk.read < DOCUMENT_CONTROLS) {
+      const root = stack[stack.length - 1];
+      stack.length -= 1;
+      walk.roots -= 1;
+      const controls = queryAllInRoot(root, SHADOW_CONTROLS);
+      const count = listLength(controls);
+      for (let i = 0; i < count && walk.judged > 0 && walk.read < DOCUMENT_CONTROLS; i += 1) {
+        walk.judged -= 1;
+        const element = controls[i];
+        if (
+          passwordKind(attributeIn(element, 'type'), attributeIn(element, 'autocomplete')) ||
+          (listed(FIELD_TAGS, tagOf(element)) && namedSecret(element))
+        ) {
+          holdControlValue(guard, element);
+          walk.read += 1;
+        }
+      }
+      if (walk.asked <= 0) continue;
+      const inside = queryAllInRoot(root, '*');
+      const size = listLength(inside);
+      const from = stack.length;
+      for (let i = 0; i < size && walk.asked > 0; i += 1) {
+        walk.asked -= 1;
+        const nested = shadowOf(inside[i]);
+        if (nested) append(stack, nested);
+      }
+      // Turned round, so that the first of them is taken off the stack first.
+      for (let a = from, b = stack.length - 1; a < b; a += 1, b -= 1) {
+        const swap = stack[a];
+        stack[a] = stack[b];
+        stack[b] = swap;
+      }
+    }
+  }
+
   /**
    * Whether a prop's text holds a value of a secret control: is it, holds
-   * it whole (a trimmed or formatted copy, a sentence quoting it), or is the
+   * it whole (a trimmed or formatted copy, a sentence quoting it), is the
    * most of it (a value seeded into a field the user has since typed on
-   * the end of). Short values only by equality: a one letter password is in
-   * half of everything.
+   * the end of), or is it changed in one place (a seed the user has since
+   * edited in the middle, see editedFrom). Short values only by equality: a
+   * one letter password is in half of everything.
    */
-  function holdsSecret(held, text) {
+  function holdsSecret(held, text, cards) {
     for (let i = 0; i < held.length; i += 1) {
-      const value = held[i];
-      if (text === value) return true;
-      if (value.length >= 4 && indexOfString(text, value) >= 0) return true;
-      if (text.length >= 4 && text.length * 2 >= value.length && indexOfString(value, text) >= 0) return true;
+      if (holds(held[i], text)) return true;
+    }
+    // A card's number grouped otherwise than the field groups it (raw
+    // digits a formatter hands back, dashes, groups of 4, 6 and 5) is judged
+    // by its digits, against the digits of each held value that is such a
+    // number (cardForms) and no other: a short code found inside the joined
+    // digits of a reference number is no copy of it. Those digits quoted
+    // whole in any text (a sentence, JSON, a URL) are a copy of it too.
+    if (cards.length) {
+      for (let i = 0; i < cards.length; i += 1) {
+        if (indexOfString(text, cards[i]) >= 0) return true;
+      }
+      const digits = cardDigits(text);
+      if (digits !== null) {
+        for (let i = 0; i < cards.length; i += 1) {
+          if (holds(cards[i], digits)) return true;
+        }
+      }
     }
     return false;
+  }
+
+  /** One held value against a prop's text, by the rules holdsSecret gives. */
+  function holds(value, text) {
+    if (text === value) return true;
+    if (value.length >= 4 && indexOfString(text, value) >= 0) return true;
+    if (text.length >= 4 && text.length * 2 >= value.length && indexOfString(value, text) >= 0) return true;
+    return editedFrom(text, value);
+  }
+
+  /**
+   * Whether a prop's text and a secret control's value differ in one place
+   * only (a run of characters put in, taken out or replaced), what they
+   * share at their two ends is four characters or more and three quarters
+   * of the longer, and the value reads as a passphrase or a seed (seedLike):
+   * a passphrase seeded into a field ("correct horse battery") that the user
+   * changed in the middle ("correct horse staple battery"). Not a title that
+   * only begins with the word a password begins with. Read by index, as the
+   * name test reads, so nothing of the page's runs.
+   */
+  function editedFrom(text, value) {
+    const shorter = text.length < value.length ? text.length : value.length;
+    const longer = text.length < value.length ? value.length : text.length;
+    let start = 0;
+    while (start < shorter && text[start] === value[start]) start += 1;
+    let end = 0;
+    while (end < shorter - start && text[text.length - 1 - end] === value[value.length - 1 - end]) end += 1;
+    const shared = start + end;
+    return shared >= 4 && shared * 4 >= longer * 3 && seedLike(value);
+  }
+
+  // A secret control's value this long or longer may be a seed (see seedLike).
+  const SEED_LENGTH = 12;
+
+  /** Whether a character is white space, as \s in a regular expression reads it. */
+  function whiteSpace(c) {
+    return (
+      c === ' ' || c === '\t' || c === '\n' || c === '\r' || c === '\f' || c === '\v' ||
+      c === '\u00a0' || c === '\u1680' || (c >= '\u2000' && c <= '\u200a') ||
+      c === '\u2028' || c === '\u2029' || c === '\u202f' || c === '\u205f' || c === '\u3000' || c === '\ufeff'
+    );
+  }
+
+  /**
+   * Whether a secret control's value reads as a passphrase or a seed, the
+   * kind a form fills in and the user then edits: words with white space
+   * between them, or SEED_LENGTH characters or more, and not a number of
+   * fewer than SEED_LENGTH digits however it is grouped (with spaces,
+   * dashes, dots, slashes, parentheses or a plus). A one-time code, a
+   * phone number or a date is one, and an order number or a total beside
+   * it differs from it in a digit or two without being an edit of it:
+   * those have rules of their own. A card's number is longer, and a prop
+   * a digit away from it holds all of it but that digit. Nor a short
+   * password, which an ordinary word is one letter away from (the label
+   * Password beside the password Passw0rd, a month beside the password
+   * January2024). Read by index.
+   */
+  function seedLike(value) {
+    let spaced = false;
+    let number = true;
+    let digits = 0;
+    for (let i = 0; i < value.length; i += 1) {
+      const c = value[i];
+      if (whiteSpace(c)) {
+        spaced = true;
+      } else if (c >= '0' && c <= '9') {
+        digits += 1;
+      } else if (!(c === '-' || c === '.' || c === '/' || c === '(' || c === ')' || c === '+')) {
+        number = false;
+      }
+    }
+    return (!number || digits >= SEED_LENGTH) && (spaced || value.length >= SEED_LENGTH);
   }
 
   // The shape of a password or a token: no whitespace, a letter and a digit.
@@ -2784,6 +3072,7 @@
       }
       const field = (guard && guard.field) || kind !== 0;
       const held = guard ? guard.values : [];
+      const cards = cardForms(held);
       for (const key of Object.keys(props)) {
         if (out.length >= PROP_LIMIT) break;
         // children is the subtree the user can already see, not a setting.
@@ -2810,7 +3099,7 @@
           typeof value !== 'object' &&
           (isSecretText(key) ||
             (field && listed(VALUE_PROPS, key)) ||
-            (scalar && holdsSecret(held, NativeString(value))) ||
+            (scalar && holdsSecret(held, NativeString(value), cards)) ||
             (password && secretShaped(key, value, digits)));
         out.push(key + '=' + (secret ? REDACTED : summariseValue(value)));
       }
@@ -3893,6 +4182,20 @@
     }
   }
 
+  /**
+   * What the panel's console and network chips show: two numbers, no entry.
+   * Each ring counted as the bridge hands it on, LIMIT at most: one a push
+   * left long (see push) is cut back only at the next push, and was counted
+   * whole, 90 where the log held 30.
+   */
+  function counts() {
+    const length = (ring) => (buffers[ring].length < LIMIT ? buffers[ring].length : LIMIT);
+    return {
+      console: length('console') + length('warnings') + length('errors'),
+      network: length('network'),
+    };
+  }
+
   // The bridge reads the log over a channel of its own rather than over
   // window.postMessage. A message posted to the window reaches every message
   // listener on the page, a third party's included, so each time the panel
@@ -3919,11 +4222,86 @@
   // window.postMessage, which this build no longer answers for the log; it
   // can only be running in a tab the extension reload has already cut it
   // off from.
+  //
+  // While the side panel is open on this tab, it holds a port to the bridge,
+  // and the bridge asks over its channel to 'watch' the counts: from then on
+  // a ring that grows says so once, with a '<channel>:changed' event that
+  // carries nothing, and says it again only after the bridge has asked for
+  // the 'counts', which it does at most four times a second, and at every
+  // read of the panel's, when it asks to 'watch' again. The bridge asks
+  // to 'unwatch' when the last port closes. The event is sent from push(),
+  // never while a request is being answered, so no page script can run with
+  // a request on window.event because of it: only a listener for that exact
+  // type hears it, and the type is the channel's name.
   const HELLO = '__cdr_hello';
   const CHANNEL = /^__cdr_[0-9a-f]{32}$/;
-  // The channels listened on, oldest first: { name, listener }.
+  // The channels listened on, oldest first: { name, listener, watched,
+  // signalled }, the last two for the counts above.
   const channels = [];
   const CHANNEL_LIMIT = 8;
+  // Whether countsChanged is sending its events now.
+  let telling = false;
+  // Calls deep the stack has to go still, for an event to reach the bridge's
+  // listener and for that to run (see countsChanged).
+  const HEADROOM = 1600;
+
+  function descend(depth) {
+    return depth <= 0 || descend(depth - 1);
+  }
+
+  /** Whether the stack has HEADROOM calls left in it. */
+  function roomToTell() {
+    try {
+      return descend(HEADROOM);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Says on each channel a panel watches, and that has not said it since its
+   * bridge last asked for the counts, that a ring has grown. A page that
+   * logs on its way back from a stack overflow has this run with all but no
+   * stack left. Then the dispatch threw, or Chrome could not call the
+   * bridge's listener and reported that in the tab as an uncaught error of
+   * the extension's; and since each channel was marked told before its
+   * event went out, it was never told again, and the chips stood still. So
+   * nothing is sent without room on the stack, and a channel is marked told
+   * only once its event has gone out: one not told is told with the next
+   * entry, which a page unwinding its stack makes with more room, into a
+   * ring already full too (owed). Nothing is told while an event is going
+   * out, so a listener that logs again (a page watching a channel of its
+   * own) is not told twice, and cannot recurse. A bridge whose listener
+   * failed even so asks again at its next read.
+   */
+  function countsChanged() {
+    if (telling) return;
+    telling = true;
+    try {
+      let room = null;
+      for (let i = 0; i < channels.length; i += 1) {
+        const entry = channels[i];
+        if (!entry.watched || entry.signalled) continue;
+        if (room === null) room = roomToTell();
+        if (!room) return;
+        try {
+          dispatchWindowEvent(window, newEvent(entry.name + ':changed', null, false));
+          entry.signalled = true;
+        } catch {
+          return; // told with the next entry
+        }
+      }
+      owed = false;
+    } finally {
+      telling = false;
+    }
+  }
+
+  function setWatched(entry, on) {
+    if (entry.watched === on) return;
+    entry.watched = on;
+    watching += on ? 1 : -1;
+  }
 
   function listen(name) {
     for (let i = 0; i < channels.length; i += 1) if (channels[i].name === name) return;
@@ -3939,22 +4317,29 @@
       const oldest = channels[0];
       for (let i = 1; i < channels.length; i += 1) channels[i - 1] = channels[i];
       channels.length -= 1;
+      setWatched(oldest, false);
       try {
         removeWindowListener(window, oldest.name, oldest.listener);
       } catch {
         /* still bounded: the entry is gone either way */
       }
     }
+    const entry = { __proto__: null, name, listener: null, watched: false, signalled: false };
     // Nothing of the page's runs from here to the reply: the request is read
     // and the reply made through what was taken at the top of this file, and
     // a page script that ran now could read the request's type off
     // window.event, which is the channel's name.
-    const listener = (event) => {
+    entry.listener = (event) => {
       try {
         const action = detailOf(event);
         let payload = null;
         if (action === 'snapshot') payload = snapshot();
         else if (action === 'clear') clearRings();
+        else if (action === 'watch' || action === 'counts') {
+          if (action === 'watch') setWatched(entry, true);
+          entry.signalled = false;
+          payload = counts();
+        } else if (action === 'unwatch') setWatched(entry, false);
         // The bridge asks once as it says HELLO, to learn that a collector
         // heard it, and is answered with nothing; see the bridge.
         else if (action !== 'ping') return;
@@ -3963,8 +4348,8 @@
         /* the bridge then reads nothing, and says so */
       }
     };
-    append(channels, { __proto__: null, name, listener });
-    addWindowListener(window, name, listener);
+    append(channels, entry);
+    addWindowListener(window, name, entry.listener);
   }
 
   try {
@@ -4043,12 +4428,17 @@
   // that passes through them, the guard's probe event, or the picker's
   // protocol. Nor is the channel closed to it. It can say a HELLO of its own
   // and read the log over that channel, lines logged before it ran
-  // included. And when the extension injects a bridge into a page already
-  // open, it can hear that bridge's HELLO and answer in this collector's
+  // included, or watch the counts on it, which say less than the log. A
+  // channel it watches is marked on its own, so it cannot keep the bridge's
+  // from being told. And when the extension injects a bridge into a page
+  // already open, it can hear that bridge's HELLO and answer in this collector's
   // place, which puts nothing in a prompt that logging made up lines would
-  // not. What it collects is the page's own console and network activity,
-  // which the first script the page runs could wrap for itself; a script
-  // that runs later can read, through this, what came before it.
+  // not, or ask to 'unwatch' on that bridge's channel, which leaves the
+  // chips at what the panel's last read found, as they were before they
+  // followed the log; each read asks to 'watch' again. What it collects is
+  // the page's own console and network activity, which the first script
+  // the page runs could wrap for itself; a script that runs later can read,
+  // through this, what came before it.
 })();
 
 // The address V8 gives this file, in stacks, in console messages and in CSP

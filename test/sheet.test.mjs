@@ -144,9 +144,10 @@ function fakeDownloads() {
  * A panel over the shared storage and downloads. `time` is the clock both
  * panels' Date.now reads, so that which edit came last is the test's to say.
  */
-async function openPanel({ storage, downloads, time, tab = { id: 7, windowId: 1, url: 'https://example.test/', title: 'Example' }, setup = () => {} }) {
+async function openPanel({ storage, downloads, time, tab = { id: 7, windowId: 1, url: 'https://example.test/', title: 'Example' }, setup = () => {}, fetch }) {
   const panel = loadPanel({
     tab,
+    fetch,
     setup: (chrome) => {
       chrome.storage = storage.api;
       chrome.downloads = downloads.api;
@@ -161,7 +162,7 @@ async function openPanel({ storage, downloads, time, tab = { id: 7, windowId: 1,
   return panel;
 }
 
-async function world({ panels = 1, seed = null, setups = [] } = {}) {
+async function world({ panels = 1, seed = null, setups = [], fetches = [] } = {}) {
   const storage = sharedStorage();
   const downloads = fakeDownloads();
   const time = { now: 1_800_000_000_000 };
@@ -175,6 +176,7 @@ async function world({ panels = 1, seed = null, setups = [] } = {}) {
         time,
         tab: { id: 7 + i, windowId: 1 + i, url: 'https://example.test/', title: 'Example' },
         setup: setups[i],
+        fetch: fetches[i],
       })
     );
   }
@@ -724,6 +726,152 @@ test('sheet: a file Chrome no longer lists is copied with a note that it was not
   assert.match(a.element('result-note').textContent, /file of item 1 in the copied prompt among its downloads/);
 });
 
+// F31 and F45, as in 0.6.0. A release candidate asked the disk itself, through
+// file URLs, where Chrome allows file access. On a volume that stopped
+// answering, its opens stayed blocked in Chrome, one per screenshot for each
+// panel page, until Chrome's file threads ran out across the whole browser
+// (W5-1). A file that would not open, in a folder Chrome listed as empty, was
+// called missing for good (W5-2). A deletion in a large folder was still
+// missed (W5-3). Chrome's download records alone say whether a screenshot is
+// there, with file access or without.
+
+/**
+ * File access as Chrome gives it to an extension loaded unpacked, and a fetch
+ * in a panel's realm that records every file URL asked. `answer(path)` is
+ * what an open does: by default nothing, ever, as on a volume gone quiet.
+ */
+function fileAccess(answer = () => new Promise(() => {})) {
+  const access = {
+    asked: [],
+    setup: (chrome) => {
+      chrome.extension = { isAllowedFileSchemeAccess: async () => true };
+    },
+    // The panel's own fetch from its first line, so opens at load count.
+    fetch: async (url) => {
+      if (!String(url).startsWith('file:')) return { blob: async () => ({}) };
+      access.asked.push(String(url));
+      return answer(decodeURIComponent(String(url).slice('file://'.length)));
+    },
+    install(panel) {
+      panel.document.visibilityState = 'visible';
+      const global = panel.R('globalThis');
+      const own = global.fetch;
+      global.fetch = async (url, ...rest) => {
+        if (!String(url).startsWith('file:')) return own(url, ...rest);
+        access.asked.push(String(url));
+        return answer(decodeURIComponent(String(url).slice('file://'.length)));
+      };
+    },
+  };
+  return access;
+}
+
+/** Chrome 156's page for a folder: start("<folder>"), then one addRow per entry. */
+function listing(folder, names) {
+  return `<script>start(${JSON.stringify(folder)});</script>\n${names.map((name) => `<script>addRow(${JSON.stringify(name)},"",0,1,"1 B",0,"");</script>\n`).join('')}`;
+}
+
+test('sheet: with file access, three panels over a sheet on a volume that does not answer open no file', async () => {
+  const quiet = fileAccess();
+  const stored = Array.from({ length: 300 }, (_, index) => storedItem(`quiet-${index}`, { downloadId: 100 + index, included: index === 0 }));
+  const { storage, downloads, time, panels } = await world({
+    panels: 3,
+    setups: [quiet.setup, quiet.setup, quiet.setup],
+    fetches: [quiet.fetch, quiet.fetch, quiet.fetch],
+    seed: ({ storage, downloads, time }) => {
+      storage.data.set('cdrReport', { items: stored, updatedAt: time.now, writer: 'x' });
+      for (const item of stored) recordFor(downloads, item.downloadId, item.path);
+    },
+  });
+  for (const panel of panels) quiet.install(panel);
+  // A reopened panel is a new page, which checks at load: three more.
+  for (let i = 0; i < 3; i += 1) {
+    const again = await openPanel({ storage, downloads, time, tab: { id: 20 + i, windowId: 9 + i, url: 'https://example.test/', title: 'Example' }, setup: quiet.setup, fetch: quiet.fetch });
+    await again.clock.advance(30_000);
+    await settle(again);
+  }
+  // Each panel shown again three times, as a reopened panel or a window
+  // brought back is, with time for every check to give up on the volume.
+  for (let round = 0; round < 3; round += 1) {
+    for (const panel of panels) {
+      panel.documentEvent('visibilitychange');
+      await panel.clock.advance(30_000);
+      await settle(panel);
+    }
+  }
+  const [a] = panels;
+  a.click('submit');
+  await a.clock.advance(500);
+  await settle(...panels);
+  assert.equal(a.element('result').hidden, false, 'the copy waited on a volume that does not answer');
+  assert.equal(quiet.asked.length, 0, `${quiet.asked.length} file opens left waiting on the volume`);
+});
+
+test('sheet: with file access, a screenshot Chrome says is there is not called missing though it will not open and its folder lists empty', async () => {
+  // As a file set to mode 000 in a folder set to 311 is seen in Chrome 156:
+  // the file does not open, and the folder's first listing is empty.
+  const shut = fileAccess((path) => {
+    if (path.endsWith('/')) return { ok: false, status: 0, body: null, text: async () => listing(path, []) };
+    throw new TypeError('Failed to fetch');
+  });
+  const { panels: [a] } = await world({ setups: [shut.setup] });
+  shut.install(a);
+  await capture(a);
+  for (let round = 0; round < 3; round += 1) {
+    a.documentEvent('visibilitychange');
+    await a.clock.advance(3000);
+    await settle(a);
+    assert.ok(!items(a)[0].missing, `a file Chrome says is there was called missing, check ${round + 1}`);
+  }
+  a.click('submit');
+  await a.clock.advance(500);
+  await settle(a);
+  assert.equal(a.element('result').hidden, false, 'a file Chrome says is there held the copy back');
+  assert.deepEqual(shut.asked, []);
+});
+
+test('sheet: with file access or without, a file deleted just before Copy is for Chrome to report', async () => {
+  for (const allowed of [false, true]) {
+    const disk = new Set();
+    const access = fileAccess((path) => {
+      if (path === DIR) return { ok: false, status: 0, body: null, text: async () => listing(DIR, [...disk].map((file) => file.slice(DIR.length))) };
+      if (disk.has(path)) return { ok: true, status: 200, body: { cancel: async () => {} } };
+      throw new TypeError('Failed to fetch');
+    });
+    const { downloads, time, panels: [a] } = await world({ setups: [allowed ? access.setup : () => {}] });
+    access.install(a);
+    // Two captures in one second get names of their own, as Chrome gives them.
+    const download = downloads.api.download;
+    downloads.api.download = async (options) => {
+      const id = await download(options);
+      const record = downloads.records.get(id);
+      record.filename = record.filename.replace(/\.png$/, ` (${id}).png`);
+      return id;
+    };
+    await capture(a);
+    time.now += 1000;
+    await capture(a);
+    const [first, second] = items(a);
+    assert.notEqual(first.path, second.path);
+    for (const item of items(a)) disk.add(item.path);
+    // Deleted a moment ago, in a folder of any size: Chrome's record still
+    // says it is there, as it does until Chrome next looks.
+    disk.delete(second.path);
+    a.click('submit');
+    await a.clock.advance(500);
+    await settle(a);
+    const which = allowed ? 'with file access' : 'without file access';
+    assert.equal(a.element('result').hidden, false, `held back ${which}`);
+    assert.equal(a.element('result-note').hidden, true, which);
+    // Chrome's own look finds it gone: the receipt says so.
+    downloads.records.get(second.downloadId).exists = false;
+    for (const fn of downloads.listeners) fn({ id: second.downloadId, exists: { previous: true, current: false } });
+    await settle(a);
+    assert.match(a.element('result-note').textContent, /screenshot of item 2 in the copied prompt gone from disk/, which);
+    assert.deepEqual(access.asked, [], which);
+  }
+});
+
 test('sheet: a missing flag stored by an older build is asked again', async () => {
   const { panels: [a] } = await world({
     seed: ({ storage, downloads, time }) => {
@@ -959,6 +1107,154 @@ test('sheet: when the undo line goes from under the keyboard, focus stays in the
     assert.equal(doc.activeElement, a.element('description'));
   } finally {
     restore();
+  }
+});
+
+/**
+ * Chrome takes the focus off a control once it is disabled and leaves it on
+ * the body: seen in Chrome 156 for Copy, pressed with a real click in a side
+ * panel, in every copy, since Copy is disabled while it works.
+ */
+function dropFocusWhenDisabled(panel, id) {
+  const doc = panel.R('document');
+  const node = panel.element(id);
+  let disabled = node.disabled;
+  Object.defineProperty(node, 'disabled', {
+    configurable: true,
+    get: () => disabled,
+    set(value) {
+      disabled = Boolean(value);
+      if (disabled && doc.activeElement === node) doc.activeElement = doc.body;
+    },
+  });
+}
+
+// F58. After a copy held back by a missing file, focus was on the body.
+test('sheet: Copy held back by a missing file hands the keyboard to that item\'s tick', async () => {
+  const { downloads, time, panels: [a] } = await world();
+  const restore = trackFocus(a);
+  try {
+    dropFocusWhenDisabled(a, 'submit');
+    await capture(a);
+    time.now += 1000;
+    await capture(a);
+    const [, second] = items(a);
+    downloads.records.get(second.downloadId).exists = false;
+    a.element('submit').focus();
+    a.click('submit');
+    await a.clock.advance(500);
+    await settle(a);
+    assert.equal(second.missing, true);
+    assert.equal(a.element('submit').disabled, true);
+    const tick = rowAt(a, 1).children[0].children[0];
+    assert.equal(a.R('document').activeElement, tick, 'focus was left on the body');
+  } finally {
+    restore();
+  }
+});
+
+test('sheet: after a copy Copy keeps the keyboard, and once the sheet is empty Copy again has it', async () => {
+  const { time, panels: [a] } = await world();
+  const restore = trackFocus(a);
+  try {
+    dropFocusWhenDisabled(a, 'submit');
+    const doc = a.R('document');
+    await capture(a);
+    time.now += 1000;
+    await capture(a);
+    // Item 1 is left out of this copy, and ticked for the next.
+    tickRow(a, 0, false);
+    a.element('submit').focus();
+    a.click('submit');
+    await a.clock.advance(500);
+    await settle(a);
+    assert.equal(items(a).length, 1);
+    assert.equal(a.element('submit').disabled, false);
+    assert.equal(doc.activeElement, a.element('submit'), 'focus was left on the body');
+
+    a.click('submit');
+    await a.clock.advance(500);
+    await settle(a);
+    assert.equal(items(a).length, 0);
+    assert.equal(a.element('result').hidden, false);
+    assert.equal(doc.activeElement, a.element('copy-again'), 'focus was left on the body');
+
+    // Put somewhere else by the user while the copy worked: left there.
+    await capture(a);
+    a.element('submit').focus();
+    a.click('submit');
+    a.element('description').focus();
+    await a.clock.advance(500);
+    await settle(a);
+    assert.equal(doc.activeElement, a.element('description'));
+  } finally {
+    restore();
+  }
+});
+
+/** Cmd+Enter through the panel's keydown listeners, as pressed in the field. */
+function copyKey(panel) {
+  panel.documentEvent('keydown', {
+    key: 'Enter',
+    isComposing: false,
+    metaKey: true,
+    ctrlKey: false,
+    shiftKey: false,
+    altKey: false,
+    preventDefault() {},
+  });
+}
+
+// V5-5 (F58). Cmd+Enter in the field copied, the emptied sheet hid the field,
+// and the keyboard was left on the body, as it was after Copy before F58.
+test('sheet: Cmd+Enter in the field that empties the sheet hands the keyboard to Copy again', async () => {
+  for (const when of ['a moment later', 'at once']) {
+    const { time, panels: [a] } = await world();
+    const restore = trackFocus(a);
+    try {
+      dropFocusWhenDisabled(a, 'submit');
+      const doc = a.R('document');
+      const field = a.element('description');
+      const section = a.element('item');
+      // Chrome takes the focus off a control once it is hidden, in a task of
+      // its own after the next style update: until then the hidden field is
+      // still the active element. Seen both ways, the copy must not care.
+      field.checkVisibility = () => !section.hidden;
+      let hidden = section.hidden;
+      Object.defineProperty(section, 'hidden', {
+        configurable: true,
+        get: () => hidden,
+        set(value) {
+          hidden = Boolean(value);
+          if (hidden && when === 'at once' && doc.activeElement === field) doc.activeElement = doc.body;
+        },
+      });
+      await capture(a);
+      time.now += 1000;
+      await capture(a);
+      field.focus();
+      copyKey(a);
+      await a.clock.advance(500);
+      await settle(a);
+      assert.equal(items(a).length, 0);
+      assert.equal(a.element('result').hidden, false);
+      assert.equal(doc.activeElement, a.element('copy-again'), `the keyboard was lost with the field hidden ${when}`);
+
+      // A copy that leaves an item keeps the field shown, and the keyboard in it.
+      await capture(a);
+      time.now += 1000;
+      await capture(a);
+      tickRow(a, 0, false);
+      field.focus();
+      copyKey(a);
+      await a.clock.advance(500);
+      await settle(a);
+      assert.equal(items(a).length, 1);
+      assert.equal(section.hidden, false);
+      assert.equal(doc.activeElement, field, 'the keyboard was taken out of the field');
+    } finally {
+      restore();
+    }
   }
 });
 
@@ -1204,6 +1500,28 @@ test('sheet: a copy with no page to read still goes once Chrome has had its time
   await settle(a);
   assert.equal(a.element('result').hidden, false, 'the wait has no end');
   assert.equal(items(a).length, 0);
+});
+
+// F57. Copy took the banner down as it started, and on a restricted tab the
+// restriction stayed away until the next tab event.
+test('sheet: on a tab the panel may not capture, the restriction stays up through a copy', async () => {
+  const { a } = await restrictedWorld({ after: 10_000 });
+  a.click('submit');
+  await a.clock.advance(500);
+  await settle(a);
+  assert.equal(a.element('result').hidden, false);
+  assert.match(a.banner() || '', /closed to extensions/, 'the copy took the restriction down');
+});
+
+test('sheet: on a tab the panel may not capture, the restriction comes back once a missing file is dealt with', async () => {
+  const { a } = await restrictedWorld({ after: 27 });
+  a.click('submit');
+  await a.clock.advance(500);
+  await settle(a);
+  assert.match(a.banner() || '', /item 1 on the sheet is no longer on disk/);
+  tickRow(a, 0, false);
+  assert.match(a.banner() || '', /closed to extensions/, 'the restriction stayed away with the missing file\'s banner');
+  assert.equal(a.element('banner-live').getAttribute('aria-live'), 'assertive');
 });
 
 // The same answer can land while the clipboard is written, after the prompt

@@ -112,13 +112,16 @@
   // "ssn" nor passHref by "pass". A word of five letters or more also matches
   // at either end of a run together lowercase name (authtoken, phonenumber).
   // Deliberately broad: a needlessly hidden value costs a line of the prompt,
-  // and the other kind of mistake cannot be taken back.
+  // and the other kind of mistake cannot be taken back. A nonce is a one time
+  // payment token (Braintree's payment_method_nonce) or a form's CSRF token
+  // (WordPress's _wpnonce).
   const SECRET_WORDS = [
     'password', 'passwd', 'passphrase', 'passcode', 'pwd', 'secret', 'token', 'auth', 'oauth',
     'authorization', 'bearer', 'jwt', 'cookie', 'session', 'credential', 'apikey', 'accesskey',
     'privatekey', 'signingkey', 'csrf', 'xsrf', 'otp', 'totp', 'pin', 'pincode', 'cvv', 'cvc',
     'ssn', 'iban', 'cardnumber', 'creditcard', 'ccnumber', 'account', 'address', 'email', 'phone',
     'dob', 'birth', 'signature', 'jsessionid', 'sessid', 'securitycode', 'verificationcode',
+    'nonce',
   ];
 
   function isSecretName(name) {
@@ -167,13 +170,50 @@
   // it. A token used as a user name still goes: it carries digits
   // (https://ghp_…@github.com, a Sentry key), capitals run together
   // (AKIAIOSFODNNEXAMPLE), a run of small letters longer than a word
-  // (the 24 of a Stripe test key), or more than PLAIN_USER_MAX characters.
+  // (the 24 of a Stripe test key), more than PLAIN_USER_MAX characters, or
+  // five consonants in a row (CONSONANT_RUN).
   const PLAIN_USER =
     /^[A-Za-z][a-z]{0,15}(?:[A-Z][a-z]{1,15})*(?:[._-][A-Za-z][a-z]{0,15}(?:[A-Z][a-z]{1,15})*)*$/;
   const PLAIN_USER_MAX = 32;
 
-  // A key in JSON, written out or once decoded: "token": in state={"token":…}.
-  const JSON_KEY = /"([^"\\]*)"\s*:/g;
+  // Five consonants in a row, y counted as a vowel (rhythm, mysql), once the
+  // letters that spell one sound (sch, tch, ght, str, th, ng, Polish sz and cz)
+  // and the abbreviations service accounts are named with (sql, svc, srv, http,
+  // ftp, ctrl) are each read as one consonant (CONSONANT_GROUPS), so armstrong,
+  // jschmidt, dijkstra, pgsql and lightdm stay. About one word of English in
+  // ten thousand still holds them (offspring), against about four in nine of
+  // the random tokens of eight small letters and three in four of sixteen.
+  // Telling the rest of such tokens from a word (administrator) would take a
+  // dictionary.
+  const CONSONANT_RUN = /[bcdfghjklmnpqrstvwxz]{5}/i;
+  const CONSONANT_GROUPS = /sch|tch|ght|str|sql|svc|srv|http|ftp|ctrl|ch|sh|th|ph|ck|ng|mc|kr|tz|sz|cz|rz/g;
+
+  // A key in JSON: "token": in state={"token":…}, or 'token': in a JavaScript
+  // object written in single quotes. Also one whose quotes are escaped, as JSON
+  // written into a string of other JSON writes them ({"s":"{\"token\":…}"}),
+  // at any depth, or written as .NET's encoder writes a quote in a string
+  // (\u0022), or percent encoded once or more, as Chrome writes a url's quotes
+  // and encodeURIComponent its colon ({%22token%22:…}, %7B'token'%3A…,
+  // %257B%2527token%2527%253A…); and one with a \u escape or an escape of its
+  // own letters, which are decoded before it is judged. Only where JSON puts a
+  // key: after a '{' or a ',' (raw or encoded) and any white space (raw,
+  // escaped as \n, encoded or a '+'), and Python's string prefix if any
+  // ({u'token': u'…'}, {b'token': …}), so that a case label (case 'code':), a
+  // ternary (? 'session' :) or prose (what's 'code': 5) is no key. A run of
+  // backslashes is matched from its first, so the scan never goes back over
+  // one, and what comes before a key is looked at only at a quote.
+  const KEY_QUOTE_FORMS = String.raw`["']|\\u00(?:22|27)|%(?:25)*2[27]`;
+  const QUOTED_KEY = new RegExp(
+    String.raw`(?<!\\)(\\*)(${KEY_QUOTE_FORMS})` +
+      String.raw`(?<=(?:[{,]|%(?:25)*(?:7[Bb]|2[Cc]))(?:\s|\\+[nrt]|%(?:25)*(?:20|0[9AaDd])|\+)*[uUbBrR]{0,2}\\*(?:${KEY_QUOTE_FORMS}))` +
+      String.raw`([^"'\\%]*(?:(?:\\u(?!00(?:22|27))[0-9A-Fa-f]{4}|%(?!(?:25)*2[27]))[^"'\\%]*)*)` +
+      String.raw`\1\2(?:\s|%(?:25)*(?:20|0[9AaDd])|\+)*(?::|%(?:25)*3[Aa])`,
+    'g'
+  );
+
+  // In a url, also a key in plain double quotes wherever it stands, as a url
+  // has always been read: "token": in ?s="token":"…" too.
+  const URL_KEY = new RegExp(String.raw`${QUOTED_KEY.source}|"([^"\\]*)"\s*:`, 'g');
 
   // More distinct keys than any state a url carries. Past that the value is a
   // blob, kept out whole rather than judged key by key in the page's time.
@@ -197,25 +237,91 @@
     if (userinfo.includes(':')) return true;
     if (/[^\x00-\x7f]/.test(userinfo) || /[;,]/.test(userinfo)) return false;
     if (userinfo && !USERINFO.test(userinfo)) return false;
-    return !(userinfo.length <= PLAIN_USER_MAX && PLAIN_USER.test(userinfo));
+    return !(
+      userinfo.length <= PLAIN_USER_MAX &&
+      PLAIN_USER.test(userinfo) &&
+      !CONSONANT_RUN.test(userinfo.toLowerCase().replace(CONSONANT_GROUPS, 'c'))
+    );
   }
 
   /**
-   * Whether JSON in a value names a secret key (state={"token":"…"}), each
-   * distinct key judged once, and by the rule for a parameter's name: the key
-   * of a state the url carries is a parameter of it, so {"key":…} and
-   * {"code":…} are as secret as ?key= and ?code=.
+   * Where each key in text that names a secret starts (state={"token":…}), in
+   * order, or only the first unless `all`; null past MAX_JSON_KEYS distinct
+   * keys, which make a blob. Each distinct key is judged once, and by the rule
+   * for a parameter's name: the key of a state the url carries is a parameter
+   * of it, so {"key":…} and {"code":…} are as secret as ?key= and ?code=. In a
+   * url a key in plain double quotes counts wherever it stands (URL_KEY); in a
+   * document (`strict`: a data: url's content, a srcdoc) only where JSON puts
+   * one (QUOTED_KEY), since script and prose there are full of quoted words
+   * before a colon. One read of the text (see judgedKey).
    */
-  function secretKeyIn(text) {
-    if (!text.includes('"')) return false;
-    const seen = new Set();
-    for (const [, key] of text.matchAll(JSON_KEY)) {
-      if (seen.has(key)) continue;
-      if (seen.size === MAX_JSON_KEYS) return true;
-      seen.add(key);
-      if (isSecretParam(key)) return true;
+  function secretKeysIn(text, strict, all) {
+    // Every key has a quote and a colon. Asked of every value, so the common
+    // answer costs a look or two and no pattern.
+    const escaped = text.includes('%');
+    if (!text.includes('"') && !text.includes("'") && !text.includes('\\u00') && !(escaped && /%(?:25)*2[27]/.test(text))) {
+      return [];
     }
-    return false;
+    if (!text.includes(':') && !(escaped && /%(?:25)*3A/i.test(text))) return [];
+    // Read with exec rather than matchAll, which copies the pattern on every
+    // call; nothing read here comes back to this function.
+    const pattern = strict ? QUOTED_KEY : URL_KEY;
+    pattern.lastIndex = 0;
+    // Distinct keys are counted only once there are matches enough to make a
+    // blob: until then each is only noted.
+    const noted = [];
+    let keys = null;
+    const found = [];
+    for (let match = pattern.exec(text); match; match = pattern.exec(text)) {
+      const { key, secret } = judgedKey(match[3] ?? match[4]);
+      if (keys) keys.add(key);
+      else if (noted.push(key) > MAX_JSON_KEYS) keys = new Set(noted);
+      if (keys && keys.size > MAX_JSON_KEYS) return null;
+      if (secret) {
+        found.push(match.index);
+        if (!all) break;
+      }
+    }
+    return found;
+  }
+
+  // Keys as written, with what they decode to and whether that is secret. A
+  // page writes the same few keys over and over, in every url it logs, so a
+  // short one is remembered, up to a bound, rather than decoded and judged
+  // again each time.
+  const JUDGED_KEYS = new Map();
+  function judgedKey(written) {
+    let judged = JUDGED_KEYS.get(written);
+    if (judged) return judged;
+    let key = written.includes('%') ? decodeLoosely(written) : written;
+    if (key.includes('\\')) key = key.replace(/\\u(.{4})/g, (escape, hex) => String.fromCharCode(parseInt(hex, 16)));
+    judged = { key, secret: isSecretParam(key) };
+    if (written.length <= 64) {
+      if (JUDGED_KEYS.size === 1000) JUDGED_KEYS.clear();
+      JUDGED_KEYS.set(written, judged);
+    }
+    return judged;
+  }
+
+  /** Whether JSON in text names a secret key, or is a blob (secretKeysIn). */
+  function secretKeyIn(text, strict) {
+    const found = secretKeysIn(text, strict, false);
+    return found === null || found.length > 0;
+  }
+
+  /**
+   * Whether JSON in text names a secret key as it stands, or decoded again for
+   * each layer of encoding up to as many as a value is followed (MAX_NESTING),
+   * counting from `layer`.
+   */
+  function secretKeyDecoded(text, layer) {
+    for (; ; layer += 1) {
+      if (secretKeyIn(text, false)) return true;
+      if (layer === MAX_NESTING || !text.includes('%')) return false;
+      const decoded = decodeLoosely(text);
+      if (decoded === text) return false;
+      text = decoded;
+    }
   }
 
   // isSecretName's test, with each word looked up rather than compared with
@@ -283,7 +389,9 @@
     for (let index = 0; index < pieces.length; index += 2) {
       const pair = pieces[index];
       const eq = pair.indexOf('=');
-      if (eq <= 0 || eq === pair.length - 1) continue;
+      // A pair with no name (?=https://…) names no secret, but its value can
+      // still hold a url or JSON that does.
+      if (eq === -1 || eq === pair.length - 1) continue;
       let name = pair.slice(0, eq);
       try {
         name = decodeURIComponent(name.replace(/\+/g, ' '));
@@ -311,11 +419,24 @@
    */
   function nestedUrl(value, depth) {
     const holdsUrl = (text) => /[?#]/.test(text) || credentialsAt(text) !== null;
-    if (secretKeyIn(value)) return REDACTED;
+    if (secretKeyIn(value, false)) return REDACTED;
     if (holdsUrl(value)) return depth < MAX_NESTING ? screenUrl(value, depth + 1) : REDACTED;
     // %253F is a '?' encoded twice, as a return address inside a return
-    // address's own encoding arrives. %22 is a quote, which JSON starts with.
-    if (!/%(?:25)*(?:3F|23|40|22)/i.test(value)) return value;
+    // address's own encoding arrives. %22 is a quote, which JSON starts with,
+    // and %27 and %5C an apostrophe or a backslash, with which a key in single
+    // quotes can show only once decoded ({%5C%27token%5C%27:…}, {%5Cn%27…),
+    // so long as a colon, raw or encoded, can follow it.
+    // Only where a decode can show more than prose (it's: 1) or a path
+    // (C:\dir), whose decoding cost a picked link of them two and a half
+    // times 0.6.0: a '{' or ',' a key can follow, a raw double quote (a key
+    // whose colon is encoded), an escape of a letter or digit, which no
+    // ordinary encoder writes (%25%37%42 is a '{' twice encoded), or an '@'
+    // with slashes (credentials in an encoded link).
+    const keyed =
+      /%(?:25)*(?:27|5C)/i.test(value) &&
+      /:|%(?:25)*3A/i.test(value) &&
+      (/[{,"]|%(?:25)*(?:7B|2C|3\d|[46][1-9A-F]|[57][0-9A])/i.test(value) || (value.includes('@') && /\/\/|%(?:25)*2F/i.test(value)));
+    if (!keyed && !/%(?:25)*(?:3F|23|40|22)/i.test(value)) return value;
     const decoded = decodeLoosely(value);
     if (holdsUrl(decoded)) {
       return depth < MAX_NESTING && screenUrl(decoded, depth + 1) === decoded ? value : REDACTED;
@@ -459,14 +580,14 @@
    * parameters (;charset=utf8) end at its comma. What follows is its content,
    * not more parameters: an svg, each of whose %23 colours would read as one
    * more nested url, or base64, whose '=' padding would end a name made of
-   * random letters. Content that is not base64 can still hold a link (an html
-   * or svg document, percent encoded), and is masked whole when that link
-   * carries a secret (see dataContent).
+   * random letters. Its content can still hold a link (an html or svg
+   * document, percent encoded) or JSON, and is masked whole when that link
+   * carries a secret or that JSON names a secret key (see dataContent).
    */
   function maskPath(path, depth) {
     const comma = /^\s*data:/i.test(path) ? path.indexOf(',') : -1;
     const end = comma === -1 ? path.length : comma;
-    const tail = comma === -1 ? '' : dataContent(path.slice(0, comma), path.slice(comma), depth);
+    const tail = comma === -1 ? '' : dataContent(path.slice(comma), depth);
     const semi = path.indexOf(';');
     if (semi === -1 || semi > end) return comma === -1 ? path : path.slice(0, comma) + tail;
     return path.slice(0, semi) + maskParams(path.slice(semi, end), depth) + tail;
@@ -474,44 +595,241 @@
 
   /**
    * A data: url's content, from its comma, masked whole when a link inside
-   * it carries credentials or a secret parameter. Read as written and then
+   * it carries credentials or a secret parameter, or when JSON in it names a
+   * secret key (data:application/json,{"token":…}). Read as written and then
    * decoded, since the link in data:text/html,%3Ca%20href%3D%22…%3Ftoken%3D…
    * is all escapes; put back encoded, a marker in it would print as
    * %3Credacted%3E. Decoded loosely, so one stray '%' does not hide the rest,
    * and again for each layer of encoding, as many as a value is followed
    * (MAX_NESTING), since content encoded twice shows its link only on the
    * second. Content still encoded past that, and still able to hold a link,
-   * is masked whole, as a parameter nested past MAX_NESTING is. Only the query
-   * and fragment of what it holds are read, never a ';' or a bare '=', which is
-   * what an svg's styles and a nested base64 image's padding are made of.
-   * Base64 content is left alone: it is no text to read.
+   * is masked whole, as a parameter nested past MAX_NESTING is. Of what it
+   * holds, the query and fragment are read, and in the last layer the names of
+   * an absolute url's path parameters, so a ;jsessionid= counts (pathSecretIn);
+   * never a ';' or a bare '=' elsewhere, which is what an svg's styles and a
+   * nested base64 image's padding are made of.
+   * JSON keys count only where JSON puts one (secretKeysIn, strict), since the
+   * script in an html document is full of quoted words before a colon.
+   * Base64 content is never read as anything else: it holds no '?', '#', '@',
+   * '://' or quote, encoded or not, so it is handed back at the first look, and
+   * a url that says ;base64 while holding text is read as text.
    */
-  function dataContent(head, content, depth) {
+  function dataContent(content, depth) {
     const linkable = /[?#@]|%(?:25)*(?:3F|23|40)/i;
-    if (/;\s*base64\s*$/i.test(head) || !linkable.test(content)) return content;
+    if (!linkable.test(content) && !/["']|:\/\/|%(?:25)*(?:2[27]|3A%(?:25)*2F)/i.test(content)) return content;
     const next = Math.min(depth + 1, MAX_NESTING);
     let text = content;
     for (let layer = 0; ; layer += 1) {
-      if (withoutCredentials(text) !== text) return `,${REDACTED}`;
+      if (withoutCredentials(text) !== text || secretKeyIn(text, true)) return `,${REDACTED}`;
       for (const [part] of text.matchAll(/[?#][^\s"'<>`]*/g)) {
         if (maskParams(part, next) !== part) return `,${REDACTED}`;
       }
-      const decoded = decodeLoosely(text);
-      if (decoded === text) return content;
-      if (layer === MAX_NESTING) return linkable.test(decoded) ? `,${REDACTED}` : content;
+      const decoded = decodingShows(text) ? decodeLoosely(text) : text;
+      if (decoded === text || layer === MAX_NESTING) {
+        return (decoded !== text && linkable.test(decoded)) || pathSecretIn(decoded) ? `,${REDACTED}` : content;
+      }
       text = decoded;
     }
+  }
+
+  /**
+   * Whether an absolute url in a data: url's content, decoded as far as it
+   * goes, names a secret path parameter (;jsessionid=). The url is read from
+   * its '//' to the first character no url holds as written in markup, raw or
+   * percent encoded (a quote, '<', '>', a space), and only a name made of url
+   * characters counts, so an html entity's ';' and the text after it are none.
+   * Its credentials, query and fragment are read with the rest of the content.
+   * One pass, however many layers and parameters.
+   */
+  function pathSecretIn(text) {
+    for (const [url] of text.matchAll(/:\/\/(?:[^\s"'<>`%]|%(?!2[027]|3[CEce]))*/g)) {
+      for (const [, name] of url.matchAll(/;([\w.-]+)=/g)) if (isSecretParam(name)) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Whether content read as it stands could show more decoded once. Only an
+   * escape of what a link or a pair is cut by can: a '?', '#', '@', '&', ';',
+   * '=', ':' or '/', or a backslash, which escapes a quote. Every other one (a
+   * space, a letter, a brace, a comma) is read as it stands, since keys are
+   * found with their braces, commas, white space and colon raw or encoded, and
+   * a key's own escapes are decoded before it is judged. A key is found only
+   * where both its quotes are written alike, so quotes in two forms (raw and
+   * encoded, or encoded to two depths) are read decoded too, and so is an
+   * escape just before a '//', which decides whether what follows is read as a
+   * userinfo (withoutCredentials).
+   */
+  const LAYER_ESCAPE = /%(?:25)*(?:2[36Ff]|3[AaBbDdFf]|40|5[Cc])/i;
+  function decodingShows(text) {
+    if (!text.includes('%')) return false;
+    if (LAYER_ESCAPE.test(text)) return true;
+    // What stands before a '//' decides whether a userinfo after it is read.
+    if (text.includes('@') && /%[0-9A-Fa-f]{2}(?:\/\/|\\\/\\\/)/.test(text)) return true;
+    const raw = text.includes('"') || text.includes("'");
+    const once = /%2[27]/i.test(text);
+    const deeper = /%25(?:25)*2[27]/i.test(text);
+    return raw + once + deeper > 1;
+  }
+
+  // The first bracket of JSON in a url, raw or percent encoded at any depth,
+  // and the first quote a key could start with.
+  const JSON_BRACKET = /[[{]|%(?:25)*(?:5B|7B)/i;
+  const KEY_QUOTE = new RegExp(KEY_QUOTE_FORMS);
+
+  /**
+   * A url with any JSON in its query or fragment that still names a secret
+   * key once its pairs are read hidden, from its opening bracket to its close.
+   * A query is read pair by pair, and a raw '&' in a string of the JSON (or
+   * its \u0026, or a ';') ends a pair, so in ?s={"user":"a&b","token":"…"} the
+   * key after it was read as no parameter at all; a '#' in one ends the query.
+   * JSON percent encoded around a raw '&', as Chrome writes such a url
+   * (?s={%22user%22:%22a&b%22,…}), is hidden from its first bracket on, read
+   * decoded as many times as a value is followed (MAX_NESTING). So is JSON with
+   * a key outside any bracket, and a url of more than MAX_JSON_KEYS distinct
+   * keys in all. Keys are judged as secretKeysIn judges them in a url. Every
+   * key is found in one read of the text, and every JSON that holds one in
+   * another, however many there are.
+   */
+  function splitJson(url, written) {
+    // Asked of every url printed, and a line of text can hold thousands, so
+    // the common answer costs no pattern: no key can be found with no quote,
+    // raw or encoded, to start it.
+    if (!url.includes('"') && !url.includes("'") && !url.includes('\\u00') && !(url.includes('%') && KEY_QUOTE.test(url))) {
+      return url;
+    }
+    const at = url.search(/[?#]/);
+    if (at === -1) return url;
+    let rest = url.slice(at);
+    const quote = rest.search(KEY_QUOTE);
+    if (quote === -1) return url;
+    // Only a url that carries JSON as written: one whose JSON maskParams hid
+    // with the value holding it can still have a key left in a part with no
+    // name, which is read on.
+    const bracket = rest.search(JSON_BRACKET);
+    if (bracket === -1 && (written === url || !JSON_BRACKET.test(written))) return url;
+    // JSON that is all in one value needs no second look: maskParams gave the
+    // value whole to nestedUrl, which read its keys as written and decoded. A
+    // value is read so only when it holds no url, raw or encoded, whose own
+    // parts would be read pair by pair; and JSON is not all in one value when a
+    // '&', ';', '#' or \u0026 cuts it, or when its part has no '=' before its
+    // first bracket or quote. The part starts at the last separator before
+    // that, '?' too (a hash router's fragment holds a route and a query). A
+    // blob needs more than MAX_JSON_KEYS keys of three characters or more.
+    if (rest.length < 3 * MAX_JSON_KEYS) {
+      const first = bracket === -1 ? quote : Math.min(bracket, quote);
+      const piece = Math.max(
+        rest.lastIndexOf('&', first),
+        rest.lastIndexOf(';', first),
+        rest.lastIndexOf('#', first),
+        rest.lastIndexOf('?', first)
+      );
+      const eq = rest.indexOf('=', piece);
+      if (eq !== -1 && eq < first && !/[?#&;@]|%(?:25)*(?:3F|23|40)|\\u0026/i.test(rest.slice(eq + 1))) return url;
+    }
+    const keys = secretKeysIn(rest, false, true);
+    const spans = keys && (keys.length ? jsonSpans(rest, keys) : []);
+    if (spans && spans.length) {
+      let hidden = '';
+      let kept = 0;
+      for (const [from, to] of spans) {
+        hidden += rest.slice(kept, from) + REDACTED;
+        kept = to;
+      }
+      rest = hidden + rest.slice(kept);
+    }
+    // Read decoded too, only when there is an escape to decode.
+    const decoded = spans && rest.includes('%') ? decodeLoosely(rest) : rest;
+    if (!spans || (decoded !== rest && secretKeyDecoded(decoded, 1))) {
+      let cut = rest.search(JSON_BRACKET);
+      if (cut === -1 || secretKeyDecoded(rest.slice(0, cut), 0)) cut = 1;
+      rest = rest.slice(0, cut) + REDACTED;
+    }
+    return rest === url.slice(at) ? url : url.slice(0, at) + rest;
+  }
+
+  /**
+   * The outermost JSON around each of the given positions (in order), as
+   * [start, end] pairs in order, or null when one lies in no JSON at all.
+   * Strings are read as JSON writes them, in either quote or as \u0022, so
+   * that a bracket in one counts for nothing. A backslash escapes what follows
+   * it outside a string too, where JSON written into a string of other JSON has
+   * its quotes escaped ({\"token\":…}). A JSON that never closes runs to the
+   * end of the text. One read of the text, however many positions.
+   */
+  function jsonSpans(text, keys) {
+    const spans = [];
+    let next = 0;
+    let start = -1;
+    let depth = 0;
+    let quoted = '';
+    let holds = false;
+    for (let i = 0; i < text.length && (holds || next < keys.length); i += 1) {
+      // A position an escape stepped over is met at the next character.
+      if (next < keys.length && keys[next] <= i) {
+        if (depth === 0) return null;
+        holds = true;
+        while (next < keys.length && keys[next] <= i) next += 1;
+      }
+      const c = text[i];
+      // A quote written \u0022 or percent encoded (%22, %2527) is a quote too.
+      let quote = c === '"' || c === "'" ? c : '';
+      if (c === '\\' && (text.startsWith('u0022', i + 1) || text.startsWith('u0027', i + 1))) {
+        quote = text.slice(i, i + 6);
+      } else if (c === '%') {
+        let at = i + 1;
+        while (text.startsWith('25', at)) at += 2;
+        if (text[at] === '2' && (text[at + 1] === '2' || text[at + 1] === '7')) quote = text.slice(i, at + 2);
+      }
+      if (quote) {
+        if (!quoted) quoted = quote;
+        else if (quoted === quote) quoted = '';
+        i += quote.length - 1;
+      } else if (c === '\\') {
+        i += 1;
+      } else if (quoted) {
+        // inside a string a bracket counts for nothing
+      } else if (c === '{' || c === '[') {
+        if (depth === 0) start = i;
+        depth += 1;
+      } else if ((c === '}' || c === ']') && depth > 0) {
+        depth -= 1;
+        if (depth === 0 && holds) {
+          spans.push([start, i + 1]);
+          holds = false;
+        }
+      }
+    }
+    if (holds) spans.push([start, text.length]);
+    return spans;
   }
 
   function screenUrl(url, depth) {
     const credentials = credentialsAt(url);
     const bare = withoutCredentials(credentials ? credentials[1] + url.slice(credentials[0].length) : url);
+    // A data: url's content is read whole first. It can hold a '?' with the
+    // rest of a link still encoded after it
+    // (data:text/html,%3Ca href%3D%22https://x/?token%3D…), or JSON with one
+    // in a string, and cut there it was read in two halves, neither secret.
+    // This and splitJson are done once, for the url as a whole: a megabyte
+    // of values can hold a hundred thousand urls, and splitJson reads the
+    // JSON of every one of them at once. Content read whole and found clean is
+    // not read again before its '?': only the pairs from there on are.
+    // Read as it came: content whose link carries credentials is hidden whole,
+    // not printed with them taken out.
+    const data = depth === 0 && /^\s*data:/i.test(url);
+    if (data) {
+      const read = maskPath(url, depth);
+      if (read !== url) return read;
+    }
     const cut = bare.search(/[?#]/);
-    if (cut === -1) return maskPath(bare, depth);
+    if (cut === -1) return data ? bare : maskPath(bare, depth);
     const hashAt = bare.indexOf('#', cut);
     const search = hashAt === -1 ? bare.slice(cut) : bare.slice(cut, hashAt);
     const hash = hashAt === -1 ? '' : bare.slice(hashAt);
-    return maskPath(bare.slice(0, cut), depth) + maskParams(search, depth) + maskParams(hash, depth);
+    const path = data ? bare.slice(0, cut) : maskPath(bare.slice(0, cut), depth);
+    const screened = path + maskParams(search, depth) + maskParams(hash, depth);
+    return depth ? screened : splitJson(screened, url);
   }
   // SECRET URLS END
 
@@ -554,6 +872,13 @@
     let passSheet = null;
     let passRule = false;
     const passIn = new Set();
+    // Whether a frame gives pointer-events a discrete transition of its own
+    // (see transitionsPointer()), as a survey of every frame found, a lift
+    // or the pointer found since the arm. It stays so until the next arm.
+    let discrete = false;
+    // The frames the last survey passed over as not drawn, asked once they
+    // are (see drawnSince()).
+    let unseen = [];
     // Pointers pressed while armed and not yet let go (see onSelectStart()).
     const downs = new Set();
     // The frames the sheet does not reach, which get a shield instead (see
@@ -563,9 +888,12 @@
     const shieldAt = [];
     // What was in the top layer when the host was last put above it.
     let layerSeen = new Set();
-    // Open shadow roots, searched for frames to shield as well as the
-    // document is.
+    // Shadow roots, open and closed (see shadowOf()), searched for frames to
+    // shield as well as the document is.
     let roots = new Set();
+    // What the survey learnt of an element's shadow root, kept for the arm
+    // (see surveyedShadowOf()).
+    let shadowSeen = new WeakMap();
     // The modal dialog the host was put in, and whether it is in the top
     // layer as a popover (see mount()).
     let mountedIn = null;
@@ -590,6 +918,12 @@
     // The keys whose keydown the picker answered, so that their keyup is
     // kept from the page too, and no other.
     const taken = new Set();
+    // The Enter that picked, still held once the tail is over (see
+    // holdEnter()).
+    let enterHeld = false;
+    // Events already handled, by the press gate or by the picker's own
+    // listeners, whichever heard them first (see seen()).
+    const handled = new WeakSet();
 
     const INSPECT_TIMEOUT_MS = 300;
     // How long presses are still kept from the page once the pick is sent.
@@ -633,11 +967,37 @@
     const START_MIN = 4;
     const FRAMES = 'iframe, frame, embed, object';
     const FRAME_TAGS = ['iframe', 'frame', 'embed', 'object'];
+    // Each frame tag with the specificity of eight ids: :is() counts as its
+    // most specific argument, and * makes it match every element, so a
+    // page's important rule on a frame by id (#player, or three ids deep)
+    // no longer beats the sheet (checked in Chrome 156). A tag each, so
+    // that only frames are matched against it on a restyle. Unlayered: a
+    // sheet with a cascade layer in it, which would beat every unlayered
+    // important rule, made each lift in frameAt() six times slower
+    // (measured in Chrome).
+    const PASS_SELECTOR = FRAME_TAGS.map((tag) => `${tag}:is(*, ${'#\\:'.repeat(8)})`).join(', ');
+    // What the sheet holds while picking (see passFrames()).
+    const PASS_RULE = `${PASS_SELECTOR} { pointer-events: none !important; }`;
+    // The same with the frames' discrete transitions held back, and what
+    // holds only those, for the lifted hit test in frameAt() and the end:
+    // held only at the moments the sheet changes a frame's pointer-events,
+    // and only while a frame gives pointer-events a discrete transition of
+    // its own (see holding()). transition-behavior: normal starts no
+    // transition of a discrete property, and leaves one already running
+    // alone (checked in Chrome 156).
+    const HELD_RULE = `${PASS_SELECTOR} { pointer-events: none !important; transition-behavior: normal !important; }`;
+    const LIFT_RULE = `${PASS_SELECTOR} { transition-behavior: normal !important; }`;
     // How many frames frameAt() holds a point against: reading 2000 boxes
-    // after a hit test takes well under a millisecond.
+    // of drawn frames after a hit test takes well under a millisecond (F71).
     const FRAME_BOXES = 2000;
-    // Elements walked at arm time looking for open shadow roots.
+    // Elements walked at arm time looking for shadow roots.
     const ROOT_SCAN = 20000;
+    // The elements attachShadow takes besides custom elements. No other
+    // element can hold a shadow root, open or closed, so no other is asked.
+    const SHADOW_HOSTS = new Set([
+      'article', 'aside', 'blockquote', 'body', 'div', 'footer', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+      'header', 'main', 'nav', 'p', 'section', 'span',
+    ]);
     const pending = new Map();
     // Bumped by stop(). A pick that was cancelled while its inspect was still
     // in flight must not arrive afterwards as a capture.
@@ -825,6 +1185,61 @@
           finish(null);
         }, INSPECT_TIMEOUT_MS);
       });
+    }
+
+    /**
+     * The deepest node on the way to an element that the page's own world
+     * can reach, where inspect() asks about it: the element itself, or,
+     * inside a closed shadow root, the host of the outermost one, with how
+     * many elements up that host is (`steps`), counted through shadow roots
+     * as the collector counts hops. A closed root is null to a page script,
+     * so the collector could not find a mark inside it, and a mark set
+     * there was seen by the component's own observers for nothing. Its host
+     * is what 0.6.0 picked there, and its component and handlers are what
+     * rendered the component the element is in.
+     */
+    function reachOf(element) {
+      let node = element;
+      let reach = { node: element, steps: 0 };
+      for (let count = 0; node && count < 4096; ) {
+        const parent = node.parentNode;
+        if (!parent) break;
+        if (parent.nodeType === 1) {
+          count += 1;
+          node = parent;
+        } else if (parent.nodeType === 11 && parent.host) {
+          count += 1;
+          if (parent.mode === 'closed') reach = { node: parent.host, steps: count };
+          node = parent.host;
+        } else {
+          break;
+        }
+      }
+      return reach;
+    }
+
+    /**
+     * A component and handlers read from the host of a closed shadow root
+     * (see reachOf()), put as the host's: counted from the picked element,
+     * up through the host, and named after it, as the collector names an
+     * ancestor (elementLabel in collector-main.js: the tag and two classes).
+     * The template then says the element is inside that host's closed root.
+     */
+    function throughHost(payload, reach) {
+      const classes = Array.from(reach.node.classList || [])
+        .filter((name) => typeof name === 'string' && name)
+        .slice(0, 2)
+        .map((name) => name.slice(0, 40));
+      const tag = String(reach.node.localName || '');
+      const label = classes.length ? `${tag}.${classes.join('.')}` : tag;
+      if (payload.component) {
+        payload.component.hops = reach.steps + payload.component.hops;
+        payload.component.closedHost = label;
+      }
+      if (payload.handlers) {
+        if (!payload.handlers.hops) payload.handlers.label = label;
+        payload.handlers.hops = reach.steps + (payload.handlers.hops || 0);
+      }
     }
 
     /**
@@ -1217,8 +1632,6 @@
     // How many keys and values of it are looked at before it is taken for a
     // blob and hidden whole.
     const MAX_JSON_NODES = 20000;
-    // How many times JSON a raw '&' cut is looked for again in one url.
-    const MAX_JSON_SPANS = 8;
 
     // What outerHTML writes in an attribute's value in place of a character:
     // '&', '"' and a no-break space, and from Chrome 138 '<' and '>' as well.
@@ -1278,17 +1691,17 @@
       if (lower !== 'accesskey' && ((control && lower === 'value') || isSecretNameBounded(lower))) {
         return REDACTED;
       }
-      if (URL_ATTRIBUTES.includes(lower)) return screenUrlValue(value);
+      if (URL_ATTRIBUTES.includes(lower)) return safeUrl(value);
       // A candidate ends at the comma before the next one, but a url can
       // hold a comma of its own (an image CDN's w_100,h_100).
       if (URL_LISTS.includes(lower)) {
-        return value.replace(/[^\s,][^\s]*?(?=,?(?:\s|$))/g, (url) => screenUrlValue(url));
+        return value.replace(/[^\s,][^\s]*?(?=,?(?:\s|$))/g, (url) => safeUrl(url));
       }
       // A signed background image. Markup writes the quotes as &quot;.
       if (lower === 'style') {
         return value.replace(STYLE_URL, (whole, double, single, entity, bare) => {
           const url = double ?? single ?? entity ?? bare;
-          const masked = screenUrlValue(url);
+          const masked = safeUrl(url);
           if (masked === url) return whole;
           const quote = double != null ? '"' : single != null ? "'" : entity != null ? '&quot;' : '';
           return `url(${quote}${masked}${quote})`;
@@ -1296,99 +1709,6 @@
       }
       if (lower === 'srcdoc') return maskDocument(value);
       return maskJson(value, 0);
-    }
-
-    /**
-     * A url as safeUrl masks it, with a data: url's content read whole
-     * first. safeUrl cuts a url at its first literal '?', and a data: url's
-     * content can hold one with the rest of a link still encoded after it
-     * (data:text/html,%3Ca href%3D%22https://x/?token%3D…), so the content
-     * was cut before dataContent could read it.
-     */
-    function screenUrlValue(url) {
-      if (/^\s*data:/i.test(url)) {
-        const read = maskPath(url, 0);
-        if (read !== url) return read;
-      }
-      return splitJson(safeUrl(url));
-    }
-
-    // A key in JSON, or in a JavaScript object written in single quotes
-    // ({'token':…}), which a url carries now and then too.
-    const QUOTED_KEY = /(["'])([^"'\\]*)\1\s*:/g;
-
-    /**
-     * A url with any JSON in its query or fragment that still names a
-     * secret key once safeUrl is done hidden, from its opening bracket to
-     * its close. safeUrl reads a query pair by pair, and a raw '&' in a
-     * string of the JSON (or its \u0026) ends a pair, so in
-     * ?s={"user":"a&b","token":"…"} the key after it was read as no
-     * parameter at all; and it reads only double quoted keys. JSON percent
-     * encoded around a raw '&' is hidden from its first bracket on. Keys are
-     * judged by the rule for a parameter's name, as secretKeyIn judges them.
-     */
-    function splitJson(url) {
-      const at = url.search(/[?#]/);
-      if (at === -1 || !/[[{]|%5B|%7B/i.test(url.slice(at))) return url;
-      let rest = url.slice(at);
-      for (let round = 0; round < MAX_JSON_SPANS; round += 1) {
-        // Never 0: rest starts with its '?' or '#'.
-        const key = secretKeyAt(rest);
-        const span = key > 0 ? jsonAround(rest, key) : null;
-        if (!span) break;
-        rest = rest.slice(0, span[0]) + REDACTED + rest.slice(span[1]);
-      }
-      if (secretKeyAt(rest) !== -1 || secretKeyAt(decodeLoosely(rest)) !== -1) {
-        let cut = rest.search(/[[{]|%5B|%7B/i);
-        if (cut === -1 || secretKeyAt(decodeLoosely(rest.slice(0, cut))) !== -1) cut = 1;
-        rest = rest.slice(0, cut) + REDACTED;
-      }
-      return rest === url.slice(at) ? url : url.slice(0, at) + rest;
-    }
-
-    // Where the first key in text that names a secret starts, -1 when none
-    // does, and 0 past MAX_JSON_KEYS distinct keys, which make a blob.
-    function secretKeyAt(text) {
-      if (!/["']/.test(text)) return -1;
-      const seen = new Set();
-      for (const match of text.matchAll(QUOTED_KEY)) {
-        const key = match[2];
-        if (seen.has(key)) continue;
-        if (seen.size === MAX_JSON_KEYS) return 0;
-        seen.add(key);
-        if (isSecretParam(key)) return match.index;
-      }
-      return -1;
-    }
-
-    /**
-     * Where the outermost JSON around a position starts and ends, as
-     * [start, end], reading strings as JSON writes them (or in single
-     * quotes) so that a bracket in one counts for nothing; null when no
-     * bracket is open there. A JSON that never closes runs to the end of
-     * the text.
-     */
-    function jsonAround(text, index) {
-      let start = -1;
-      let depth = 0;
-      let quoted = '';
-      for (let i = 0; i < text.length; i += 1) {
-        const c = text[i];
-        if (i === index && depth === 0) return null;
-        if (quoted) {
-          if (c === '\\') i += 1;
-          else if (c === quoted) quoted = '';
-        } else if (c === '"' || c === "'") {
-          quoted = c;
-        } else if (c === '{' || c === '[') {
-          if (depth === 0) start = i;
-          depth += 1;
-        } else if ((c === '}' || c === ']') && depth > 0) {
-          depth -= 1;
-          if (depth === 0 && i > index) return [start, i + 1];
-        }
-      }
-      return depth > 0 && start <= index ? [start, text.length] : null;
     }
 
     // A token of JSON: a string, a bracket or separator, or a number or
@@ -1460,7 +1780,7 @@
         if (written[0] === '"') {
           const node = JSON.parse(written);
           const nested = maskJson(node, depth + 1);
-          const masked = nested !== node ? nested : screenUrlValue(node);
+          const masked = nested !== node ? nested : safeUrl(node);
           if (masked !== node) edits.push([token.index, token.index + written.length, JSON.stringify(masked)]);
         }
       };
@@ -1573,6 +1893,11 @@
       return text.length;
     }
 
+    // A key in double quotes, as JSON writes one. Not QUOTED_KEY: a key in
+    // single quotes left in the object maskLiteral has masked is one whose
+    // value it hid where it stands, and must not hide the whole object.
+    const JSON_KEY = /"([^"\\]*)"\s*:/g;
+
     // Whether text that is not quite JSON names a secret key, each distinct
     // key judged once; past MAX_JSON_KEYS of them it is a blob.
     function namesSecret(text) {
@@ -1606,7 +1931,7 @@
             /* read as it is written */
           }
         }
-        if (maskMarkup(source) !== source || dataContent('', unescapeValue(source), 0) !== unescapeValue(source)) {
+        if (maskMarkup(source) !== source || dataContent(unescapeValue(source), 0) !== unescapeValue(source)) {
           return REDACTED;
         }
         return html;
@@ -1931,7 +2256,8 @@
     ];
     const PRESS = [...CANCELLED, ...STOPPED];
     // What the tail listens for (see beginTail()).
-    const TAIL_EVENTS = [...PRESS, 'keydown', 'keypress', 'keyup'];
+    const HELD_EVENTS = ['keydown', 'keypress', 'keyup'];
+    const TAIL_EVENTS = [...PRESS, ...HELD_EVENTS];
 
     // The keys the picker answers while armed (see step()). Every other key,
     // Tab among them, still reaches the page.
@@ -1945,6 +2271,7 @@
       event.preventDefault();
       event.stopPropagation();
       event.stopImmediatePropagation();
+      spend(event);
     }
 
     function hold(event) {
@@ -1954,7 +2281,43 @@
       }
       event.stopPropagation();
       event.stopImmediatePropagation();
+      spend(event);
       if (event.type === 'pointerdown' && event.pointerType === 'touch') uncapture(event);
+    }
+
+    // The events Chrome gives transient user activation with, before any
+    // listener runs: a mouse's pointerdown, a finger's pointerup and the
+    // mousedown its tap makes, and every keydown but Escape's, repeats
+    // included (checked in Chrome 156).
+    const ACTIVATING = ['pointerdown', 'pointerup', 'mousedown', 'touchend', 'keydown'];
+
+    /**
+     * The activation a press or key kept from the page still gave it,
+     * spent at once: left alone, for five seconds the page could open a
+     * popup or start playback as if it had been clicked. Nothing withdraws
+     * it; showPicker() spends it, and on a button input in no document it
+     * shows nothing and throws nothing (checked in Chrome 156). What it
+     * cannot reach is the page's sticky activation (hasBeenActive), which
+     * stays for the life of the page.
+     */
+    function spend(event) {
+      if (!ACTIVATING.includes(event.type) || event.key === 'Escape') return;
+      try {
+        if (!navigator.userActivation?.isActive) return;
+        const input = document.createElement('input');
+        input.type = 'button';
+        input.showPicker();
+      } catch {
+        /* nothing left to spend */
+      }
+    }
+
+    // Whether the event was handled already: the press gate and the
+    // picker's own listener on window can both hear it (see route()).
+    function seen(event) {
+      if (handled.has(event)) return true;
+      handled.add(event);
+      return false;
     }
 
     // The capture a finger's press takes, let go as the press begins, so
@@ -1973,10 +2336,10 @@
     }
 
     /**
-     * The element under a point, as deep as the page lets anyone look: past
-     * the picker's own shields, and into open shadow roots, whose content
-     * elementFromPoint reports as their host, and where the pick used to stop.
-     * A closed root keeps its host, which is as far as the page allows.
+     * The element under a point, as deep as it goes: past the picker's own
+     * shields, and into shadow roots, open and closed (see shadowOf()),
+     * whose content elementFromPoint reports as their host, and where the
+     * pick used to stop.
      *
      * Frames let the pointer through while armed (see passFrames()), and so
      * a hit test goes through them too. A frame is found by its box instead
@@ -1991,14 +2354,78 @@
 
     function deepest(x, y) {
       let element = under(document, x, y);
-      for (let depth = 0; element && element.shadowRoot && depth < 32; depth += 1) {
-        const root = element.shadowRoot;
+      for (let depth = 0; element && depth < 32; depth += 1) {
+        const root = shadowOf(element);
+        if (!root) break;
         const inner = under(root, x, y);
         if (!inner || inner === element || !(root.contains(inner) || element.contains(inner))) break;
-        roots.add(root);
+        addRoot(root);
         element = inner;
       }
       return element;
+    }
+
+    /**
+     * An element's shadow root, open or closed. A page script gets null
+     * for a closed one; a content script can ask Chrome for it
+     * (chrome.dom, Chrome 88), and so the pick, the frames' sheet and the
+     * top layer check go inside a closed root as they do an open one. Only
+     * an element attachShadow takes is asked.
+     */
+    function shadowOf(element) {
+      const open = element.shadowRoot;
+      if (open) return open;
+      const name = element.localName;
+      if (element.namespaceURI !== 'http://www.w3.org/1999/xhtml' || (!name.includes('-') && !SHADOW_HOSTS.has(name))) {
+        return null;
+      }
+      try {
+        return chrome.dom.openOrClosedShadowRoot(element) || null;
+      } catch {
+        return null;
+      }
+    }
+
+    // shadowOf() for the survey, which walks up to ROOT_SCAN elements every
+    // fifteenth frame: Chrome is asked about each element once an arm (14 ms
+    // at 20 000 elements, measured in Chrome), and a custom element not
+    // defined yet, whose constructor has not attached its root, again each
+    // time. An element given a closed root later is found by the pointer.
+    function surveyedShadowOf(element) {
+      const open = element.shadowRoot;
+      if (open) return open;
+      if (shadowSeen.has(element)) return shadowSeen.get(element);
+      const root = shadowOf(element);
+      if (root || !element.localName.includes('-') || element.matches(':defined')) shadowSeen.set(element, root);
+      return root;
+    }
+
+    // A shadow root found: its frames get the sheet (see passFrames()), and
+    // a popover or dialog shown in it raises the host at once, by its
+    // toggle and its close, which go no further than the root.
+    function addRoot(root) {
+      if (roots.has(root)) return;
+      roots.add(root);
+      try {
+        root.addEventListener('toggle', onTopLayer, true);
+        root.addEventListener('close', onTopLayer, true);
+      } catch {
+        /* the fifteenth frame check sees it (see shieldFrames()) */
+      }
+    }
+
+    function dropRoot(root) {
+      roots.delete(root);
+      try {
+        root.removeEventListener('toggle', onTopLayer, true);
+        root.removeEventListener('close', onTopLayer, true);
+      } catch {
+        /* gone with its tree */
+      }
+    }
+
+    function dropRoots() {
+      for (const root of [...roots]) dropRoot(root);
     }
 
     /**
@@ -2021,20 +2448,37 @@
      *
      * The boxes are read here, after the hit test, which has brought the
      * layout up to date, so they cost no layout of their own.
+     *
+     * A frame that gives pointer-events a discrete transition of its own
+     * (transition: all .3s allow-discrete) kept none for half of it as the
+     * sheet came off, so this very hit test passed through it, and the page
+     * heard transition events on every move over it. While a frame does,
+     * the lift holds discrete transitions back, and so does putting the
+     * sheet back, which then costs one more restyle (see holding()).
      */
     function frameAt(x, y, element) {
       if (!element) return null;
-      let boxed = false;
+      let boxed = null;
       for (let index = 0; index < allFrames.length && !boxed; index += 1) {
         const frame = allFrames[index];
         if (!frame.isConnected) continue;
         const r = frame.getBoundingClientRect();
-        boxed = x >= r.left - 1 && x < r.right + 1 && y >= r.top - 1 && y < r.bottom + 1;
+        if (x >= r.left - 1 && x < r.right + 1 && y >= r.top - 1 && y < r.bottom + 1) boxed = frame;
       }
       if (!boxed) return null;
-      const lift = Boolean(passSheet) && !passSheet.disabled;
-      if (lift) passSheet.disabled = true;
+      // The hit test that found `element` has restyled what the page
+      // changed, with its own transitions, and no script of its has run
+      // since.
+      const held = Boolean(passSheet && passRule) && (discrete || transitionsPointer(boxed) || drawnSince());
+      const lift = Boolean(passSheet) && !passSheet.disabled && !held;
+      let lifted = false;
       try {
+        if (held) {
+          passSheet.replaceSync(LIFT_RULE);
+          lifted = true;
+        } else if (lift) {
+          passSheet.disabled = true;
+        }
         const top = deepest(x, y);
         if (!top) return null;
         if (FRAME_TAGS.includes(top.localName)) return top;
@@ -2043,6 +2487,104 @@
         return node && node.nodeType === 1 && pickable(top) ? top : null;
       } finally {
         if (lift) passSheet.disabled = false;
+        if (lifted) {
+          discrete = true;
+          passSheet.replaceSync(HELD_RULE);
+          restyle();
+          passSheet.replaceSync(PASS_RULE);
+        }
+      }
+    }
+
+    /**
+     * Whether a frame gives pointer-events a discrete transition (discrete),
+     * counting a frame the last survey passed over as not drawn (unseen)
+     * that is drawn now, shown or scrolled into view since. Asked before the
+     * sheet changes, so such a frame is held from the first change after it
+     * is drawn, not from the next survey. Only frames still not drawn are
+     * kept, so each is read once, and asking costs no layout.
+     */
+    function drawnSince() {
+      if (!discrete && unseen.length) {
+        const still = [];
+        for (const frame of unseen) {
+          if (!frame.isConnected) continue;
+          if (!frame.checkVisibility({ contentVisibilityAuto: true })) {
+            still.push(frame);
+          } else if (transitionsPointer(frame)) {
+            discrete = true;
+            break;
+          }
+        }
+        unseen = discrete ? [] : still;
+      }
+      return discrete;
+    }
+
+    /**
+     * Whether a frame's own style gives pointer-events a discrete
+     * transition: an entry of transition-property that is all or
+     * pointer-events, whose transition-behavior is allow-discrete, and whose
+     * duration and delay add up to more than nothing. Read while the sheet
+     * holds nothing back, so it is the page's own. Most frames are answered
+     * by their transition-behavior alone.
+     */
+    function transitionsPointer(element) {
+      try {
+        const style = getComputedStyle(element);
+        if (!style.getPropertyValue('transition-behavior').includes('allow-discrete')) return false;
+        const list = (name) => style.getPropertyValue(name).split(',').map((value) => value.trim());
+        const seconds = (value) => (Number.parseFloat(value) || 0) * (/ms$/.test(value) ? 0.001 : 1);
+        const [properties, behaviors, durations, delays] = [
+          'transition-property',
+          'transition-behavior',
+          'transition-duration',
+          'transition-delay',
+        ].map(list);
+        return properties.some((property, index) => {
+          if (property !== 'all' && property !== 'pointer-events') return false;
+          const at = (values) => values[index % values.length];
+          return at(behaviors) === 'allow-discrete' && Math.max(seconds(at(durations)), 0) + seconds(at(delays)) > 0;
+        });
+      } catch {
+        return false;
+      }
+    }
+
+    /**
+     * The sheet's change taken in now. Chrome restyles every tree whose
+     * adopted sheets changed when any style is read, closed shadow roots
+     * included. A change the page made to a frame is not taken in by this
+     * read, only by a read of that frame's own style or by a hit test,
+     * which brings the whole page up to date (all checked in Chrome 156).
+     */
+    function restyle() {
+      getComputedStyle(document.documentElement).getPropertyValue('pointer-events');
+    }
+
+    /**
+     * A change to the trees that adopt the sheet (`change`), made with the
+     * frames' discrete transitions held back and restyled at once, while a
+     * frame gives pointer-events one of its own: the page's transition
+     * otherwise kept the old value for half its time and fired events of
+     * its own. What the page changed is restyled first, with its own
+     * transitions, by a hit test, and the hold is let go before anything of
+     * the page's runs again, so a display or overlay transition the page
+     * starts on a frame runs as written and fires all its events. With no
+     * such frame, nothing is held, as before.
+     */
+    function holding(change) {
+      if (!passSheet || !passRule || !drawnSince()) {
+        change();
+        return;
+      }
+      try {
+        document.elementFromPoint(0, 0);
+        passSheet.replaceSync(HELD_RULE);
+        change();
+        restyle();
+      } finally {
+        passSheet.replaceSync(PASS_RULE);
       }
     }
 
@@ -2112,7 +2654,8 @@
      * page's own script (select all) is the page's.
      */
     function onSelectStart(event) {
-      if (event.isTrusted && (downs.size || tailPresses.size)) swallow(event);
+      if (!event.isTrusted || seen(event)) return;
+      if (downs.size || tailPresses.size) swallow(event);
     }
 
     /**
@@ -2123,11 +2666,16 @@
      */
     function onFrameOver(event) {
       if (!event.isTrusted) return;
-      const target = typeof event.composedPath === 'function' ? event.composedPath()[0] : event.target;
+      let target = typeof event.composedPath === 'function' ? event.composedPath()[0] : event.target;
       try {
+        // A frame in a closed shadow root is seen from here as its host.
+        if (target && target.nodeType === 1 && !target.matches(FRAMES) && shadowOf(target)) {
+          target = deepest(event.clientX, event.clientY);
+        }
         if (!target || target.nodeType !== 1 || !target.matches(FRAMES)) return;
         const scope = target.getRootNode();
-        if (scope.nodeType === 11 && scope.host) roots.add(scope);
+        if (scope.nodeType === 11 && scope.host) addRoot(scope);
+        if (transitionsPointer(target)) discrete = true;
         passFrames();
         if (!frameList.includes(target)) frameList.push(target);
         if (!allFrames.includes(target) && allFrames.length < FRAME_BOXES) allFrames.push(target);
@@ -2146,7 +2694,7 @@
      * cancel, on the user's behalf.
      */
     function onPointer(event) {
-      if (!event.isTrusted) return;
+      if (!event.isTrusted || seen(event)) return;
       hold(event);
       if (event.type === 'pointerdown') {
         downs.add(event.pointerId);
@@ -2183,7 +2731,7 @@
     }
 
     function onKeyDown(event) {
-      if (!event.isTrusted) return;
+      if (!event.isTrusted || seen(event)) return;
       if (event.key === 'Escape') {
         swallow(event);
         stop();
@@ -2201,7 +2749,7 @@
     // The keyup of a key the picker answered, so a page that acts on keyup
     // does not act on it.
     function onKeyUp(event) {
-      if (!event.isTrusted || !taken.has(event.key)) return;
+      if (!event.isTrusted || seen(event) || !taken.has(event.key)) return;
       taken.delete(event.key);
       swallow(event);
     }
@@ -2302,9 +2850,7 @@
      */
     function startElement() {
       let focused = document.activeElement;
-      while (focused && focused.shadowRoot && focused.shadowRoot.activeElement) {
-        focused = focused.shadowRoot.activeElement;
-      }
+      while (focused && shadowOf(focused)?.activeElement) focused = shadowOf(focused).activeElement;
       if (pickable(focused)) return focused;
       const width = window.innerWidth;
       const height = window.innerHeight;
@@ -2371,7 +2917,8 @@
     // since that is what renders, and the first child at all failing that.
     function firstChildOf(element) {
       let fallback = null;
-      for (const list of [element.shadowRoot ? element.shadowRoot.children : [], element.children]) {
+      const root = shadowOf(element);
+      for (const list of [root ? root.children : [], element.children]) {
         for (const child of Array.from(list)) {
           if (!pickable(child)) continue;
           const r = child.getBoundingClientRect();
@@ -2395,8 +2942,8 @@
      * the pointer there and a press went to the framed page, for real. While
      * armed, and through the tail, they let the pointer through to the page
      * instead: a stylesheet of the picker's own, adopted by the document and
-     * by each open shadow root that holds a frame, gives them
-     * pointer-events:none. A move or a press over a frame then reaches the
+     * by each shadow root that holds a frame, gives them pointer-events:none
+     * (PASS_RULE). A move or a press over a frame then reaches the
      * page, where the capture listeners keep it, and nothing goes into the
      * frame. What the page draws over a frame (a hover menu, a tooltip)
      * keeps the pointer, and its hover, as it would with no picker. The
@@ -2428,16 +2975,30 @@
       if (passSheet === false) return;
       try {
         if (!passSheet) passSheet = new CSSStyleSheet();
-        if (!passRule) passSheet.replaceSync(`${FRAMES} { pointer-events: none !important; }`);
+        if (!passRule) passSheet.replaceSync(PASS_RULE);
         passRule = true;
       } catch {
         // No constructable stylesheets: every frame gets a shield.
         passSheet = false;
         return;
       }
+      const adopting = [];
       for (const scope of [document, ...roots]) {
         try {
           if (scope !== document && (!scope.host.isConnected || !scope.querySelector(FRAMES))) continue;
+          if (scope.adoptedStyleSheets.includes(passSheet)) passIn.add(scope);
+          else adopting.push(scope);
+        } catch {
+          /* the frames in a tree in an odd state get a shield */
+        }
+      }
+      if (adopting.length) holding(() => adoptIn(adopting));
+    }
+
+    // The sheet put at the end of each tree's own list.
+    function adoptIn(scopes) {
+      for (const scope of scopes) {
+        try {
           const sheets = scope.adoptedStyleSheets;
           if (!sheets.includes(passSheet)) scope.adoptedStyleSheets = [...sheets, passSheet];
           passIn.add(scope);
@@ -2458,21 +3019,39 @@
 
     // The sheet put back in every tree that adopted it where the page has
     // set its own list since. A look at each list, each frame and at each
-    // press.
+    // press. Put back before anything restyles, with nothing held: the
+    // frames there still hold none from their last restyle. A hold first
+    // restyled them without it, and the page heard a transition of
+    // pointer-events begin and be cancelled at every reset of its list.
     function keepPassing() {
+      const lost = [];
       for (const scope of passIn) {
         try {
-          const sheets = scope.adoptedStyleSheets;
-          if (!sheets.includes(passSheet)) scope.adoptedStyleSheets = [...sheets, passSheet];
+          if (!scope.adoptedStyleSheets.includes(passSheet)) lost.push(scope);
         } catch {
           /* gone with its tree */
         }
       }
+      adoptIn(lost);
     }
 
     // The sheet taken back out of every tree that adopted it, leaving the
-    // page's own sheets as they are now, and emptied.
+    // page's own sheets as they are now, and emptied. While a frame gives
+    // pointer-events a discrete transition of its own, the frames are first
+    // given their own value back with transitions held back, restyled at
+    // once, or that transition ran as the sheet went, and the page heard
+    // it (see holding()).
     function stopPassing() {
+      if (passSheet && passRule && drawnSince()) {
+        try {
+          document.elementFromPoint(0, 0);
+          passSheet.replaceSync(LIFT_RULE);
+          restyle();
+        } catch {
+          /* taken out all the same */
+        }
+      }
+      unseen = [];
       for (const scope of passIn) {
         try {
           const sheets = scope.adoptedStyleSheets;
@@ -2493,9 +3072,30 @@
 
     // The frames as they stand now: found, letting the pointer through, and
     // the ones that still take it (a page rule that wins over the sheet's,
-    // a tree that would not adopt it), which get a shield.
+    // a tree that would not adopt it), which get a shield. The sheet goes
+    // back where the page dropped it before any style is read here (see
+    // keepPassing()). Every frame found (FRAME_BOXES) and drawn is asked
+    // whether it transitions pointer-events, until one does.
     function surveyFrames() {
+      keepPassing();
       frameList = findFrames();
+      // Not frames the browser does not draw now (display: none, or in
+      // content it skips: content-visibility: auto off screen). Reading the
+      // style of one in skipped content lays it out, and so does
+      // checkVisibility() with no options, which made each arm and the
+      // first scroll after it slow on pages of many such frames. A frame
+      // not drawn cannot take a press, and is asked once it is drawn (see
+      // drawnSince()).
+      if (!discrete) {
+        unseen = [];
+        discrete = allFrames.some((frame) => {
+          if (typeof frame.checkVisibility === 'function' && !frame.checkVisibility({ contentVisibilityAuto: true })) {
+            unseen.push(frame);
+            return false;
+          }
+          return transitionsPointer(frame);
+        });
+      }
       passFrames();
       live = frameList.filter((element) => {
         try {
@@ -2558,7 +3158,7 @@
       const every = [];
       for (const scope of [document, ...roots]) {
         if (scope !== document && !scope.host.isConnected) {
-          roots.delete(scope);
+          dropRoot(scope);
           continue;
         }
         try {
@@ -2574,11 +3174,12 @@
       return found;
     }
 
-    // Open shadow roots, so frames inside a web component let the pointer
-    // through too, and a popover in one is seen in the top layer. Walked
-    // at the arm and on each survey, within a budget, so a root attached
-    // while armed is found too; one found sooner by the pointer (see
-    // pickAt() and onFrameOver()) is added then. A closed root is not seen.
+    // Shadow roots, open and closed (see shadowOf()), so frames inside a
+    // web component let the pointer through too, and a popover in one is
+    // seen in the top layer. Walked at the arm and on each survey, within
+    // a budget, so a root attached while armed is found too; one found
+    // sooner by the pointer (see pickAt() and onFrameOver()) is added
+    // then, and a closed one attached after the arm only then.
     function collectRoots() {
       const stack = document.documentElement ? [document.documentElement] : [];
       let budget = ROOT_SCAN;
@@ -2586,9 +3187,10 @@
         const walker = document.createTreeWalker(stack.pop(), NodeFilter.SHOW_ELEMENT);
         for (let node = walker.currentNode; node && budget > 0; node = walker.nextNode()) {
           budget -= 1;
-          if (node.shadowRoot) {
-            roots.add(node.shadowRoot);
-            stack.push(node.shadowRoot);
+          const root = node.nodeType === 1 ? surveyedShadowOf(node) : null;
+          if (root) {
+            addRoot(root);
+            stack.push(root);
           }
         }
       }
@@ -2633,6 +3235,15 @@
      * which puts it above whatever opened last. On a page with nothing in the
      * top layer it stays an ordinary element at the end of body, as it always
      * was.
+     *
+     * As body's last child it takes :last-child from the page's own last
+     * element, so a page that spaces body's children by margin (Tailwind's
+     * space-y) moves while armed. Put after body instead, it took
+     * :last-child from body itself, and a page's body:last-child or
+     * html > :last-child rule changed body (checked in Chrome 156). Before
+     * head it would change body's :nth-child and be drawn under the page's
+     * own elements at the same z-index unless it were always a popover,
+     * which the page would hear as a toggle and match as :popover-open.
      *
      * Inside the topmost modal dialog only when the dialog holds a frame
      * that needs a shield (see surveyFrames()), which is rare now that frames
@@ -2707,7 +3318,7 @@
     // element is the topmost one, also inside a shadow root.
     function modalOfFocus() {
       let node = document.activeElement;
-      while (node && node.shadowRoot && node.shadowRoot.activeElement) node = node.shadowRoot.activeElement;
+      while (node && shadowOf(node)?.activeElement) node = shadowOf(node).activeElement;
       for (let depth = 0; node && node.nodeType === 1 && depth < 256; depth += 1) {
         try {
           if (node.matches(':modal')) return node;
@@ -2770,7 +3381,8 @@
      * press begun in the tail, ends it whatever is held.
      *
      * The key that picked, held down, repeats: its repeats and its keyup
-     * are kept from the page too, or a form whose field had focus was sent.
+     * are kept from the page too, or a form whose field had focus was sent,
+     * and past the tail until it is let go (see holdEnter()).
      *
      * @returns {number} this tail's id
      */
@@ -2833,11 +3445,13 @@
       if (!active) {
         unmount();
         stopPassing();
+        dropRoots();
+        if (taken.has('Enter')) holdEnter();
       }
     }
 
     function onTail(event) {
-      if (!event.isTrusted) return;
+      if (!event.isTrusted || seen(event)) return;
       if (event.type === 'keyup') {
         if (event.key !== 'Enter') return;
         taken.delete(event.key);
@@ -2858,6 +3472,41 @@
       }
       // The mouse events a tap makes come once it has moved the hover.
       if (tapRead && (event.type === 'mousedown' || event.type === 'click')) tapRead();
+    }
+
+    /**
+     * The Enter that picked, still held when the tail ends. Its repeats
+     * reached the page as the key held down, and sent the form whose field
+     * has focus as often as they came. They are kept from the page until
+     * the key is let go, until a press of Enter that is no repeat shows it
+     * was let go unseen, or until the window loses focus, after which its
+     * keyup goes elsewhere. No other key is held.
+     */
+    function holdEnter() {
+      if (enterHeld) return;
+      enterHeld = true;
+      for (const type of HELD_EVENTS) window.addEventListener(type, onHeldEnter, true);
+      window.addEventListener('blur', releaseEnter);
+      window.addEventListener('pagehide', releaseEnter);
+    }
+
+    function onHeldEnter(event) {
+      if (!event.isTrusted || event.key !== 'Enter' || seen(event)) return;
+      if (event.type !== 'keyup' && !event.repeat) {
+        releaseEnter();
+        return;
+      }
+      swallow(event);
+      if (event.type === 'keyup') releaseEnter();
+    }
+
+    function releaseEnter() {
+      if (!enterHeld) return;
+      enterHeld = false;
+      taken.delete('Enter');
+      for (const type of HELD_EVENTS) window.removeEventListener(type, onHeldEnter, true);
+      window.removeEventListener('blur', releaseEnter);
+      window.removeEventListener('pagehide', releaseEnter);
     }
 
     // A press begun in the tail has ended; what is left of it comes within
@@ -2985,8 +3634,10 @@
 
         // The marker attribute is set here, after the payload is built, because
         // attributes() and markup() read the live DOM and would otherwise print
-        // data-cdr-pick into the user's prompt.
-        const inspected = inspect(element);
+        // data-cdr-pick into the user's prompt. Inside a closed shadow root it
+        // goes on that root's host (see reachOf()).
+        const reach = reachOf(element);
+        const inspected = inspect(reach.node);
 
         // Hiding the highlight box only queues the change, and one frame does
         // not guarantee a paint has landed before the panel screenshots the tab,
@@ -3007,6 +3658,7 @@
             if (era !== generation) return;
             if (reply?.component) payload.component = reply.component;
             if (reply?.handlers) payload.handlers = reply.handlers;
+            if (reach.steps) throughHost(payload, reach);
             send({ type: 'cdr:element-picked', rect: captureRect, viewport, element: payload, run: picked });
             lingerTail(tail);
           })
@@ -3060,6 +3712,32 @@
       window[method]('pagehide', stop);
     }
 
+    /**
+     * The presses and keys the press gate hears (content/press-gate.js), a
+     * content script declared at document_start whose listeners on window
+     * were added before any of the page's own. Chrome runs the listeners of
+     * one target in the order they were added, across worlds, so a page's
+     * capture listener on window added before the arm heard the presses
+     * that picked, and the keys, before the picker's own listener could
+     * keep them. Through the gate the picker hears them first. Its own
+     * listeners stay for a tab whose gate was not there before the page's
+     * scripts ran (a tab open from before the extension was installed or
+     * reloaded); each event is handled once, by whichever hears it first.
+     */
+    function route(event) {
+      if (active) {
+        if (PRESS.includes(event.type)) onPointer(event);
+        else if (event.type === 'keydown') onKeyDown(event);
+        else if (event.type === 'keyup') onKeyUp(event);
+        else if (event.type === 'selectstart') onSelectStart(event);
+      } else if (tailOn) {
+        if (TAIL_EVENTS.includes(event.type)) onTail(event);
+        else if (event.type === 'selectstart') onSelectStart(event);
+      } else if (enterHeld && HELD_EVENTS.includes(event.type)) {
+        onHeldEnter(event);
+      }
+    }
+
     function start() {
       if (active) return run;
       // Mutually exclusive with the region overlay; see the matching comment
@@ -3070,6 +3748,7 @@
         /* ignore */
       }
       endTail();
+      releaseEnter();
       if (!host) build();
       active = true;
       run = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
@@ -3082,10 +3761,13 @@
       hint.style.display = 'block';
       shields.style.display = 'block';
 
-      roots = new Set();
+      dropRoots();
+      shadowSeen = new WeakMap();
       collectRoots();
       // Frames let the pointer through before the host is placed, which
       // goes into a modal dialog only for a frame that still needs a shield.
+      discrete = false;
+      unseen = [];
       surveyFrames();
       frameCount = 1;
       mount();
@@ -3105,7 +3787,7 @@
       frame = 0;
       pressed = false;
       downs.clear();
-      roots = new Set();
+      dropRoots();
       frameList = [];
       allFrames = [];
       live = [];
@@ -3124,6 +3806,14 @@
       disarm();
       unmount();
       stopPassing();
+    }
+
+    // The press gate hands its events to this controller, the only one the
+    // page gets (see route()).
+    try {
+      if (window.__cdrPressGate) window.__cdrPressGate.hook = route;
+    } catch {
+      /* no gate: the picker's own listeners hear everything */
     }
 
     // isActive: see the matching line in overlay.js. key: the panel holds the

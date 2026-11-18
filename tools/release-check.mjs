@@ -27,11 +27,11 @@
  * never pass, because it compared the branch name with the version.
  *
  * Writes publish, tag, version and commit to $GITHUB_OUTPUT when that is set.
- * Exits 1 on a refusal.
+ * Exits 1 on a refusal, and when a git or gh call fails or runs past a minute.
  */
 
 import { appendFileSync, readFileSync, realpathSync } from 'node:fs';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { EXCLUDE, INCLUDE } from './build.mjs';
@@ -118,16 +118,69 @@ export function decide(facts) {
 
 // ------------------------------------------------------------------- facts --
 
-function git(args) {
-  return execFileSync('git', args, { cwd: ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
-}
+// Each git call is a read of the local repository and the gh call is one
+// request to GitHub, so none should take a minute, even on a slow runner. One
+// that does is stopped and fails the run, saying which, rather than holding
+// the workflow until GitHub's own job limit of six hours. The variable is for
+// the tests.
+const TIMEOUT_MS = Number(process.env.RELEASE_CHECK_TIMEOUT_MS) || 60_000;
 
-function tagCommitOf(tag) {
-  const result = spawnSync('git', ['rev-parse', '-q', '--verify', `refs/tags/${tag}^{commit}`], {
+// spawnSync kills only the process it started, and a gh can start git, and
+// git its helpers. So the call leads a process group of its own, and the
+// whole group is killed once spawnSync has killed its leader. spawnSync
+// honours `detached` as spawn does (Node 22 and 24), though its documentation
+// lists the option only for spawn; the test of a hung call holds it to that.
+// Were it ever ignored, no such group would exist, only the call itself would
+// be stopped, and GitHub's runner would still end what is left when the job
+// ends. Windows has no process groups. Only on CI: a group of its own is out
+// of the terminal's reach, so on a local run Ctrl+C would stop this script
+// and leave a hung call running with nobody left to enforce its limit.
+// CI as CI services set it: CI=false or CI=0 in a shell's profile is not.
+const ON_CI = process.env.GITHUB_ACTIONS === 'true' || /^(?:1|true)$/i.test(process.env.CI ?? '');
+const GROUP = process.platform !== 'win32' && ON_CI;
+
+// A git or gh call that failed or ran out of time. main() prints only its
+// message, which names the call; any other error keeps its type and stack.
+class CallFailed extends Error {}
+
+/** Runs git or gh from the root, and throws when it cannot start or does not finish in time. */
+function run(command, args) {
+  const result = spawnSync(command, args, {
     cwd: ROOT,
     encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: TIMEOUT_MS,
+    killSignal: 'SIGKILL',
+    detached: GROUP,
   });
-  return result.status === 0 ? result.stdout.trim() : null;
+  if (result.error?.code === 'ETIMEDOUT') {
+    if (GROUP && result.pid > 0) {
+      try {
+        process.kill(-result.pid, 'SIGKILL');
+      } catch {
+        // Nothing of the group is left.
+      }
+    }
+    throw new CallFailed(`${command} ${args.join(' ')} did not finish within ${TIMEOUT_MS / 1000} s, so it was stopped`);
+  }
+  if (result.error) throw new CallFailed(`could not run ${command} ${args.join(' ')}: ${result.error.message}`);
+  return result;
+}
+
+function git(args) {
+  const result = run('git', args);
+  if (result.status !== 0) throw new CallFailed(`git ${args.join(' ')} failed: ${result.stderr.trim()}`);
+  return result.stdout.trim();
+}
+
+// With -q --verify, git exits 1 when there is no such tag. Any other failure
+// (128: not a repository, a corrupt one) is not an answer.
+function tagCommitOf(tag) {
+  const args = ['rev-parse', '-q', '--verify', `refs/tags/${tag}^{commit}`];
+  const result = run('git', args);
+  if (result.status === 1) return null;
+  if (result.status !== 0) throw new CallFailed(`git ${args.join(' ')} failed: ${result.stderr.trim()}`);
+  return result.stdout.trim();
 }
 
 /**
@@ -144,7 +197,7 @@ export function includeIn(source) {
 
 /** The INCLUDE list tools/build.mjs had at `commit`, or null. */
 function includeAt(commit) {
-  const result = spawnSync('git', ['show', `${commit}:tools/build.mjs`], { cwd: ROOT, encoding: 'utf8' });
+  const result = run('git', ['show', `${commit}:tools/build.mjs`]);
   return result.status === 0 ? includeIn(result.stdout) : null;
 }
 
@@ -180,19 +233,22 @@ function shippedChangedBetween(from, to) {
 
 /** Asks GitHub through `gh`, which the hosted runners carry. */
 function releaseExistsFor(tag) {
-  const result = spawnSync('gh', ['release', 'view', tag, '--json', 'tagName'], {
-    cwd: ROOT,
-    encoding: 'utf8',
-  });
-  if (result.error) throw new Error(`could not run gh to ask whether ${tag} has a release: ${result.error.message}`);
+  const result = run('gh', ['release', 'view', tag, '--json', 'tagName']);
   if (result.status === 0) return true;
   if (/release not found/i.test(result.stderr)) return false;
-  throw new Error(`gh release view ${tag} failed: ${result.stderr.trim()}`);
+  throw new CallFailed(`gh release view ${tag} failed: ${result.stderr.trim()}`);
 }
 
 function main() {
   const check = process.argv.includes('--check');
-  const read = (file) => JSON.parse(readFileSync(join(ROOT, file), 'utf8'));
+  const read = (file) => {
+    const text = readFileSync(join(ROOT, file), 'utf8');
+    try {
+      return JSON.parse(text);
+    } catch (error) {
+      throw new SyntaxError(`${file} is not valid JSON: ${error.message}`);
+    }
+  };
   const manifestVersion = read('manifest.json').version;
   const packageVersion = read('package.json').version;
   const sha = process.env.GITHUB_SHA || git(['rev-parse', 'HEAD']);
@@ -230,5 +286,13 @@ function main() {
 }
 
 if (process.argv[1] && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))) {
-  main();
+  try {
+    main();
+  } catch (error) {
+    // A git or gh call that failed or ran out of time. Its message names the
+    // call, and a stack would only bury it.
+    if (!(error instanceof CallFailed)) throw error;
+    console.error(error.message);
+    process.exitCode = 1;
+  }
 }

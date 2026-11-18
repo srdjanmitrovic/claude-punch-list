@@ -92,6 +92,19 @@ test('picker: an attribute named for a secret is hidden on any element', () => {
   );
 });
 
+test('picker: a payment nonce field and attribute lose their value (F43)', () => {
+  assert.equal(
+    maskMarkup('<input type="text" name="payment_method_nonce" value="tokencc_F43A"><span data-card-nonce="F43B" data-announce="soon">x</span>'),
+    '<input type="text" name="payment_method_nonce" value="<redacted>"><span data-card-nonce="<redacted>" data-announce="soon">x</span>'
+  );
+  assert.equal(maskAttribute('href', '/wp-admin/post.php?post=7&_wpnonce=F43C'), '/wp-admin/post.php?post=7&_wpnonce=<redacted>');
+});
+
+test('picker: a link\'s user name of small letters with five consonants in a row goes (F52)', () => {
+  assert.equal(maskAttribute('href', 'https://xkcdqwertyzpqlm@git.example.com/repo'), 'https://git.example.com/repo');
+  assert.equal(maskAttribute('href', 'ssh://postgres@db.example.com/app'), 'ssh://postgres@db.example.com/app');
+});
+
 test('picker: a url attribute keeps its path and loses credentials and secret params', () => {
   assert.equal(
     maskMarkup('<a href="/reset?token=abc&amp;step=2">Reset</a>'),
@@ -659,4 +672,123 @@ test('picker: any element whose type is password loses its value', () => {
   assert.equal(control, true);
   assert.equal(maskAttribute('value', 'S', control), '<redacted>');
   assert.equal(secretControl('x-field', (name) => ({ type: 'text' })[name] ?? null), false);
+});
+
+// F20: the picker read JSON in a link with its own copy of the rule, so a
+// key whose quotes are escaped or that holds a \u escape, JSON in a data:
+// url's content and a data: url that says ;base64 while holding text were
+// read in neither place. The rule is now one, in the SECRET URLS block.
+test('picker: escaped keys, and JSON or text in a data: url, are read in a picked element\'s links (F20)', () => {
+  assert.equal(maskAttribute('href', '/cb?s="{\\"token\\":\\"PF1\\"}"', false), '/cb?s=<redacted>');
+  assert.equal(maskAttribute('href', '/cb?s={"\\u0074oken":"PF2"}', false), '/cb?s=<redacted>');
+  assert.equal(maskAttribute('href', 'data:application/json,{"a":"b?c","token":"PF3"}', false), 'data:application/json,<redacted>');
+  assert.equal(maskAttribute('href', 'data:application/json,%7B%22token%22%3A%22PF4%22%7D', false), 'data:application/json,<redacted>');
+  assert.equal(
+    maskAttribute('href', 'data:text/html;base64,%3Ca%20href%3D%22https%3A%2F%2Fa.test%2F%3Ftoken%3DPF5%22%3E', false),
+    'data:text/html;base64,<redacted>'
+  );
+  assert.equal(
+    maskMarkup('<a href="data:application/json,{&quot;token&quot;:&quot;PF6&quot;}">x</a>'),
+    '<a href="data:application/json,<redacted>">x</a>'
+  );
+  // A srcdoc is hidden whole when anything in it would be.
+  assert.equal(maskAttribute('srcdoc', '<script>var cfg = {"token":"PF7"}</script>', false), '<redacted>');
+  // Base64 content and JSON with nothing secret are left as written.
+  const png = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
+  for (const plain of [png, 'data:application/json,{"name":"x","page":1}', "/s?q=it's%20fine&page=2"]) {
+    assert.equal(maskAttribute('href', plain, false), plain);
+  }
+});
+
+// V1-4: the picker's links and srcdoc read a quoted word before a colon as a
+// key anywhere, so a script's case label or ternary hid a document 0.6.0
+// printed. A key counts where JSON puts one; one in single quotes or with
+// escaped quotes still does.
+test('picker: only a key where JSON puts one hides a srcdoc or a data: link (V1-4)', () => {
+  const plain = [
+    "<script>switch (mode) { case 'code': run(); break; default: stop(); }</script><p>Hello</p>",
+    "<script>const store = persist ? 'session' : 'local';</script><p>Hello</p>",
+  ];
+  for (const doc of plain) {
+    assert.equal(maskAttribute('srcdoc', doc, false), doc);
+    assert.equal(maskAttribute('href', `data:text/html,${doc}`, false), `data:text/html,${doc}`);
+  }
+  assert.equal(maskAttribute('srcdoc', "<script>var cfg = {'token':'PV14A'}</script>", false), '<redacted>');
+  assert.equal(maskAttribute('href', 'data:application/json,{"a":"{\\"token\\":\\"PV14B\\"}"}', false), 'data:application/json,<redacted>');
+});
+
+// V1-7: a pair with no name was skipped, so a url in its value kept its secret.
+test('picker: a url in the value of a pair with no name is screened (V1-7)', () => {
+  assert.equal(
+    maskAttribute('href', 'https://a.test/x?=https://b.test/cb?token=PV17', false),
+    'https://a.test/x?=https://b.test/cb?token=<redacted>'
+  );
+});
+
+// V1-5: letter groups count as one consonant, so a surname with an initial
+// keeps its place in a picked link, and a random token still goes.
+test('picker: a link\'s user name made of letter groups stays (V1-5)', () => {
+  for (const href of ['https://jschmidt@bitbucket.org/team/repo.git', 'ssh://pgsql@db.example.com/app', 'https://armstrong@a.example/']) {
+    assert.equal(maskAttribute('href', href, false), href);
+  }
+  assert.equal(maskAttribute('href', 'https://qmzbtrwhalk@git.example.com/repo', false), 'https://git.example.com/repo');
+});
+
+// W1-1: every absolute url in a data: url's content was screened as a url
+// again on each decoded layer, so a link of a megabyte of ';x=1' path
+// parameters behind an escape encoded six times held the page for 240 ms a
+// read, 0.7 s a pick and 3.4 s with five such attributes (0.6.0: 1 ms a read).
+// Only the names of its path parameters are read now, once, in the last
+// layer: about 25 ms. The limit is three times what a megabyte of plain
+// parameters in a link takes on this machine, and at least 100 ms.
+test('picker: a megabyte data: link of path parameters behind a layered escape is read in bounded time (W1-1)', () => {
+  const plain = `https://a.test/?${'a=1&'.repeat(1 << 18)}`;
+  let best = Infinity;
+  for (let run = 0; run < 3; run += 1) best = Math.min(best, timed(() => maskAttribute('href', plain, false), 0));
+  const limit = Math.max(100, 3 * best);
+  const href = `data:,http://h/%2525252525253D${';x=1'.repeat((1 << 18) - 10)}`;
+  let out;
+  const took = timed(() => {
+    out = maskAttribute('href', href, false);
+  }, limit);
+  assert.ok(took < limit, `${Math.round(took)} ms, over ${Math.round(limit)}`);
+  assert.equal(out, href);
+  assert.equal(maskAttribute('href', `${href};jsessionid=PW11`, false), 'data:,<redacted>');
+});
+
+// W1-4: that url ran on through encodeURI'd markup, whose quotes and spaces
+// are %22 and %20, so an entity's ';' and the words up to a later '=' read as
+// a secret parameter and hid ordinary html. It ends at a quote, '<', '>' or
+// space, raw or encoded, and only a name made of url characters counts.
+test('picker: an html data: link with entities and a word before an "=" keeps its content (W1-4)', () => {
+  for (const html of [
+    '<a href="https://a.test/">Home</a>&nbsp;&middot;&nbsp;Account settings <a href="/settings">open</a>',
+    '<a href="https://a.test/help">Help</a><p style="color:red;font-weight:bold">Your account is locked=true</p>',
+  ]) {
+    const href = `data:text/html,${encodeURI(html)}`;
+    assert.equal(maskAttribute('href', href, false), href);
+  }
+  const src = `data:text/html,${encodeURI('<img src="https://a.test/i.png;jsessionid=PW14">')}`;
+  assert.equal(maskAttribute('src', src, false), 'data:text/html,<redacted>');
+});
+
+// W1-2: a key counted only with its quote straight after the '{' or ',' and
+// white space, so Python's repr of a dict ({u'token': u'…'}, {b'token': …})
+// printed in a picked link, which 0.6.0's picker hid. W1-3: JSON all in one
+// value was trusted to nestedUrl, which did not decode single quoted keys
+// that show only once decoded.
+test('picker: keys with a string prefix, or in single quotes that show only once decoded, hide a link (W1-2, W1-3)', () => {
+  for (const state of [
+    "{u'next': u'/home', u'token': u'PW12A'}",
+    "{b'token': b'PW12B'}",
+    '{u%27token%27:%20u%27PW12C%27}',
+    '{%5C%27token%5C%27:%5C%27PW13A%5C%27}',
+    '{%5Cn%27token%27:%27PW13B%27}',
+    "{%27token':'PW13C'}",
+  ]) {
+    assert.equal(maskAttribute('href', `/cb?state=${state}`, false), '/cb?state=<redacted>', state);
+  }
+  assert.equal(maskMarkup(`<a href="/cb?state={u'token': u'PW12D'}">x</a>`), '<a href="/cb?state=<redacted>">x</a>');
+  const doc = "<script>t = x ? u'session' : 2; switch (m) { case 'code': f(); }</script>";
+  assert.equal(maskAttribute('srcdoc', doc, false), doc);
 });

@@ -15,12 +15,14 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # A hung step fails here, not at GitHub's own limit of six hours.
+    timeout-minutes: 15
     strategy:
       # Each Node version reports on its own, rather than one failure
       # cancelling the other.
       fail-fast: false
       matrix:
-        node: ["20", "24"]
+        node: ["22", "24"]
     steps:
       - uses: actions/checkout@v7
 
@@ -40,6 +42,8 @@ jobs:
   version:
     if: github.event_name == 'pull_request' && github.base_ref == 'main'
     runs-on: ubuntu-latest
+    # A hung step fails here, not at GitHub's own limit of six hours.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
         with:
@@ -47,7 +51,7 @@ jobs:
 
       - uses: actions/setup-node@v7
         with:
-          node-version: "20"
+          node-version: "24"
 
       - name: Check the version names one build
         run: node tools/release-check.mjs --check

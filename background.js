@@ -18,11 +18,14 @@
  *                                                      | { ok: false, outside: 'site'|'path' }
  *                                                      | { ok: false, error }
  * panel      => worker   port 'cdr:panel'   posts cdr:holding { tabId|null }; closing it disarms that tab
- * content    -> *        cdr:region-selected { rect, viewport, run }
+ * content    -> *        cdr:region-selected { rect, viewport, run, moved? }
  * content    -> *        cdr:element-picked  { rect, viewport, element, run }
  * content    -> *        cdr:capture-cancelled { mode, run }
  * panel      -> content  cdr:get-context     (handled by collector-bridge.js)
  * panel      -> content  cdr:clear-context   (handled by collector-bridge.js)
+ * panel      => content  port 'cdr:counts'  to the tab in view; the bridge posts
+ *                                            cdr:counts { console, network } as they change
+ *                                            (no worker in between)
  *
  * The cdr:* messages sent by content scripts are broadcast to every extension
  * context, so the side panel listens for them directly instead of having the
@@ -34,7 +37,9 @@
  * so a late message from an earlier run cannot end a newer arm of its mode.
  * `viewport` is { width, height, visual? }, the layout viewport in CSS pixels
  * and, where the page has one, its visualViewport as { x, y, width, height,
- * scale }, which is what a pinch zoomed screenshot shows.
+ * scale }, which is what a pinch zoomed screenshot shows. `moved` is true
+ * when the overlay, inside the element shown fullscreen, moved the page's
+ * layout while armed, so the crop may not match the selection.
  */
 
 const CAPTURE_SCRIPTS = {

@@ -65,7 +65,13 @@
  *                                    may be the component itself) and
  *                                    sourceFrom: 'stack' when its call site is
  *                                    a position in the code the browser ran
- *                                    rather than one React recorded.
+ *                                    rather than one React recorded. A
+ *                                    component of either kind carries
+ *                                    closedHost, the host's label, when the
+ *                                    picked element is inside a closed shadow
+ *                                    root and the component was read from
+ *                                    that root's host, its hops counted from
+ *                                    the element through the host.
  *
  * Every field may be missing or of the wrong type: the log comes from the
  * page and the component from the page's own world. Anything that is not
@@ -429,9 +435,10 @@ function clockFor(report) {
  * The zone of the log's clock times, and the day of those that print none,
  * as a sentence, or '' when no entry prints a clock time.
  *
- * The Captured line gives both when the page prints. With the page toggle
- * off there is no such line, and a log of bare times could not be set beside
- * a server's.
+ * The Captured line gives both when the page prints, though in a list whose
+ * log is split under the items it comes after them. With the page toggle off
+ * there is no such line, and a log of bare times could not be set beside a
+ * server's.
  */
 function clockNotice(report, clock) {
   if (!Number.isFinite(report.armedAt)) return '';
@@ -751,10 +758,18 @@ function formatComponent(component) {
       // The count is parentElement steps, so it is said in DOM elements: saying
       // "levels" invites counting components, which is a different number.
       const steps = hops === 1 ? '1 DOM element' : `${hops} DOM elements`;
-      identity +=
-        `${identity.endsWith('.') ? '' : '.'} The selected element was not rendered by ` +
-        `${vue ? 'Vue' : 'React'} itself; ` +
-        `this is the nearest component node, ${steps} up.`;
+      // Inside a closed shadow root the page's own world, where the
+      // component is read, sees only the root's host, so the component is
+      // the one nearest that host. Whether the framework rendered the
+      // element itself cannot be known, and is not said.
+      const host = typeof component.closedHost === 'string' ? flatten(component.closedHost) : '';
+      identity += host
+        ? `${identity.endsWith('.') ? '' : '.'} The selected element is inside the closed shadow root of ` +
+          `\`${host}\`, which the page's own scripts cannot see into; ` +
+          `this is the component nearest that host, ${steps} up.`
+        : `${identity.endsWith('.') ? '' : '.'} The selected element was not rendered by ` +
+          `${vue ? 'Vue' : 'React'} itself; ` +
+          `this is the nearest component node, ${steps} up.`;
     }
     lines.push(identity);
   }
@@ -1238,8 +1253,10 @@ function pathOf(url) {
   // start credentialsAt would read a path's leading '//' as an authority:
   // new URL() has taken the real one out, so an '@' left in the path is the
   // path's own (http://host//@alice/profile).
-  const path =
-    maskPath(withoutCredentials(parsed.pathname), 0) + maskParams(parsed.search) + maskParams(parsed.hash);
+  const path = splitJson(
+    maskPath(withoutCredentials(parsed.pathname), 0) + maskParams(parsed.search) + maskParams(parsed.hash),
+    url
+  );
   // A landing page has no path to speak of, and "Fix this issue on /" names
   // nothing at all. The host is the only identifying thing left, so keep it.
   return path === '/' ? safeUrl(url) : path;
@@ -1255,13 +1272,16 @@ const REDACTED = '<redacted>';
 // "ssn" nor passHref by "pass". A word of five letters or more also matches
 // at either end of a run together lowercase name (authtoken, phonenumber).
 // Deliberately broad: a needlessly hidden value costs a line of the prompt,
-// and the other kind of mistake cannot be taken back.
+// and the other kind of mistake cannot be taken back. A nonce is a one time
+// payment token (Braintree's payment_method_nonce) or a form's CSRF token
+// (WordPress's _wpnonce).
 const SECRET_WORDS = [
   'password', 'passwd', 'passphrase', 'passcode', 'pwd', 'secret', 'token', 'auth', 'oauth',
   'authorization', 'bearer', 'jwt', 'cookie', 'session', 'credential', 'apikey', 'accesskey',
   'privatekey', 'signingkey', 'csrf', 'xsrf', 'otp', 'totp', 'pin', 'pincode', 'cvv', 'cvc',
   'ssn', 'iban', 'cardnumber', 'creditcard', 'ccnumber', 'account', 'address', 'email', 'phone',
   'dob', 'birth', 'signature', 'jsessionid', 'sessid', 'securitycode', 'verificationcode',
+  'nonce',
 ];
 
 function isSecretName(name) {
@@ -1310,13 +1330,50 @@ const USERINFO = /^[^\x00-\x1f\x7f"<>[\\\]^`{|}]+$/;
 // it. A token used as a user name still goes: it carries digits
 // (https://ghp_…@github.com, a Sentry key), capitals run together
 // (AKIAIOSFODNNEXAMPLE), a run of small letters longer than a word
-// (the 24 of a Stripe test key), or more than PLAIN_USER_MAX characters.
+// (the 24 of a Stripe test key), more than PLAIN_USER_MAX characters, or
+// five consonants in a row (CONSONANT_RUN).
 const PLAIN_USER =
   /^[A-Za-z][a-z]{0,15}(?:[A-Z][a-z]{1,15})*(?:[._-][A-Za-z][a-z]{0,15}(?:[A-Z][a-z]{1,15})*)*$/;
 const PLAIN_USER_MAX = 32;
 
-// A key in JSON, written out or once decoded: "token": in state={"token":…}.
-const JSON_KEY = /"([^"\\]*)"\s*:/g;
+// Five consonants in a row, y counted as a vowel (rhythm, mysql), once the
+// letters that spell one sound (sch, tch, ght, str, th, ng, Polish sz and cz)
+// and the abbreviations service accounts are named with (sql, svc, srv, http,
+// ftp, ctrl) are each read as one consonant (CONSONANT_GROUPS), so armstrong,
+// jschmidt, dijkstra, pgsql and lightdm stay. About one word of English in
+// ten thousand still holds them (offspring), against about four in nine of
+// the random tokens of eight small letters and three in four of sixteen.
+// Telling the rest of such tokens from a word (administrator) would take a
+// dictionary.
+const CONSONANT_RUN = /[bcdfghjklmnpqrstvwxz]{5}/i;
+const CONSONANT_GROUPS = /sch|tch|ght|str|sql|svc|srv|http|ftp|ctrl|ch|sh|th|ph|ck|ng|mc|kr|tz|sz|cz|rz/g;
+
+// A key in JSON: "token": in state={"token":…}, or 'token': in a JavaScript
+// object written in single quotes. Also one whose quotes are escaped, as JSON
+// written into a string of other JSON writes them ({"s":"{\"token\":…}"}),
+// at any depth, or written as .NET's encoder writes a quote in a string
+// (\u0022), or percent encoded once or more, as Chrome writes a url's quotes
+// and encodeURIComponent its colon ({%22token%22:…}, %7B'token'%3A…,
+// %257B%2527token%2527%253A…); and one with a \u escape or an escape of its
+// own letters, which are decoded before it is judged. Only where JSON puts a
+// key: after a '{' or a ',' (raw or encoded) and any white space (raw,
+// escaped as \n, encoded or a '+'), and Python's string prefix if any
+// ({u'token': u'…'}, {b'token': …}), so that a case label (case 'code':), a
+// ternary (? 'session' :) or prose (what's 'code': 5) is no key. A run of
+// backslashes is matched from its first, so the scan never goes back over
+// one, and what comes before a key is looked at only at a quote.
+const KEY_QUOTE_FORMS = String.raw`["']|\\u00(?:22|27)|%(?:25)*2[27]`;
+const QUOTED_KEY = new RegExp(
+  String.raw`(?<!\\)(\\*)(${KEY_QUOTE_FORMS})` +
+    String.raw`(?<=(?:[{,]|%(?:25)*(?:7[Bb]|2[Cc]))(?:\s|\\+[nrt]|%(?:25)*(?:20|0[9AaDd])|\+)*[uUbBrR]{0,2}\\*(?:${KEY_QUOTE_FORMS}))` +
+    String.raw`([^"'\\%]*(?:(?:\\u(?!00(?:22|27))[0-9A-Fa-f]{4}|%(?!(?:25)*2[27]))[^"'\\%]*)*)` +
+    String.raw`\1\2(?:\s|%(?:25)*(?:20|0[9AaDd])|\+)*(?::|%(?:25)*3[Aa])`,
+  'g'
+);
+
+// In a url, also a key in plain double quotes wherever it stands, as a url
+// has always been read: "token": in ?s="token":"…" too.
+const URL_KEY = new RegExp(String.raw`${QUOTED_KEY.source}|"([^"\\]*)"\s*:`, 'g');
 
 // More distinct keys than any state a url carries. Past that the value is a
 // blob, kept out whole rather than judged key by key in the page's time.
@@ -1340,25 +1397,91 @@ function isCredentials(userinfo) {
   if (userinfo.includes(':')) return true;
   if (/[^\x00-\x7f]/.test(userinfo) || /[;,]/.test(userinfo)) return false;
   if (userinfo && !USERINFO.test(userinfo)) return false;
-  return !(userinfo.length <= PLAIN_USER_MAX && PLAIN_USER.test(userinfo));
+  return !(
+    userinfo.length <= PLAIN_USER_MAX &&
+    PLAIN_USER.test(userinfo) &&
+    !CONSONANT_RUN.test(userinfo.toLowerCase().replace(CONSONANT_GROUPS, 'c'))
+  );
 }
 
 /**
- * Whether JSON in a value names a secret key (state={"token":"…"}), each
- * distinct key judged once, and by the rule for a parameter's name: the key
- * of a state the url carries is a parameter of it, so {"key":…} and
- * {"code":…} are as secret as ?key= and ?code=.
+ * Where each key in text that names a secret starts (state={"token":…}), in
+ * order, or only the first unless `all`; null past MAX_JSON_KEYS distinct
+ * keys, which make a blob. Each distinct key is judged once, and by the rule
+ * for a parameter's name: the key of a state the url carries is a parameter
+ * of it, so {"key":…} and {"code":…} are as secret as ?key= and ?code=. In a
+ * url a key in plain double quotes counts wherever it stands (URL_KEY); in a
+ * document (`strict`: a data: url's content, a srcdoc) only where JSON puts
+ * one (QUOTED_KEY), since script and prose there are full of quoted words
+ * before a colon. One read of the text (see judgedKey).
  */
-function secretKeyIn(text) {
-  if (!text.includes('"')) return false;
-  const seen = new Set();
-  for (const [, key] of text.matchAll(JSON_KEY)) {
-    if (seen.has(key)) continue;
-    if (seen.size === MAX_JSON_KEYS) return true;
-    seen.add(key);
-    if (isSecretParam(key)) return true;
+function secretKeysIn(text, strict, all) {
+  // Every key has a quote and a colon. Asked of every value, so the common
+  // answer costs a look or two and no pattern.
+  const escaped = text.includes('%');
+  if (!text.includes('"') && !text.includes("'") && !text.includes('\\u00') && !(escaped && /%(?:25)*2[27]/.test(text))) {
+    return [];
   }
-  return false;
+  if (!text.includes(':') && !(escaped && /%(?:25)*3A/i.test(text))) return [];
+  // Read with exec rather than matchAll, which copies the pattern on every
+  // call; nothing read here comes back to this function.
+  const pattern = strict ? QUOTED_KEY : URL_KEY;
+  pattern.lastIndex = 0;
+  // Distinct keys are counted only once there are matches enough to make a
+  // blob: until then each is only noted.
+  const noted = [];
+  let keys = null;
+  const found = [];
+  for (let match = pattern.exec(text); match; match = pattern.exec(text)) {
+    const { key, secret } = judgedKey(match[3] ?? match[4]);
+    if (keys) keys.add(key);
+    else if (noted.push(key) > MAX_JSON_KEYS) keys = new Set(noted);
+    if (keys && keys.size > MAX_JSON_KEYS) return null;
+    if (secret) {
+      found.push(match.index);
+      if (!all) break;
+    }
+  }
+  return found;
+}
+
+// Keys as written, with what they decode to and whether that is secret. A
+// page writes the same few keys over and over, in every url it logs, so a
+// short one is remembered, up to a bound, rather than decoded and judged
+// again each time.
+const JUDGED_KEYS = new Map();
+function judgedKey(written) {
+  let judged = JUDGED_KEYS.get(written);
+  if (judged) return judged;
+  let key = written.includes('%') ? decodeLoosely(written) : written;
+  if (key.includes('\\')) key = key.replace(/\\u(.{4})/g, (escape, hex) => String.fromCharCode(parseInt(hex, 16)));
+  judged = { key, secret: isSecretParam(key) };
+  if (written.length <= 64) {
+    if (JUDGED_KEYS.size === 1000) JUDGED_KEYS.clear();
+    JUDGED_KEYS.set(written, judged);
+  }
+  return judged;
+}
+
+/** Whether JSON in text names a secret key, or is a blob (secretKeysIn). */
+function secretKeyIn(text, strict) {
+  const found = secretKeysIn(text, strict, false);
+  return found === null || found.length > 0;
+}
+
+/**
+ * Whether JSON in text names a secret key as it stands, or decoded again for
+ * each layer of encoding up to as many as a value is followed (MAX_NESTING),
+ * counting from `layer`.
+ */
+function secretKeyDecoded(text, layer) {
+  for (; ; layer += 1) {
+    if (secretKeyIn(text, false)) return true;
+    if (layer === MAX_NESTING || !text.includes('%')) return false;
+    const decoded = decodeLoosely(text);
+    if (decoded === text) return false;
+    text = decoded;
+  }
 }
 
 // isSecretName's test, with each word looked up rather than compared with
@@ -1426,7 +1549,9 @@ function maskParams(part, depth = 0) {
   for (let index = 0; index < pieces.length; index += 2) {
     const pair = pieces[index];
     const eq = pair.indexOf('=');
-    if (eq <= 0 || eq === pair.length - 1) continue;
+    // A pair with no name (?=https://…) names no secret, but its value can
+    // still hold a url or JSON that does.
+    if (eq === -1 || eq === pair.length - 1) continue;
     let name = pair.slice(0, eq);
     try {
       name = decodeURIComponent(name.replace(/\+/g, ' '));
@@ -1454,11 +1579,24 @@ function maskParams(part, depth = 0) {
  */
 function nestedUrl(value, depth) {
   const holdsUrl = (text) => /[?#]/.test(text) || credentialsAt(text) !== null;
-  if (secretKeyIn(value)) return REDACTED;
+  if (secretKeyIn(value, false)) return REDACTED;
   if (holdsUrl(value)) return depth < MAX_NESTING ? screenUrl(value, depth + 1) : REDACTED;
   // %253F is a '?' encoded twice, as a return address inside a return
-  // address's own encoding arrives. %22 is a quote, which JSON starts with.
-  if (!/%(?:25)*(?:3F|23|40|22)/i.test(value)) return value;
+  // address's own encoding arrives. %22 is a quote, which JSON starts with,
+  // and %27 and %5C an apostrophe or a backslash, with which a key in single
+  // quotes can show only once decoded ({%5C%27token%5C%27:…}, {%5Cn%27…),
+  // so long as a colon, raw or encoded, can follow it.
+  // Only where a decode can show more than prose (it's: 1) or a path
+  // (C:\dir), whose decoding cost a picked link of them two and a half
+  // times 0.6.0: a '{' or ',' a key can follow, a raw double quote (a key
+  // whose colon is encoded), an escape of a letter or digit, which no
+  // ordinary encoder writes (%25%37%42 is a '{' twice encoded), or an '@'
+  // with slashes (credentials in an encoded link).
+  const keyed =
+    /%(?:25)*(?:27|5C)/i.test(value) &&
+    /:|%(?:25)*3A/i.test(value) &&
+    (/[{,"]|%(?:25)*(?:7B|2C|3\d|[46][1-9A-F]|[57][0-9A])/i.test(value) || (value.includes('@') && /\/\/|%(?:25)*2F/i.test(value)));
+  if (!keyed && !/%(?:25)*(?:3F|23|40|22)/i.test(value)) return value;
   const decoded = decodeLoosely(value);
   if (holdsUrl(decoded)) {
     return depth < MAX_NESTING && screenUrl(decoded, depth + 1) === decoded ? value : REDACTED;
@@ -1602,14 +1740,14 @@ function withoutCredentials(text) {
  * parameters (;charset=utf8) end at its comma. What follows is its content,
  * not more parameters: an svg, each of whose %23 colours would read as one
  * more nested url, or base64, whose '=' padding would end a name made of
- * random letters. Content that is not base64 can still hold a link (an html
- * or svg document, percent encoded), and is masked whole when that link
- * carries a secret (see dataContent).
+ * random letters. Its content can still hold a link (an html or svg
+ * document, percent encoded) or JSON, and is masked whole when that link
+ * carries a secret or that JSON names a secret key (see dataContent).
  */
 function maskPath(path, depth) {
   const comma = /^\s*data:/i.test(path) ? path.indexOf(',') : -1;
   const end = comma === -1 ? path.length : comma;
-  const tail = comma === -1 ? '' : dataContent(path.slice(0, comma), path.slice(comma), depth);
+  const tail = comma === -1 ? '' : dataContent(path.slice(comma), depth);
   const semi = path.indexOf(';');
   if (semi === -1 || semi > end) return comma === -1 ? path : path.slice(0, comma) + tail;
   return path.slice(0, semi) + maskParams(path.slice(semi, end), depth) + tail;
@@ -1617,44 +1755,241 @@ function maskPath(path, depth) {
 
 /**
  * A data: url's content, from its comma, masked whole when a link inside
- * it carries credentials or a secret parameter. Read as written and then
+ * it carries credentials or a secret parameter, or when JSON in it names a
+ * secret key (data:application/json,{"token":…}). Read as written and then
  * decoded, since the link in data:text/html,%3Ca%20href%3D%22…%3Ftoken%3D…
  * is all escapes; put back encoded, a marker in it would print as
  * %3Credacted%3E. Decoded loosely, so one stray '%' does not hide the rest,
  * and again for each layer of encoding, as many as a value is followed
  * (MAX_NESTING), since content encoded twice shows its link only on the
  * second. Content still encoded past that, and still able to hold a link,
- * is masked whole, as a parameter nested past MAX_NESTING is. Only the query
- * and fragment of what it holds are read, never a ';' or a bare '=', which is
- * what an svg's styles and a nested base64 image's padding are made of.
- * Base64 content is left alone: it is no text to read.
+ * is masked whole, as a parameter nested past MAX_NESTING is. Of what it
+ * holds, the query and fragment are read, and in the last layer the names of
+ * an absolute url's path parameters, so a ;jsessionid= counts (pathSecretIn);
+ * never a ';' or a bare '=' elsewhere, which is what an svg's styles and a
+ * nested base64 image's padding are made of.
+ * JSON keys count only where JSON puts one (secretKeysIn, strict), since the
+ * script in an html document is full of quoted words before a colon.
+ * Base64 content is never read as anything else: it holds no '?', '#', '@',
+ * '://' or quote, encoded or not, so it is handed back at the first look, and
+ * a url that says ;base64 while holding text is read as text.
  */
-function dataContent(head, content, depth) {
+function dataContent(content, depth) {
   const linkable = /[?#@]|%(?:25)*(?:3F|23|40)/i;
-  if (/;\s*base64\s*$/i.test(head) || !linkable.test(content)) return content;
+  if (!linkable.test(content) && !/["']|:\/\/|%(?:25)*(?:2[27]|3A%(?:25)*2F)/i.test(content)) return content;
   const next = Math.min(depth + 1, MAX_NESTING);
   let text = content;
   for (let layer = 0; ; layer += 1) {
-    if (withoutCredentials(text) !== text) return `,${REDACTED}`;
+    if (withoutCredentials(text) !== text || secretKeyIn(text, true)) return `,${REDACTED}`;
     for (const [part] of text.matchAll(/[?#][^\s"'<>`]*/g)) {
       if (maskParams(part, next) !== part) return `,${REDACTED}`;
     }
-    const decoded = decodeLoosely(text);
-    if (decoded === text) return content;
-    if (layer === MAX_NESTING) return linkable.test(decoded) ? `,${REDACTED}` : content;
+    const decoded = decodingShows(text) ? decodeLoosely(text) : text;
+    if (decoded === text || layer === MAX_NESTING) {
+      return (decoded !== text && linkable.test(decoded)) || pathSecretIn(decoded) ? `,${REDACTED}` : content;
+    }
     text = decoded;
   }
+}
+
+/**
+ * Whether an absolute url in a data: url's content, decoded as far as it
+ * goes, names a secret path parameter (;jsessionid=). The url is read from
+ * its '//' to the first character no url holds as written in markup, raw or
+ * percent encoded (a quote, '<', '>', a space), and only a name made of url
+ * characters counts, so an html entity's ';' and the text after it are none.
+ * Its credentials, query and fragment are read with the rest of the content.
+ * One pass, however many layers and parameters.
+ */
+function pathSecretIn(text) {
+  for (const [url] of text.matchAll(/:\/\/(?:[^\s"'<>`%]|%(?!2[027]|3[CEce]))*/g)) {
+    for (const [, name] of url.matchAll(/;([\w.-]+)=/g)) if (isSecretParam(name)) return true;
+  }
+  return false;
+}
+
+/**
+ * Whether content read as it stands could show more decoded once. Only an
+ * escape of what a link or a pair is cut by can: a '?', '#', '@', '&', ';',
+ * '=', ':' or '/', or a backslash, which escapes a quote. Every other one (a
+ * space, a letter, a brace, a comma) is read as it stands, since keys are
+ * found with their braces, commas, white space and colon raw or encoded, and
+ * a key's own escapes are decoded before it is judged. A key is found only
+ * where both its quotes are written alike, so quotes in two forms (raw and
+ * encoded, or encoded to two depths) are read decoded too, and so is an
+ * escape just before a '//', which decides whether what follows is read as a
+ * userinfo (withoutCredentials).
+ */
+const LAYER_ESCAPE = /%(?:25)*(?:2[36Ff]|3[AaBbDdFf]|40|5[Cc])/i;
+function decodingShows(text) {
+  if (!text.includes('%')) return false;
+  if (LAYER_ESCAPE.test(text)) return true;
+  // What stands before a '//' decides whether a userinfo after it is read.
+  if (text.includes('@') && /%[0-9A-Fa-f]{2}(?:\/\/|\\\/\\\/)/.test(text)) return true;
+  const raw = text.includes('"') || text.includes("'");
+  const once = /%2[27]/i.test(text);
+  const deeper = /%25(?:25)*2[27]/i.test(text);
+  return raw + once + deeper > 1;
+}
+
+// The first bracket of JSON in a url, raw or percent encoded at any depth,
+// and the first quote a key could start with.
+const JSON_BRACKET = /[[{]|%(?:25)*(?:5B|7B)/i;
+const KEY_QUOTE = new RegExp(KEY_QUOTE_FORMS);
+
+/**
+ * A url with any JSON in its query or fragment that still names a secret
+ * key once its pairs are read hidden, from its opening bracket to its close.
+ * A query is read pair by pair, and a raw '&' in a string of the JSON (or
+ * its \u0026, or a ';') ends a pair, so in ?s={"user":"a&b","token":"…"} the
+ * key after it was read as no parameter at all; a '#' in one ends the query.
+ * JSON percent encoded around a raw '&', as Chrome writes such a url
+ * (?s={%22user%22:%22a&b%22,…}), is hidden from its first bracket on, read
+ * decoded as many times as a value is followed (MAX_NESTING). So is JSON with
+ * a key outside any bracket, and a url of more than MAX_JSON_KEYS distinct
+ * keys in all. Keys are judged as secretKeysIn judges them in a url. Every
+ * key is found in one read of the text, and every JSON that holds one in
+ * another, however many there are.
+ */
+function splitJson(url, written) {
+  // Asked of every url printed, and a line of text can hold thousands, so
+  // the common answer costs no pattern: no key can be found with no quote,
+  // raw or encoded, to start it.
+  if (!url.includes('"') && !url.includes("'") && !url.includes('\\u00') && !(url.includes('%') && KEY_QUOTE.test(url))) {
+    return url;
+  }
+  const at = url.search(/[?#]/);
+  if (at === -1) return url;
+  let rest = url.slice(at);
+  const quote = rest.search(KEY_QUOTE);
+  if (quote === -1) return url;
+  // Only a url that carries JSON as written: one whose JSON maskParams hid
+  // with the value holding it can still have a key left in a part with no
+  // name, which is read on.
+  const bracket = rest.search(JSON_BRACKET);
+  if (bracket === -1 && (written === url || !JSON_BRACKET.test(written))) return url;
+  // JSON that is all in one value needs no second look: maskParams gave the
+  // value whole to nestedUrl, which read its keys as written and decoded. A
+  // value is read so only when it holds no url, raw or encoded, whose own
+  // parts would be read pair by pair; and JSON is not all in one value when a
+  // '&', ';', '#' or \u0026 cuts it, or when its part has no '=' before its
+  // first bracket or quote. The part starts at the last separator before
+  // that, '?' too (a hash router's fragment holds a route and a query). A
+  // blob needs more than MAX_JSON_KEYS keys of three characters or more.
+  if (rest.length < 3 * MAX_JSON_KEYS) {
+    const first = bracket === -1 ? quote : Math.min(bracket, quote);
+    const piece = Math.max(
+      rest.lastIndexOf('&', first),
+      rest.lastIndexOf(';', first),
+      rest.lastIndexOf('#', first),
+      rest.lastIndexOf('?', first)
+    );
+    const eq = rest.indexOf('=', piece);
+    if (eq !== -1 && eq < first && !/[?#&;@]|%(?:25)*(?:3F|23|40)|\\u0026/i.test(rest.slice(eq + 1))) return url;
+  }
+  const keys = secretKeysIn(rest, false, true);
+  const spans = keys && (keys.length ? jsonSpans(rest, keys) : []);
+  if (spans && spans.length) {
+    let hidden = '';
+    let kept = 0;
+    for (const [from, to] of spans) {
+      hidden += rest.slice(kept, from) + REDACTED;
+      kept = to;
+    }
+    rest = hidden + rest.slice(kept);
+  }
+  // Read decoded too, only when there is an escape to decode.
+  const decoded = spans && rest.includes('%') ? decodeLoosely(rest) : rest;
+  if (!spans || (decoded !== rest && secretKeyDecoded(decoded, 1))) {
+    let cut = rest.search(JSON_BRACKET);
+    if (cut === -1 || secretKeyDecoded(rest.slice(0, cut), 0)) cut = 1;
+    rest = rest.slice(0, cut) + REDACTED;
+  }
+  return rest === url.slice(at) ? url : url.slice(0, at) + rest;
+}
+
+/**
+ * The outermost JSON around each of the given positions (in order), as
+ * [start, end] pairs in order, or null when one lies in no JSON at all.
+ * Strings are read as JSON writes them, in either quote or as \u0022, so
+ * that a bracket in one counts for nothing. A backslash escapes what follows
+ * it outside a string too, where JSON written into a string of other JSON has
+ * its quotes escaped ({\"token\":…}). A JSON that never closes runs to the
+ * end of the text. One read of the text, however many positions.
+ */
+function jsonSpans(text, keys) {
+  const spans = [];
+  let next = 0;
+  let start = -1;
+  let depth = 0;
+  let quoted = '';
+  let holds = false;
+  for (let i = 0; i < text.length && (holds || next < keys.length); i += 1) {
+    // A position an escape stepped over is met at the next character.
+    if (next < keys.length && keys[next] <= i) {
+      if (depth === 0) return null;
+      holds = true;
+      while (next < keys.length && keys[next] <= i) next += 1;
+    }
+    const c = text[i];
+    // A quote written \u0022 or percent encoded (%22, %2527) is a quote too.
+    let quote = c === '"' || c === "'" ? c : '';
+    if (c === '\\' && (text.startsWith('u0022', i + 1) || text.startsWith('u0027', i + 1))) {
+      quote = text.slice(i, i + 6);
+    } else if (c === '%') {
+      let at = i + 1;
+      while (text.startsWith('25', at)) at += 2;
+      if (text[at] === '2' && (text[at + 1] === '2' || text[at + 1] === '7')) quote = text.slice(i, at + 2);
+    }
+    if (quote) {
+      if (!quoted) quoted = quote;
+      else if (quoted === quote) quoted = '';
+      i += quote.length - 1;
+    } else if (c === '\\') {
+      i += 1;
+    } else if (quoted) {
+      // inside a string a bracket counts for nothing
+    } else if (c === '{' || c === '[') {
+      if (depth === 0) start = i;
+      depth += 1;
+    } else if ((c === '}' || c === ']') && depth > 0) {
+      depth -= 1;
+      if (depth === 0 && holds) {
+        spans.push([start, i + 1]);
+        holds = false;
+      }
+    }
+  }
+  if (holds) spans.push([start, text.length]);
+  return spans;
 }
 
 function screenUrl(url, depth) {
   const credentials = credentialsAt(url);
   const bare = withoutCredentials(credentials ? credentials[1] + url.slice(credentials[0].length) : url);
+  // A data: url's content is read whole first. It can hold a '?' with the
+  // rest of a link still encoded after it
+  // (data:text/html,%3Ca href%3D%22https://x/?token%3D…), or JSON with one
+  // in a string, and cut there it was read in two halves, neither secret.
+  // This and splitJson are done once, for the url as a whole: a megabyte
+  // of values can hold a hundred thousand urls, and splitJson reads the
+  // JSON of every one of them at once. Content read whole and found clean is
+  // not read again before its '?': only the pairs from there on are.
+  // Read as it came: content whose link carries credentials is hidden whole,
+  // not printed with them taken out.
+  const data = depth === 0 && /^\s*data:/i.test(url);
+  if (data) {
+    const read = maskPath(url, depth);
+    if (read !== url) return read;
+  }
   const cut = bare.search(/[?#]/);
-  if (cut === -1) return maskPath(bare, depth);
+  if (cut === -1) return data ? bare : maskPath(bare, depth);
   const hashAt = bare.indexOf('#', cut);
   const search = hashAt === -1 ? bare.slice(cut) : bare.slice(cut, hashAt);
   const hash = hashAt === -1 ? '' : bare.slice(hashAt);
-  return maskPath(bare.slice(0, cut), depth) + maskParams(search, depth) + maskParams(hash, depth);
+  const path = data ? bare.slice(0, cut) : maskPath(bare.slice(0, cut), depth);
+  const screened = path + maskParams(search, depth) + maskParams(hash, depth);
+  return depth ? screened : splitJson(screened, url);
 }
 // SECRET URLS END
 
@@ -1671,8 +2006,12 @@ const URL_CHAR = '[^\\s"\'<>`\\u00ab\\u00bb\\u2018\\u2019\\u201c\\u201d\\u3001\\
 // no input can make the scan go back over text it has already passed.
 const URL_RUN = new RegExp(`${URL_CHAR}+`, 'g');
 
-// An absolute url of any scheme (https://, wss://, postgres://).
-const SCHEME = /\b[a-z][a-z0-9+.-]{0,31}:\/\//i;
+// An absolute url of any scheme (https://, wss://, postgres://). Found by
+// its '://' and its scheme read back from there (group 1), so that each
+// character is looked at once: looked for from the scheme, every letter
+// after a dot started one, and a megabyte of dotted names (t.o.k.e.n.…)
+// cost 32 looks a character, as many as a scheme can hold.
+const SCHEME = /:\/\/(?<=\b([a-z][a-z0-9+.-]{0,31}):\/\/)/i;
 
 // A data: url, which has no '//': a media type, or straight to its
 // parameters or its comma (data:text/html,…, data:;base64,…).
@@ -1686,9 +2025,10 @@ const DATA = /\bdata:(?=[a-z]+\/|[;,])/i;
 // started one, and left '%3' printed before the mask. Only an escape's own
 // digits are passed over: after a '%' that starts no escape (100%https%3A…,
 // x%5https%3A…) a scheme starts as after any other character, since one kept
-// from starting there printed whole.
+// from starting there printed whole. Found by its encoded '://' and read back
+// from there, as SCHEME is, with the scheme in group 1.
 const ENCODED_SCHEME =
-  /(?:(?<=%[0-9a-f]{2})|(?<![a-z]))(?!(?<=%[0-9a-f])[0-9a-f])(?!(?<=%)[0-9a-f]{2})[a-z][a-z0-9+.-]{0,31}%(?:25)*3A%(?:25)*2F%(?:25)*2F/i;
+  /%(?:25)*3A%(?:25)*2F%(?:25)*2F(?<=(?:(?<=%[0-9a-f]{2})|(?<![a-z]))(?!(?<=%[0-9a-f])[0-9a-f])(?!(?<=%)[0-9a-f]{2})([a-z][a-z0-9+.-]{0,31})%(?:25)*3A%(?:25)*2F%(?:25)*2F)/i;
 
 /**
  * Where the url in a run starts, or -1 for none: an absolute url or a data:
@@ -1708,7 +2048,7 @@ const ENCODED_SCHEME =
 function urlStart(run, before) {
   const scheme = SCHEME.exec(run);
   const data = DATA.exec(run);
-  let start = scheme ? scheme.index : -1;
+  let start = scheme ? scheme.index - scheme[1].length : -1;
   if (data && (start === -1 || data.index < start)) start = data.index;
   // The first query or fragment mark with something after it, and the last
   // such mark or ';', which a path must come before.
@@ -1774,69 +2114,210 @@ function inFrame(text, at) {
   return [lineOf(previous, true), lineOf(next, false)].some((line) => line.length < 300 && FRAME_LINE.test(line));
 }
 
+// One character a url may hold, as URL_CHAR, and a run of them that starts
+// where the scan is told to look.
+const URL_CHAR_ONE = new RegExp(URL_CHAR);
+const URL_RUN_AT = new RegExp(`${URL_CHAR}+`, 'y');
+
+/**
+ * Where a run ends once every apostrophe in it is taken in: one between two
+ * letters or digits belongs to the text, not around it (?q=don't, or JSON in
+ * single quotes that encodeURIComponent left as it was,
+ * ?s=%7B'token'%3A'…'%7D, whose first apostrophe ended the run before its
+ * key). A quote around a url has a space, a bracket or punctuation on its
+ * outer side ('https://…', fetch('…').then).
+ */
+function runEnd(text, end) {
+  while (text[end] === "'" && /[A-Za-z0-9]/.test(text[end - 1]) && /[A-Za-z0-9%]/.test(text[end + 1] ?? '')) {
+    URL_RUN_AT.lastIndex = end + 1;
+    URL_RUN_AT.exec(text);
+    end = URL_RUN_AT.lastIndex;
+  }
+  return end;
+}
+
+/**
+ * Where a url ends that a quote cut short, when the quote belongs to JSON
+ * the url carries (GET /cb?s={"user":"a b","token":"…"}): past the bracket
+ * that closes it, and the url characters after that. Read from the url's
+ * start, so that its own brackets are counted. Strings are read whole, in
+ * either quote and past their escapes, so a bracket, a space or a '&' in one
+ * counts for nothing. Outside one, a backslash before a quote escapes it, as
+ * JSON written into a string of other JSON writes its quotes
+ * ({"next":"/cb?s={\"token\":…}"}). Outside any JSON a quote ends the url,
+ * unless a value starts with it and JSON with it (?s="{\"token\":…}"). JSON
+ * that never closes runs to the end of its line, and a line break ends the
+ * url wherever it comes. An apostrophe the run took in, or one between two
+ * letters or digits, is text (see runEnd). One pass, and what it passes over
+ * is not scanned again.
+ *
+ * @param {string} text
+ * @param {number} from  where the url starts
+ * @param {number} end  where its run ends, at the quote
+ */
+function jsonUrlEnd(text, from, end) {
+  let depth = 0;
+  for (let index = from; index < text.length; index += 1) {
+    const c = text[index];
+    if (c === '\n') return index;
+    const apostrophe =
+      c === "'" && (index < end || (/[A-Za-z0-9]/.test(text[index - 1]) && /[A-Za-z0-9%]/.test(text[index + 1] ?? '')));
+    if ((c === '"' || c === "'") && !apostrophe) {
+      if (depth === 0 && !(text[index - 1] === '=' && /[[{]/.test(text[index + 1] ?? ''))) return index;
+      for (index += 1; index < text.length && text[index] !== c && text[index] !== '\n'; index += 1) {
+        if (text[index] === '\\' && index + 1 < text.length && text[index + 1] !== '\n') index += 1;
+      }
+      if (text[index] !== c) return index;
+    } else if (depth === 0 && !apostrophe && !URL_CHAR_ONE.test(c)) {
+      return index;
+    } else if (c === '\\') {
+      if (text[index + 1] === '"' || text[index + 1] === "'") index += 1;
+    } else if (c === '{' || c === '[') {
+      depth += 1;
+    } else if ((c === '}' || c === ']') && depth > 0) {
+      depth -= 1;
+    }
+  }
+  return text.length;
+}
+
+/**
+ * A run with no url to start it screened for one that is all escapes: the
+ * link in an svg's data: url, cut off from it by a quote that
+ * encodeURIComponent leaves as it is
+ * (data:image/svg+xml,%3Cimage%20href%3D'https%3A%2F%2F…%3Ftoken%3D…'), or a
+ * redirect logged on its own. Read decoded, and masked whole when it carries
+ * a secret, as a parameter holding one is.
+ */
+function encodedIn(run) {
+  const encoded = ENCODED_SCHEME.exec(run);
+  if (!encoded) return withoutCredentials(run);
+  const at = encoded.index - encoded[1].length;
+  const url = run.slice(at);
+  const screened = nestedUrl(url, 0);
+  // An escape encoded again (next%253Dhttps%253A…, a %3D whose 3 and D read
+  // as plain text) can have its last digit taken for the scheme's first
+  // letter. The mask then starts at that escape's '%', rather than leave
+  // '%253' before it. Read from the letter still, since a url is looked for
+  // at the start of what is screened.
+  const cut =
+    screened !== url && /[0-9a-f]/i.test(run[at])
+      ? /%(?:25)+[0-9a-f]$/i.exec(run.slice(Math.max(0, at - 64), at))
+      : null;
+  const from = cut ? at - cut[0].length : at;
+  return withoutCredentials(run.slice(0, from)) + screened;
+}
+
 /**
  * Every url in a line of page text or a stack frame, through safeUrl. What
  * the scan took in that belongs to the text is kept out of the url first:
  * closing punctuation, a bracket the url did not open, and a frame's
  * :line:col, which would otherwise vanish into a masked value. Credentials
  * go from the whole run, wherever a url in it starts, since a url glued to
- * a word (foo_https://u:p@…) or run into another holds them too.
+ * a word (foo_https://u:p@…) or run into another holds them too. A url whose
+ * run a quote ends while JSON in it is open is read on to the JSON's end
+ * (see jsonUrlEnd), and the runs it takes in are not read again.
  */
 function safeText(text) {
-  const whole = String(text);
-  return whole.replace(URL_RUN, (run, offset) => {
-    const start = urlStart(run, offset ? whole[offset - 1] : '');
+  return screenText(String(text), '', true);
+}
+
+// What a run of url characters must hold for screening to change it: a
+// query, fragment or path parameter mark, an '@', a scheme, a data: url or an
+// encoded scheme. A run with none of them has no url start (urlStart) and
+// nothing encodedIn reads.
+const SCREENABLE = /[?#;@]|:\/\/|data:|%(?:25)*3A/i;
+
+// What text a run was read on into must hold for the joined reading to miss
+// a mask: what would make a url of its own (SCREENABLE), a '=' that turns the
+// url's last ';' into the start of a pair, or an encoded '?', '#' or '@' that
+// makes the url's last value, decoded, read as a url rather than as JSON.
+const JOIN_CHANGES = /[?#;@=]|:\/\/|data:|%(?:25)*(?:3A|3F|23|40)/i;
+
+/**
+ * safeText's scan, with `before` the character before the text. With `join`
+ * a run is read on past an apostrophe (runEnd) and past the quotes of JSON
+ * its url carries (jsonUrlEnd). What it takes in is then read as the tail of
+ * the first url, by the rules for a url's last value or a data: url's
+ * content, which can miss what the runs read as urls of their own would
+ * have masked: a second url's ;jsessionid=, or a '=' in the tail that turns
+ * the url's last ';' into the start of a pair. So a joined run is also
+ * scanned without joining, and when that masks anything, the joined run's
+ * screened form is scanned once more without joining, so that neither
+ * reading's mask is lost.
+ */
+function screenText(whole, before, join) {
+  let out = '';
+  let kept = 0;
+  for (const match of whole.matchAll(URL_RUN)) {
+    const offset = match.index;
+    if (offset < kept) continue;
+    let run = match[0];
+    const lead = offset ? whole[offset - 1] : before;
+    if (join && whole[offset + run.length] === "'") run = whole.slice(offset, runEnd(whole, offset + run.length));
+    if (!SCREENABLE.test(run)) {
+      out += whole.slice(kept, offset + run.length);
+      kept = offset + run.length;
+      continue;
+    }
+    const start = urlStart(run, lead);
+    let screened;
     if (start === -1) {
-      // A url that is all escapes: the link in an svg's data: url, cut off
-      // from it by a quote that encodeURIComponent leaves as it is
-      // (data:image/svg+xml,%3Cimage%20href%3D'https%3A%2F%2F…%3Ftoken%3D…'),
-      // or a redirect logged on its own. Read decoded, and masked whole when
-      // it carries a secret, as a parameter holding one is.
-      const encoded = ENCODED_SCHEME.exec(run);
-      if (!encoded) return withoutCredentials(run);
-      const at = encoded.index;
-      const url = run.slice(at);
-      const screened = nestedUrl(url, 0);
-      // An escape encoded again (next%253Dhttps%253A…, a %3D whose 3 and D
-      // read as plain text) can have its last digit taken for the scheme's
-      // first letter. The mask then starts at that escape's '%', rather than
-      // leave '%253' before it. Read from the letter still, since a url is
-      // looked for at the start of what is screened.
-      const cut =
-        screened !== url && /[0-9a-f]/i.test(run[at])
-          ? /%(?:25)+[0-9a-f]$/i.exec(run.slice(Math.max(0, at - 64), at))
-          : null;
-      const from = cut ? at - cut[0].length : at;
-      return withoutCredentials(run.slice(0, from)) + screened;
+      screened = encodedIn(run);
+    } else {
+      let found = run.slice(start);
+      const quote = whole[offset + run.length];
+      // A value can start with its quote, escaped too where the url is itself
+      // in a string of JSON ({"next":"/x#n=\"{\\\"token\\\":…}\""}).
+      const valueQuoted = found.endsWith('=') || found.endsWith('=\\');
+      const json = /[[{]/.test(found) || (valueQuoted && /[[{]/.test(whole[offset + run.length + 1] ?? ''));
+      if (join && (quote === '"' || quote === "'") && json) {
+        run = whole.slice(offset, jsonUrlEnd(whole, offset + start, offset + run.length));
+        found = run.slice(start);
+      }
+      screened = screenFound(whole, offset, run, start, found);
     }
-    const found = run.slice(start);
-    // Counted once and kept up to date as the end moves back, so a long run
-    // of closing brackets costs one pass rather than one per bracket.
-    const tally = { '(': 0, ')': 0, '[': 0, ']': 0 };
-    for (const char of found) if (char in tally) tally[char] += 1;
-    let end = found.length;
-    for (;;) {
-      const last = found[end - 1];
-      const open = { ')': '(', ']': '[' }[last];
-      if ('.,;:!?'.includes(last)) end -= 1;
-      else if (open && tally[open] < tally[last]) {
-        tally[last] -= 1;
-        end -= 1;
-      } else break;
+    if (run.length > match[0].length && JOIN_CHANGES.test(run.slice(match[0].length))) {
+      if (screenText(run, lead, false) !== run) screened = screenText(screened, lead, false);
     }
-    let url = found.slice(0, end);
-    // In a stack frame, the url is followed by its position: "at f (url:3:9)",
-    // "at url:3:9", "f@url:3:9". Every current engine writes both the line and
-    // the column, so a single number, or any number outside a frame, is taken
-    // to be part of the last value (auth=admin:1234, alice@url?auth=admin:1234,
-    // and alice@url?auth=admin:12:34 on a line of its own; see inFrame).
-    const position = /:\d+:\d+$/.exec(url);
-    if (position && /[?#;]/.test(url.slice(0, position.index)) && inFrame(whole, offset + start)) {
-      end = position.index;
-      url = found.slice(0, end);
-    }
-    return withoutCredentials(run.slice(0, start) + safeUrl(url) + found.slice(end));
-  });
+    out += whole.slice(kept, offset) + screened;
+    kept = offset + run.length;
+  }
+  return out + whole.slice(kept);
+}
+
+/**
+ * A run with its url, found from `start`, through safeUrl. What the scan
+ * took in that belongs to the text is kept out of the url first: closing
+ * punctuation, a bracket the url did not open, a frame's :line:col.
+ */
+function screenFound(whole, offset, run, start, found) {
+  // Counted once and kept up to date as the end moves back, so a long run
+  // of closing brackets costs one pass rather than one per bracket.
+  const tally = { '(': 0, ')': 0, '[': 0, ']': 0 };
+  for (const char of found) if (char in tally) tally[char] += 1;
+  let end = found.length;
+  for (;;) {
+    const last = found[end - 1];
+    const open = { ')': '(', ']': '[' }[last];
+    if ('.,;:!?'.includes(last)) end -= 1;
+    else if (open && tally[open] < tally[last]) {
+      tally[last] -= 1;
+      end -= 1;
+    } else break;
+  }
+  let url = found.slice(0, end);
+  // In a stack frame, the url is followed by its position: "at f (url:3:9)",
+  // "at url:3:9", "f@url:3:9". Every current engine writes both the line and
+  // the column, so a single number, or any number outside a frame, is taken
+  // to be part of the last value (auth=admin:1234, alice@url?auth=admin:1234,
+  // and alice@url?auth=admin:12:34 on a line of its own; see inFrame).
+  const position = /:\d+:\d+$/.exec(url);
+  if (position && /[?#;]/.test(url.slice(0, position.index)) && inFrame(whole, offset + start)) {
+    end = position.index;
+    url = found.slice(0, end);
+  }
+  return withoutCredentials(run.slice(0, start) + safeUrl(url) + found.slice(end));
 }
 
 function originOf(url) {
@@ -2374,6 +2855,15 @@ function normalized(report) {
   };
 }
 
+/** A url's printed form, worked out once per url and then looked up. */
+function rememberedFor(show) {
+  const shown = new Map();
+  return (url) => {
+    if (!shown.has(url)) shown.set(url, show(url));
+    return shown.get(url);
+  };
+}
+
 /**
  * @param {Report} input
  * @returns {string} Markdown ready for the clipboard.
@@ -2389,8 +2879,9 @@ export function buildPrompt(input) {
   const mixed = counts.bug > 0 && counts.change > 0;
   const voice = mixed ? MIXED : voiceOf(items[0]);
   // Decided once for the whole report, so that a url cannot print as a path in
-  // the opening line and in full three sections later.
-  const showUrl = oneOrigin(items, report.page) ? pathOf : safeUrl;
+  // the opening line and in full three sections later. Each url is screened
+  // once however often it prints: the page's own url can hold a megabyte.
+  const showUrl = rememberedFor(oneOrigin(items, report.page) ? pathOf : safeUrl);
   const where = describeScope(items, report.page, showUrl);
   const split = splitLog(items, report);
   const numbers = itemNumbers(items);
@@ -2410,10 +2901,13 @@ export function buildPrompt(input) {
     frames: printsFrames(report),
     sites: items.some((item) => siteFromStack(item.element?.component)),
   });
-  // With the page toggle off no Captured line gives the zone and day of the
-  // log's clock times, so this sentence does, before the first of them: above
-  // the items when the log is split under them, else with the page's notes.
-  const clock = report.page ? '' : clockNotice(report, clockFor(report));
+  // The zone and day of the log's clock times, before the first of them. The
+  // page's Captured line gives both, but in a list whose log is split under
+  // the items it comes after them, and with the page toggle off there is no
+  // such line. So this sentence goes above the items when the log is split
+  // under them, page or no page, and otherwise, with the page off, with the
+  // page's notes.
+  const clock = clockNotice(report, clockFor(report));
   const clockFirst = Boolean(clock && split && [...split.buckets.values()].some((bucket) => bucket.length));
 
   sections.push(mixed ? MIXED.lead(counts, where) : voice.lead(items.length, where));

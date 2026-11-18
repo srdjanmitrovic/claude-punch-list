@@ -10,7 +10,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
   cpSync,
@@ -21,6 +21,7 @@ import {
   readFileSync,
   rmSync,
   statSync,
+  utimesSync,
   writeFileSync,
 } from 'node:fs';
 import { devNull, tmpdir } from 'node:os';
@@ -84,13 +85,26 @@ function copyTools(dir, files = TOOLS) {
   }
 }
 
-function runBuild(dir) {
+// A build of the real tree takes under a fifth of a second here, and a CI
+// runner is three to four times slower, so a build that takes a minute is
+// stuck. Its stdin is not connected: data handed to a child on stdin through
+// spawnSync now and then never arrived on macOS. W6-F4: the build's own limit
+// for each child it starts is a quarter of this, so a stuck child is stopped
+// by the build, which then removes its temporary folder, before this limit
+// kills the build and leaves both.
+const BUILD_LIMIT_MS = 60_000;
+
+function runBuild(dir, { env = {}, timeout = BUILD_LIMIT_MS } = {}) {
   const result = spawnSync(process.execPath, [join(dir, 'tools', 'build.mjs')], {
     cwd: dir,
-    env: cleanEnv(),
+    env: cleanEnv({ BUILD_CHECK_TIMEOUT_MS: String(BUILD_LIMIT_MS / 4), ...env }),
     encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    timeout,
+    killSignal: 'SIGKILL',
   });
-  const out = { status: result.status, output: `${result.stdout}\n${result.stderr}` };
+  const stopped = result.error?.code === 'ETIMEDOUT' ? `\nthe build did not finish within ${timeout / 1000} s, so it was stopped` : '';
+  const out = { status: result.status, output: `${result.stdout}\n${result.stderr}${stopped}` };
   if (result.status === 0) {
     const name = readdirSync(join(dir, 'dist')).find((file) => file.endsWith('.zip'));
     out.zip = readFileSync(join(dir, 'dist', name));
@@ -188,7 +202,7 @@ test('build: the zip carries LICENSE with the MIT notice', (t) => {
 
 // TR5. Node links whichever zlib it was built with, its own or the system's,
 // and the two compress the same input to different bytes. The archive's
-// bytes are pinned here for a fixed input, so CI on Node 20 and 24 proves the
+// bytes are pinned here for a fixed input, so CI on Node 22 and 24 proves the
 // checksum no longer moves with the Node that ran the build. A change to the
 // zip writer or the compressor changes this hash, and that is the point: it
 // changes every release checksum too.
@@ -283,6 +297,173 @@ test('build: two builds of one tree are byte identical', (t) => {
   const second = runBuild(dir);
   assert.equal(first.status, 0, first.output);
   assert.ok(first.zip.equals(second.zip));
+});
+
+// A module preloaded into the build and every Node it starts, through
+// NODE_OPTIONS, which a child inherits.
+function preload(dir, name, lines) {
+  const path = join(dir, name);
+  writeFileSync(path, `${lines.join('\n')}\n`);
+  return `--import=${pathToFileURL(path).href}`;
+}
+
+// V6-1. The build handed the import check every file, and Node's syntax check
+// each module, on stdin through spawnSync's `input`. Now and then on macOS
+// the child waited on that pipe for good, and the build with it: a few
+// children in a thousand with six builds at once, which failed this file's
+// tests at random. Each child now reads a file, and its stdin is not
+// connected. Seen from inside each child the build starts, for a build that
+// passes and for one whose module Node is asked about.
+test('build: no child of the build is handed its input through a pipe', (t) => {
+  const dir = writeFixture(scratch(t));
+  const log = join(dir, 'stdin.log');
+  const env = {
+    STDIN_LOG: log,
+    NODE_OPTIONS: preload(dir, 'stdin-probe.mjs', [
+      "import { appendFileSync, fstatSync } from 'node:fs';",
+      'const stdin = fstatSync(0);',
+      'const args = [...process.execArgv, ...process.argv.slice(2)];',
+      'const record = { pid: process.pid, ppid: process.ppid, args, pipe: stdin.isFIFO() || stdin.isSocket() };',
+      'appendFileSync(process.env.STDIN_LOG, `${JSON.stringify(record)}\\n`);',
+    ]),
+  };
+  const children = () => {
+    const records = readFileSync(log, 'utf8').trim().split('\n').map((text) => JSON.parse(text));
+    rmSync(log);
+    const build = records.find((record) => record.ppid === process.pid);
+    assert.ok(build, 'the build did not run with the probe');
+    return records.filter((record) => record.ppid === build.pid);
+  };
+
+  const clean = runBuild(dir, { env });
+  assert.equal(clean.status, 0, clean.output);
+  const started = children();
+  assert.ok(started.some((child) => child.args.includes('--link')), JSON.stringify(started));
+  for (const child of started) assert.equal(child.pipe, false, `stdin is a pipe in ${child.args.join(' ')}`);
+
+  const lib = join(dir, 'shared', 'lib.js');
+  writeFileSync(lib, `${readFileSync(lib, 'utf8')}\nexport const = ;\n`);
+  const broken = runBuild(dir, { env });
+  assert.equal(broken.status, 1, broken.output);
+  assert.match(broken.output, /shared\/lib\.js:\d+ does not parse: SyntaxError/);
+  const asked = children();
+  assert.ok(asked.some((child) => child.args.includes('--check')), JSON.stringify(asked));
+  for (const child of asked) assert.equal(child.pipe, false, `stdin is a pipe in ${child.args.join(' ')}`);
+});
+
+// V6-1 and V6-6. A child that never answers is stopped, Node's syntax check
+// of a module (which had no limit at all) as well as the import check, and
+// the build says which in words. It said "spawnSync <path to node>
+// ETIMEDOUT". Each child may take ten times what a whole build takes on this
+// machine, and at least two seconds.
+test('build: a check that never answers is stopped, and the build says which', (t) => {
+  const dir = writeFixture(scratch(t));
+  const started = performance.now();
+  const plain = runBuild(dir);
+  assert.equal(plain.status, 0, plain.output);
+  const limit = Math.max(2000, Math.ceil((10 * (performance.now() - started)) / 100) * 100);
+  const seconds = String(limit / 1000).replace('.', '\\.');
+  const pidFile = join(dir, 'hung.pid');
+  const hang = preload(dir, 'hang.mjs', [
+    "import { writeFileSync } from 'node:fs';",
+    'if ([...process.execArgv, ...process.argv].includes(process.env.HANG_ON)) {',
+    '  writeFileSync(process.env.HANG_PID, String(process.pid));',
+    '  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);',
+    '}',
+  ]);
+  const alive = (pid) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  // A child the build leaves running (one with no limit is, once this test
+  // stops the build) is stopped here.
+  const leftRunning = [];
+  t.after(() => {
+    for (const pid of leftRunning) if (alive(pid)) process.kill(pid, 'SIGKILL');
+  });
+  const hangOn = (flag) => {
+    rmSync(pidFile, { force: true });
+    const env = { NODE_OPTIONS: hang, HANG_ON: flag, HANG_PID: pidFile, BUILD_CHECK_TIMEOUT_MS: String(limit) };
+    const result = runBuild(dir, { env, timeout: 20 * limit });
+    assert.ok(existsSync(pidFile), `no child was started with ${flag}\n${result.output}`);
+    const pid = Number(readFileSync(pidFile, 'utf8'));
+    if (alive(pid)) leftRunning.push(pid);
+    return { ...result, pid };
+  };
+
+  const link = hangOn('--link');
+  assert.equal(link.status, 1, link.output);
+  assert.match(link.output, new RegExp(`the import check did not finish within ${seconds} s, so it was stopped`));
+  assert.doesNotMatch(link.output, /ETIMEDOUT|does not parse/);
+  assert.ok(!alive(link.pid), 'the import check was left running');
+
+  const lib = join(dir, 'shared', 'lib.js');
+  writeFileSync(lib, `${readFileSync(lib, 'utf8')}\nexport const = ;\n`);
+  const syntax = hangOn('--check');
+  assert.equal(syntax.status, 1, syntax.output);
+  assert.match(syntax.output, new RegExp(`the syntax check of shared/lib\\.js did not finish within ${seconds} s, so it was stopped`));
+  assert.ok(!alive(syntax.pid), 'the syntax check was left running');
+});
+
+// W6-F4. A build stopped by a signal (Ctrl+C, a kill) never reaches the
+// finally that removes its temporary folder, which holds a copy of every
+// script. Each build now removes the folders such builds left once they are
+// an hour old, and leaves younger ones, which may be a running build's, and
+// any folder it did not name.
+test('build: a build removes the temporary folders of builds stopped an hour ago', (t) => {
+  const dir = writeFixture(scratch(t));
+  const temp = scratch(t);
+  const left = ['punch-list-build-Old123', 'punch-list-build-New456', 'punch-list-build-notours'];
+  for (const name of left) {
+    mkdirSync(join(temp, name));
+    writeFileSync(join(temp, name, 'input.json'), '{}');
+  }
+  const twoHoursAgo = new Date(Date.now() - 2 * 3_600_000);
+  for (const name of [left[0], left[2]]) utimesSync(join(temp, name), twoHoursAgo, twoHoursAgo);
+  const result = runBuild(dir, { env: { TMPDIR: temp, TMP: temp, TEMP: temp } });
+  assert.equal(result.status, 0, result.output);
+  assert.deepEqual(readdirSync(temp).sort(), [left[1], left[2]].sort());
+});
+
+// W6-F5. A temporary folder the build could not make (TMPDIR names no
+// folder) or write (a full disk) crashed it with an uncaught stack. It now
+// says which check could not run, and removes what it made.
+test('build: a temp directory the build cannot use fails it in words', (t) => {
+  const dir = writeFixture(scratch(t));
+  const missing = join(dir, 'no-such-folder');
+  const lost = runBuild(dir, { env: { TMPDIR: missing, TMP: missing, TEMP: missing } });
+  assert.equal(lost.status, 1, lost.output);
+  assert.match(lost.output, /the import check could not run: ENOENT/);
+  assert.match(lost.output, /the syntax check of shared\/lib\.js could not run: ENOENT/);
+  assert.doesNotMatch(lost.output, /^\s+at /m);
+
+  const full = preload(dir, 'full.mjs', [
+    "import fs from 'node:fs';",
+    "import { syncBuiltinESMExports } from 'node:module';",
+    'const write = fs.writeFileSync;',
+    'fs.writeFileSync = function (path, ...rest) {',
+    "  if (String(path).endsWith(process.env.FULL_ON)) throw Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' });",
+    '  return write.call(this, path, ...rest);',
+    '};',
+    'syncBuiltinESMExports();',
+  ]);
+  const lib = join(dir, 'shared', 'lib.js');
+  writeFileSync(lib, `${readFileSync(lib, 'utf8')}\nexport const = ;\n`);
+  for (const [file, expected] of [
+    ['input.json', /the import check could not run: ENOSPC/],
+    ['module.mjs', /the syntax check of shared\/lib\.js could not run: ENOSPC/],
+  ]) {
+    const temp = scratch(t);
+    const result = runBuild(dir, { env: { NODE_OPTIONS: full, FULL_ON: file, TMPDIR: temp, TMP: temp, TEMP: temp } });
+    assert.equal(result.status, 1, result.output);
+    assert.match(result.output, expected);
+    assert.doesNotMatch(result.output, /^\s+at /m);
+    assert.deepEqual(readdirSync(temp), [], `the build left its folder, writing ${file}`);
+  }
 });
 
 // The compressor is written for this repository, so it is held to zlib's
@@ -499,6 +680,155 @@ test('build: an import() whose path the build cannot check fails the build', (t)
   assert.match(classic.output, /content\/overlay\.js:2 calls import\(\), and the build does not follow content\/overlay\.js as a module/);
 });
 
+// F54. The import() check read the text alone. A method named import whose
+// parameters held a '(' or a line break, a method call with a comment between
+// its '.' and import, import( in a string, a comment, a template or a regular
+// expression, and an import() with a comment before or after its path each
+// failed the build, and an import() spread into an object (...import(path))
+// was taken for a method and built clean however broken it was. V8 now says
+// which of them are imports.
+//
+// V6-2, V6-3 and V6-4, found checking that. A line comment ended only at \n,
+// while JavaScript also ends one at \r, U+2028 and U+2029: a computed path
+// read as the literal before such a comment, and built clean while Chrome
+// loaded another file, and an import split from its '(' by one was not found
+// at all, nor one split by a classic script's HTML-like comment. A private
+// method named #import that its class called failed the build.
+const LINE_ENDS = { LS: '\u2028', PS: '\u2029', CR: '\r' };
+test('build: only what V8 parses as an import() is checked as one', (t) => {
+  const dir = writeFixture(scratch(t));
+  const panel = join(dir, 'sidepanel', 'panel.js');
+  const original = readFileSync(panel, 'utf8');
+  const line = "import { value } from '../shared/lib.js';";
+  const clean = [
+    'const loader = { import(name = String(1)) { return name; } };',
+    'const other = {\n  import(\n    name,\n  ) {\n    return name;\n  },\n};',
+    "const later = (it) => it./* lazily */import('./nowhere.js');",
+    `const help = "call import('./nowhere.js') to load it later";`,
+    "// import('./nowhere.js') would load it later",
+    '/* import(path) */',
+    "const shown = `import('./nowhere.js')`;",
+    String.raw`const pattern = /import\('\.\/nowhere\.js'\)/;`,
+    "const lazy = () => import(/* lazily */ '../shared/lib.js' /* once */);",
+    "const lazier = () => import(\n  // later\n  '../shared/lib.js',\n);",
+    "class Loader { #import(name) { return name; } load() { return this.#import('./nowhere.js'); } }",
+    ...Object.entries(LINE_ENDS).map(([name, end]) => `const after${name} = () => import(// later${end}'../shared/lib.js');`),
+  ];
+  writeFileSync(panel, original.replace(line, [line, ...clean].join('\n')));
+  const overlay = join(dir, 'content', 'overlay.js');
+  const script = readFileSync(overlay, 'utf8');
+  writeFileSync(overlay, script.replace('(() => {', `(() => {\n  const help = 'import("../shared/lib.js")';\n  // import(later)`));
+  const built = runBuild(dir);
+  assert.equal(built.status, 0, built.output);
+  writeFileSync(overlay, script);
+
+  const nowhere = /sidepanel\/panel\.js imports "\.\/nowhere\.js", which is not in the build/;
+  const computed = /sidepanel\/panel\.js:2 calls import\(\) with a path that is not written out/;
+  for (const [added, expected] of [
+    ["const later = () => ({ ...import('./nowhere.js') });", nowhere],
+    ["const later = () => import(/* lazily */ './nowhere.js');", nowhere],
+    [`const later = (path) => [import(path), "import('./nowhere.js')"];`, computed],
+    ...Object.values(LINE_ENDS).flatMap((end) => [
+      // Chrome loads lib.js.map, and ./nowhere.js.
+      [`const later = () => import('../shared/lib.js' // map${end}+ '.map'\n);`, computed],
+      [`const later = () => import(// first${end}'./nowhere.js' ||\n'../shared/lib.js');`, computed],
+      [`const later = () => import // later${end}('./nowhere.js');`, nowhere],
+    ]),
+    // W6-F1: a match from an earlier `import` ran on to the next line's '('
+    // or to the next */, through the real import(), which was then never
+    // tried: `obj.import-->0` is `-- > 0`, and the others are strings.
+    ["const probe = (obj) => obj.import-->0 || import('./nowhere.js');\n(() => {})();", nowhere],
+    ["const hint = \"import // see docs\"; const lazy = () => import('./nowhere.js');\n(() => {})();", nowhere],
+    ["const glob = \"import /*\"; const lazy = () => import('./nowhere.js');\n/* later */ (() => {})();", nowhere],
+  ]) {
+    writeFileSync(panel, original.replace(line, `${line}\n${added}`));
+    const result = runBuild(dir);
+    assert.equal(result.status, 1, `built clean with: ${JSON.stringify(added)}\n${result.output}`);
+    assert.match(result.output, expected, JSON.stringify(added));
+    assert.equal(result.output.match(/sidepanel\/panel\.js/g).length, 1, result.output);
+  }
+  writeFileSync(panel, original);
+
+  // A content script is not followed as a module, so each import() in it
+  // fails the build, wherever its comments are.
+  for (const added of [
+    "import <!-- later\n('../shared/lib.js');",
+    "import\n--> later\n('../shared/lib.js');",
+    `import // later${LINE_ENDS.LS}(chrome.runtime.getURL('x.js'));`,
+    `import // later${LINE_ENDS.CR}('../shared/lib.js');`,
+    "void function (obj) { return obj.import-->0 || import(chrome.runtime.getURL('x.js')); };\n(() => {})();",
+  ]) {
+    writeFileSync(overlay, script.replace('(() => {', `(() => {\n  ${added}`));
+    const result = runBuild(dir);
+    assert.equal(result.status, 1, `built clean with: ${JSON.stringify(added)}\n${result.output}`);
+    assert.match(result.output, /content\/overlay\.js:2 calls import\(\), and the build does not follow content\/overlay\.js as a module/);
+  }
+});
+
+// V6-5. Node 24 parses a source phase import (import source x from, and
+// import.source()), which Chrome 156 refuses as a SyntaxError, so a panel that
+// used one built clean on the Node the release is built with and never
+// loaded. Phase imports, the source and the defer phase, now fail the build
+// on any Node: in V8's words where it parses them (a static import's phase),
+// and otherwise by finding import.source and import.defer in the code.
+const parsesSourcePhase = (() => {
+  try {
+    new vm.Script("import.source('./x.wasm');");
+    return true;
+  } catch {
+    return false;
+  }
+})();
+test('build: a phase import fails the build, on a Node that parses it or not', (t) => {
+  const dir = writeFixture(scratch(t));
+  const panel = join(dir, 'sidepanel', 'panel.js');
+  const original = readFileSync(panel, 'utf8');
+  const line = "import { value } from '../shared/lib.js';";
+  // Only mentioned: these build.
+  writeFileSync(panel, original.replace(line, [line, `const help = "import.source('./x.wasm') loads its source";`, '// import.defer(later)', 'const meta = import.meta.url;'].join('\n')));
+  const mentioned = runBuild(dir);
+  assert.equal(mentioned.status, 0, mentioned.output);
+
+  const phase = (word) => new RegExp(`sidepanel/panel\\.js:2 calls import\\.${word}\\(\\), a phase import Chrome does not support`);
+  for (const [added, expected] of [
+    ["const wasm = () => import.source('../shared/lib.js');", phase('source')],
+    ["const wasm = () => import /* now */ . source('../shared/lib.js');", phase('source')],
+    ["const later = () => import.defer('../shared/lib.js');", phase('defer')],
+    [
+      "import source wasm from '../shared/lib.js';",
+      parsesSourcePhase
+        ? /sidepanel\/panel\.js imports "\.\.\/shared\/lib\.js" with import source, a phase import Chrome does not support/
+        : /sidepanel\/panel\.js:2 does not parse/,
+    ],
+  ]) {
+    writeFileSync(panel, original.replace(line, `${line}\n${added}`));
+    const result = runBuild(dir);
+    assert.equal(result.status, 1, `built clean with: ${added}\n${result.output}`);
+    assert.match(result.output, expected, added);
+  }
+  writeFileSync(panel, original);
+
+  // W6-F2: in a module nothing imports, the static form built clean on Node
+  // 24, whose V8 parses it, and failed on Node 22, whose V8 does not.
+  const unused = join(dir, 'shared', 'unused.js');
+  writeFileSync(unused, "import source wasm from './nowhere.wasm';\nexport default wasm;\n");
+  const unfollowed = runBuild(dir);
+  rmSync(unused);
+  assert.equal(unfollowed.status, 1, unfollowed.output);
+  assert.match(
+    unfollowed.output,
+    parsesSourcePhase
+      ? /shared\/unused\.js imports "\.\/nowhere\.wasm" with import source, a phase import Chrome does not support/
+      : /shared\/unused\.js:1 does not parse/
+  );
+
+  const overlay = join(dir, 'content', 'overlay.js');
+  writeFileSync(overlay, readFileSync(overlay, 'utf8').replace('(() => {', "(() => {\n  import.source('../shared/lib.js');"));
+  const classic = runBuild(dir);
+  assert.equal(classic.status, 1, classic.output);
+  assert.match(classic.output, /content\/overlay\.js:2 calls import\.source\(\), a phase import Chrome does not support/);
+});
+
 // TR6. git lists a path in an unresolved merge conflict once for each side,
 // and the build packed every line it was given: three copies of a conflicted
 // icon, one of them a side of the conflict, and not a word about it. A
@@ -635,6 +965,35 @@ test('release: the workflows ask tools/release-check.mjs and build what it names
   }
 });
 
+// Node 20 reached its end of life in April 2026. CI tests the lines still
+// supported, the oldest of them is the one package.json asks for, and the
+// version check and the release build run on the newest.
+test('release: CI tests the Node versions package.json allows, and releases on the newest', () => {
+  const ci = read('.github/workflows/ci.yml');
+  const release = read('.github/workflows/release.yml');
+  const matrix = JSON.parse(/^\s*node: (\[[^\]\n]*\])$/m.exec(ci)?.[1] ?? '[]').map(Number);
+  assert.ok(matrix.length, 'ci.yml has no Node matrix');
+  const floor = Number(/^>=(\d+)$/.exec(JSON.parse(read('package.json')).engines?.node ?? '')?.[1]);
+  assert.equal(floor, Math.min(...matrix), 'package.json allows a Node that CI does not test, or CI tests one it does not allow');
+  assert.ok(floor >= 22, `Node ${floor} is past its end of life`);
+  const pinned = [...`${ci}\n${release}`.matchAll(/node-version: "(\d+)"/g)].map((match) => Number(match[1]));
+  assert.equal(pinned.length, 2, 'the version check and the release build no longer name their Node');
+  for (const version of pinned) assert.equal(version, Math.max(...matrix), `a workflow runs on Node ${version}`);
+});
+
+// A step that hangs fails its job within minutes rather than at GitHub's
+// limit of six hours. The build's own children and the release check's git
+// and gh calls have limits of their own, tested above and below.
+test('release: every workflow job has a time limit', () => {
+  for (const name of ['ci.yml', 'release.yml']) {
+    const text = read(`.github/workflows/${name}`);
+    const jobs = text.match(/^    runs-on: .*$/gm) ?? [];
+    const limits = text.match(/^    timeout-minutes: \d+$/gm) ?? [];
+    assert.ok(jobs.length, `${name} has no job`);
+    assert.equal(limits.length, jobs.length, `a job in ${name} has no timeout-minutes`);
+  }
+});
+
 // The tag's own INCLUDE is read from the tag's tools/build.mjs, which in
 // 0.5.0 did not export it yet.
 test('release: the files a tag shipped are read from the build script it had', async () => {
@@ -675,6 +1034,9 @@ test('release: tools/release-check.mjs reads the version, the tag and the shippe
       cwd: dir,
       env: cleanEnv({ GITHUB_OUTPUT: output, ...env }),
       encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      // A run takes a tenth of a second here; one that takes a minute is stuck.
+      timeout: 60_000,
     });
     const outputs = existsSync(output)
       ? Object.fromEntries(readFileSync(output, 'utf8').trim().split('\n').map((line) => line.split('=')))
@@ -745,6 +1107,182 @@ test('release: tools/release-check.mjs reads the version, the tag and the shippe
   assert.equal(check(['--check']).status, 0);
   assert.equal(check([], { GITHUB_REF: 'refs/heads/main' }).outputs.commit, bumped);
   assert.equal(check([], { GITHUB_REF: 'refs/tags/v0.1.0' }).status, 1);
+});
+
+// F59. Each git and gh call waited as long as it took, so a hung one held the
+// release workflow until GitHub's own job limit. Each is now stopped after a
+// limit (a minute, and two seconds here), and the run fails naming it, the
+// tag lookup as well as the question to GitHub. V6-7: only the call itself
+// was stopped, and what it had started ran on (a gh can start git, and git
+// its helpers), and the failure printed as an uncaught exception with a
+// stack. The stand-ins here wait on a child of their own.
+const shell = (!hasGit && 'no git') || (process.platform === 'win32' && 'the stand-ins are shell scripts');
+test('release: a git or gh call that hangs is stopped and fails the run', { skip: shell }, async (t) => {
+  const dir = scratch(t);
+  mkdirSync(join(dir, 'content'));
+  writeFileSync(join(dir, 'manifest.json'), JSON.stringify({ manifest_version: 3, version: '0.1.0' }));
+  writeFileSync(join(dir, 'package.json'), JSON.stringify({ version: '0.1.0' }));
+  writeFileSync(join(dir, 'content', 'a.js'), 'one();\n');
+  copyTools(dir, [...TOOLS, 'release-check.mjs']);
+  git(dir, 'init', '-q', '-b', 'main');
+  git(dir, 'add', '-A');
+  git(dir, 'commit', '-q', '--no-gpg-sign', '-m', 'first');
+  git(dir, 'tag', 'v0.1.0');
+  const realGit = execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim();
+  const bin = join(dir, '.bin');
+  mkdirSync(bin);
+  const stub = (name, script) => writeFileSync(join(bin, name), `#!/bin/sh\n${script}\n`, { mode: 0o755 });
+  // A stand-in that never answers: it starts a sleep, says its pid, and waits.
+  const pids = join(dir, '.pids');
+  const hang = `sleep 30 &\necho $! >> "${pids}"\nwait`;
+  const alive = (pid) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  // Kept here, since the folder is gone by the time the test ends.
+  const seen = [];
+  const sleeps = () => {
+    const found = existsSync(pids) ? readFileSync(pids, 'utf8').trim().split('\n').map(Number) : [];
+    seen.push(...found);
+    return found;
+  };
+  t.after(() => {
+    for (const pid of seen) if (alive(pid)) process.kill(pid, 'SIGKILL');
+  });
+  // A process killed is gone once whatever adopted it has reaped it.
+  const goneSoon = async (pid) => {
+    for (let tries = 0; tries < 50 && alive(pid); tries += 1) await new Promise((done) => setTimeout(done, 100));
+    return !alive(pid);
+  };
+  const fromMain = () => {
+    rmSync(pids, { force: true });
+    const started = Date.now();
+    const result = spawnSync(process.execPath, [join(dir, 'tools', 'release-check.mjs')], {
+      cwd: dir,
+      env: cleanEnv({
+        // The group kill runs on CI only (the next test says why).
+        CI: 'true',
+        GITHUB_REF: 'refs/heads/main',
+        PATH: `${bin}${delimiter}${process.env.PATH}`,
+        RELEASE_CHECK_TIMEOUT_MS: '2000',
+      }),
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 20_000,
+    });
+    return { status: result.status, text: `${result.stdout}${result.stderr}`, seconds: (Date.now() - started) / 1000 };
+  };
+  const leftNothing = async (run) => {
+    const [sleep, ...more] = sleeps();
+    assert.ok(sleep && !more.length, `the stand-in did not start one sleep\n${run.text}`);
+    assert.ok(await goneSoon(sleep), 'what the hung call started is still running');
+  };
+  // gh never says whether the tag has a release.
+  stub('gh', hang);
+  const gh = fromMain();
+  await leftNothing(gh);
+  assert.equal(gh.status, 1, `ran ${gh.seconds} s\n${gh.text}`);
+  assert.equal(gh.text.trim(), 'gh release view v0.1.0 --json tagName did not finish within 2 s, so it was stopped');
+  // git never says which commit the tag is on.
+  stub('gh', 'echo \'{"tagName":"v0.1.0"}\'');
+  stub('git', `case "$*" in *--verify*)\n${hang}\nexit 1;;\nesac\nexec "${realGit}" "$@"`);
+  const tag = fromMain();
+  await leftNothing(tag);
+  assert.equal(tag.status, 1, `ran ${tag.seconds} s\n${tag.text}`);
+  assert.equal(tag.text.trim(), 'git rev-parse -q --verify refs/tags/v0.1.0^{commit} did not finish within 2 s, so it was stopped');
+});
+
+// W6-F3. A call in a process group of its own is out of the terminal's
+// reach, so Ctrl+C on a local run stopped the script and left a hung call
+// running, with nobody left to enforce its limit. Only CI puts the call in a
+// group of its own now. The run here leads its own group, as a shell's
+// foreground job does, and the group gets SIGINT, as Ctrl+C sends it. A
+// shell profile that sets CI=false or CI=0 is a local run too.
+for (const ci of [undefined, 'false', '0']) {
+test(`release: Ctrl+C on a local run stops the call it waits on (${ci === undefined ? 'CI unset' : `CI=${ci}`})`, { skip: shell }, async (t) => {
+  const dir = scratch(t);
+  writeFileSync(join(dir, 'manifest.json'), JSON.stringify({ manifest_version: 3, version: '0.1.0' }));
+  writeFileSync(join(dir, 'package.json'), JSON.stringify({ version: '0.1.0' }));
+  copyTools(dir, [...TOOLS, 'release-check.mjs']);
+  const bin = join(dir, '.bin');
+  mkdirSync(bin);
+  const pidFile = join(dir, '.pid');
+  writeFileSync(join(bin, 'git'), `#!/bin/sh\necho $$ > "${pidFile}"\nexec sleep 30\n`, { mode: 0o755 });
+  const alive = (pid) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const wait = async (ready, tries) => {
+    for (let k = 0; k < tries && !ready(); k += 1) await new Promise((done) => setTimeout(done, 100));
+    return ready();
+  };
+  const env = cleanEnv({ PATH: `${bin}${delimiter}${process.env.PATH}`, RELEASE_CHECK_TIMEOUT_MS: '20000' });
+  delete env.CI;
+  delete env.GITHUB_ACTIONS;
+  if (ci !== undefined) env.CI = ci;
+  const run = spawn(process.execPath, [join(dir, 'tools', 'release-check.mjs'), '--check'], { cwd: dir, env, stdio: 'ignore', detached: true });
+  const exited = new Promise((done) => run.on('exit', done));
+  let pid = 0;
+  t.after(() => {
+    if (pid && alive(pid)) process.kill(pid, 'SIGKILL');
+    if (alive(run.pid)) process.kill(run.pid, 'SIGKILL');
+  });
+  assert.ok(await wait(() => (pid = existsSync(pidFile) ? Number(readFileSync(pidFile, 'utf8')) : 0) > 0, 200), 'git was never called');
+  process.kill(-run.pid, 'SIGINT');
+  const guard = setTimeout(() => run.kill('SIGKILL'), 10_000);
+  await exited;
+  clearTimeout(guard);
+  assert.ok(await wait(() => !alive(pid), 50), 'the git call is still running after Ctrl+C');
+});
+}
+
+// W6-F6. Only a git or gh call's failure is printed as its message alone. A
+// manifest.json that is not JSON printed only JSON.parse's words, naming
+// neither the file nor the error's type.
+test('release: a version file that is not JSON is named, as a SyntaxError', (t) => {
+  const dir = scratch(t);
+  writeFileSync(join(dir, 'manifest.json'), '{\n  "manifest_version": 3,\n  "version": "0.1.0",\n}\n');
+  writeFileSync(join(dir, 'package.json'), JSON.stringify({ version: '0.1.0' }));
+  copyTools(dir, [...TOOLS, 'release-check.mjs']);
+  const result = spawnSync(process.execPath, [join(dir, 'tools', 'release-check.mjs'), '--check'], {
+    cwd: dir,
+    env: cleanEnv(),
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: 60_000,
+  });
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr, /SyntaxError: manifest\.json is not valid JSON: /);
+});
+
+// F67. A tag lookup that git could not answer (exit 128: not a repository, a
+// corrupt one) read as "not tagged yet", so with GITHUB_SHA set a run from
+// main went on to release. Only exit 1 means there is no such tag.
+test('release: a tag lookup git cannot answer fails the run', { skip: !hasGit && 'no git' }, (t) => {
+  const dir = scratch(t);
+  writeFileSync(join(dir, 'manifest.json'), JSON.stringify({ manifest_version: 3, version: '0.1.0' }));
+  writeFileSync(join(dir, 'package.json'), JSON.stringify({ version: '0.1.0' }));
+  copyTools(dir, [...TOOLS, 'release-check.mjs']);
+  const output = join(dir, '.output');
+  const result = spawnSync(process.execPath, [join(dir, 'tools', 'release-check.mjs')], {
+    cwd: dir,
+    // Not a repository, whatever folder holds this one.
+    env: cleanEnv({ GIT_CEILING_DIRECTORIES: dirname(dir), GITHUB_REF: 'refs/heads/main', GITHUB_SHA: 'c0ffee', GITHUB_OUTPUT: output }),
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: 60_000,
+  });
+  assert.equal(result.status, 1, `${result.stdout}${result.stderr}`);
+  assert.match(result.stderr, /^git rev-parse -q --verify refs\/tags\/v0\.1\.0\^\{commit\} failed: fatal: not a git repository/);
+  assert.ok(!existsSync(output), `it decided anyway: ${existsSync(output) && readFileSync(output, 'utf8')}`);
 });
 
 // ------------------------------------------------------------------ stage --

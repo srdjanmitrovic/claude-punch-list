@@ -41,6 +41,8 @@ concurrency:
 jobs:
   release:
     runs-on: ubuntu-latest
+    # A hung step fails here, not at GitHub's own limit of six hours.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
         with:
@@ -50,7 +52,7 @@ jobs:
 
       - uses: actions/setup-node@v7
         with:
-          node-version: "20"
+          node-version: "24"
 
       - name: Decide what to release
         id: plan

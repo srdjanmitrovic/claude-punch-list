@@ -274,11 +274,24 @@ function withTimeout(promise, ms) {
  *   (goes when that page changes), one capture (goes when the tab changes),
  *   or the report (stays until its cause is dealt with). 'missing' is the
  *   report's missing file, which a discard recounts.
+ *
+ * Nothing to say, on a tab the panel may not capture, still says that: the
+ * restriction holds for as long as the tab is in view, and this line is the
+ * only place it is said. Hidden instead, it stayed away after a copy, or
+ * after a missing file's banner went, until the next tab event.
  */
 function showBanner(message, kind = 'warn', scope = 'capture') {
-  // resolveTab sets it again once it has shown the restriction itself. Any
-  // other banner has replaced the restriction's, and is not its to clear.
-  state.restrictionShown = false;
+  if (!message && state.restriction) {
+    // Already up: set again, its text would be read out again.
+    if (state.restrictionShown) return;
+    message = state.restriction;
+    kind = 'error';
+    scope = 'page';
+  }
+  // Whether the banner is the restriction's, so resolveTab takes down only
+  // its own. Any other banner has replaced it, and is not resolveTab's to
+  // clear.
+  state.restrictionShown = Boolean(message) && message === state.restriction;
   if (!message) {
     el.banner.hidden = true;
     state.bannerScope = null;
@@ -449,6 +462,8 @@ async function resolveTab() {
   state.tab = tab || null;
   // The chips are the tab's before, or nothing's yet, until this one's read.
   if (tab && tab.id !== state.settledTabId) clearCounts();
+  // And no longer follow the tab before.
+  if (countsPort && countsPort.tabId !== tab?.id) unwatchCounts();
 
   // Arming is per-tab. Switching tabs would otherwise leave the button lit for
   // an overlay that is still live on a page no longer in view, and the next
@@ -504,6 +519,11 @@ async function resolveTab() {
   const moved = switched || (state.settledUrl != null && state.settledUrl !== (tab.url || ''));
   state.settledTabId = tab.id;
   state.settledUrl = tab.url || '';
+  // A new page has a bridge of its own, which the read below connects to.
+  // Chrome closes the port when its page is unloaded, and from Chrome 123
+  // when its page goes into the back/forward cache; before that a cached
+  // page kept its port, and the chips would have gone on following it.
+  if (moved) unwatchCounts();
 
   // The worker tracks which tab has an overlay waiting. Adopting it here covers
   // the case a one-shot broadcast cannot: Alt+Shift+C arms the page and opens
@@ -590,6 +610,12 @@ function loadImage(dataUrl) {
 
 const RESIZED_DURING_CAPTURE =
   'The tab changed size between the selection and the screenshot, so this crop may be off.';
+
+// The overlay's host, put into the element shown fullscreen, moved the page's
+// layout there while Region was armed (a :last-child rule), and the page moved
+// back once it was gone, before the screenshot (content/overlay.js, childBoxes).
+const MOVED_UNDER_OVERLAY =
+  'The page moved its fullscreen content while Region was armed and moved it back for the screenshot, so this crop may be off.';
 
 /**
  * Crop a viewport screenshot down to a CSS-pixel rect.
@@ -791,14 +817,43 @@ function closeTip() {
 
 /**
  * How long a click on the tooltip waits for a second press before it is
- * acted on, and the tooltip stays for it. A second press makes it a double
- * click, which selects a word of the tooltip as a double click on any text
- * does (see holdTipRun). The double click time macOS and Windows set unless
- * the user slows it: at 300 ms, a double click of 380 ms picked the row.
+ * acted on, and the tooltip stays for it, until the user's own double clicks
+ * say to wait longer (tipClickMs). A second press makes it a double click,
+ * which selects a word of the tooltip as a double click on any text does
+ * (see holdTipRun). The double click time macOS and Windows set unless the
+ * user slows it: at 300 ms, a double click of 380 ms picked the row.
  */
 const TIP_CLICK_MS = 500;
+/**
+ * The most the wait grows to (see learnClickTime). Windows lets the user slow
+ * a double click to 900 ms, and macOS further still; a click on the tooltip
+ * that waited seconds would read as lost.
+ */
+const TIP_CLICK_MAX_MS = 1000;
+/** The wait now: TIP_CLICK_MS, or longer once the user's double clicks are. */
+let tipClickMs = TIP_CLICK_MS;
+/** When the last press in the panel went down, see learnClickTime. */
+let lastPressAt = null;
 /** The click on the tooltip that is waiting, see clickThroughTip. */
 let tipClickTimer = null;
+
+/**
+ * Learn how slow a double click the system allows, from the double clicks it
+ * counts. No web API tells the system's double click time, but the browser
+ * counts a press as the next click of a run (event.detail) only inside it, so
+ * every such press, anywhere in the panel, is a gap the system allows. The
+ * wait grows to the slowest one seen, with a fifth to spare, so a user who
+ * has slowed their double click waits longer, and nobody else does. Kept for
+ * the life of the panel. The first slow double click, before any is seen,
+ * still picks the row.
+ */
+function learnClickTime(event) {
+  if (event.detail > 1 && lastPressAt != null) {
+    const gap = event.timeStamp - lastPressAt;
+    if (gap > 0) tipClickMs = Math.min(TIP_CLICK_MAX_MS, Math.max(tipClickMs, Math.round(gap * 1.2)));
+  }
+  lastPressAt = event.timeStamp;
+}
 
 function cancelTipClick() {
   clearTimeout(tipClickTimer);
@@ -822,7 +877,7 @@ function cancelTipClick() {
  * emptying the sheet) or unticked a chip for every later prompt, while the
  * user was looking at the tooltip and not at what it hid.
  *
- * Not at once: a press that follows within TIP_CLICK_MS makes a double click,
+ * Not at once: a press that follows within tipClickMs makes a double click,
  * which selects the word under it. Nor a drag that selected the tooltip's
  * words: that is reading it.
  */
@@ -865,7 +920,7 @@ function clickThroughTip(event) {
     // to the tooltip, which cannot take focus.
     row.closest?.('button, input, textarea, select, a[href]')?.focus?.({ preventScroll: true });
     row.dispatchEvent(new MouseEvent('click', init));
-  }, TIP_CLICK_MS);
+  }, tipClickMs);
 }
 
 /**
@@ -885,7 +940,7 @@ let tipHeld = false;
  * selecting a word, and the browser does that for them. On the tooltip, or
  * where it was, as when the pointer slipped off it and it closed: such a
  * press is also kept from the control it lands on there, Copy perhaps, while
- * it is inside TIP_CLICK_MS. Not later: by then the tooltip has gone, and a
+ * it is inside tipClickMs. Not later: by then the tooltip has gone, and a
  * press on what it uncovered is one the user aimed there, which the system
  * may still count as the second click.
  */
@@ -905,8 +960,10 @@ function holdTipRun(event) {
         event.clientY >= box.top &&
         event.clientY <= box.bottom;
       if (where) cancelTipClick();
-      tipHeld = where && event.timeStamp - at < TIP_CLICK_MS;
+      tipHeld = where && event.timeStamp - at < tipClickMs;
     }
+    // After: this press is judged by the wait its run began under.
+    learnClickTime(event);
   }
   if (event.detail > 1 && tipHeld) {
     event.preventDefault();
@@ -1942,6 +1999,7 @@ async function refreshContext() {
   const read = ++state.reads;
   if (!tab || state.restriction) {
     state.countsRead = read;
+    unwatchCounts();
     setCount(el.countConsole, null);
     setCount(el.countNetwork, null);
     // Nothing from an earlier read is handed on. It came from another tab, and
@@ -1979,16 +2037,20 @@ async function refreshContext() {
           : OUTSIDE_MATCHES
         : reloadAdvice;
     el.collectorWarning.hidden = error !== 'missing' && !lateStart;
-    setCount(
-      el.countConsole,
-      context
-        ? (collected.console?.length || 0) +
-            (collected.warnings?.length || 0) +
-            (collected.errors?.length || 0)
-        : null
-    );
-    setCount(el.countNetwork, context ? collected.network?.length || 0 : null);
+    if (!countsFollowed(tab.id)) {
+      setCount(
+        el.countConsole,
+        context
+          ? (collected.console?.length || 0) +
+              (collected.warnings?.length || 0) +
+              (collected.errors?.length || 0)
+          : null
+      );
+      setCount(el.countNetwork, context ? collected.network?.length || 0 : null);
+    }
   }
+  // A collector answered: from here its counts come to the chips as they change.
+  if (context && !error && state.tab?.id === tab.id && !state.restriction) watchCounts(tab.id);
 
   updateElementCount();
   return { context, error, tabId: tab.id, lateStart };
@@ -2147,14 +2209,93 @@ function updateElementCount() {
 /**
  * Read the chips again because the user has come back to the panel: its
  * window took focus, it was shown, or the pointer came into it. The counts are
- * otherwise read on a capture, a copy and a change of tab, and a page logs in
- * between. Not on a timer: every read runs in the page and hands it the log.
+ * otherwise read on a capture, a copy and a change of tab, and followed
+ * between those through the port below where the tab's collector can; this
+ * read is what keeps them current where it cannot (a collector of an earlier
+ * build still running in the tab). Not on a timer: every read runs in the
+ * page and hands it the log.
  */
 function refreshChips() {
   if (!state.tab || state.restriction) return;
   if (Date.now() - state.chipsReadAt < CHIPS_MIN_GAP_MS) return;
   state.chipsReadAt = Date.now();
   refreshContext();
+}
+
+/**
+ * The console and network chips follow the log of the tab in view for as
+ * long as the panel is open and shown, through a port to that tab's bridge
+ * (cdr:counts in collector-bridge.js), which posts the two counts when they
+ * change, at most four times a second, and nothing else. The port is opened
+ * once a read of the tab has found its collector, and closed on a change of
+ * tab or of page, when the panel is hidden, and by Chrome when the panel
+ * closes; with no port open the page does nothing for the chips.
+ *
+ * { tabId, port, counts }: counts says the port has posted, from when its
+ * numbers are the chips'. A read's reply and a port's message travel on two
+ * channels, which Chrome does not keep in order between them, so a read that
+ * answers after a newer post would put the older counts back, and nothing
+ * would correct them until the log changed. The port's own posts arrive in
+ * order, and the bridge posts the counts it finds at each read there too
+ * (recount in collector-bridge.js), so a read still sets the chips right
+ * after a signal of the collector's was lost.
+ */
+let countsPort = null;
+/** The tab whose counts the panel follows once it is shown again. */
+let countsWaiting = null;
+
+function watchCounts(tabId) {
+  if (countsPort?.tabId === tabId) return;
+  unwatchCounts();
+  if (document.visibilityState === 'hidden') {
+    countsWaiting = tabId;
+    return;
+  }
+  if (typeof chrome.tabs.connect !== 'function') return;
+  let port;
+  try {
+    port = chrome.tabs.connect(tabId, { name: 'cdr:counts', frameId: 0 });
+  } catch {
+    return; // the tab went away
+  }
+  const live = { tabId, port, counts: false };
+  countsPort = live;
+  port.onMessage.addListener((message) => {
+    if (countsPort !== live || message?.type !== 'cdr:counts') return;
+    const { console: consoleCount, network: networkCount } = message;
+    if (!Number.isInteger(consoleCount) || !Number.isInteger(networkCount)) return;
+    if (consoleCount < 0 || networkCount < 0) return;
+    live.counts = true;
+    if (state.tab?.id !== tabId || state.restriction) return;
+    setCount(el.countConsole, consoleCount);
+    setCount(el.countNetwork, networkCount);
+  });
+  port.onDisconnect.addListener(() => {
+    // "Receiving end does not exist" for a page with no bridge, which a
+    // later read that finds one tries again.
+    void chrome.runtime.lastError;
+    if (countsPort === live) countsPort = null;
+  });
+}
+
+function unwatchCounts() {
+  const live = countsPort;
+  countsPort = null;
+  countsWaiting = null;
+  if (!live) return;
+  try {
+    live.port.disconnect();
+  } catch {
+    /* already closed */
+  }
+}
+
+/**
+ * Whether the chips are the port's for this tab. A read's reply then leaves
+ * them alone, and the bridge posts what that read found on the port.
+ */
+function countsFollowed(tabId) {
+  return countsPort?.tabId === tabId && countsPort.counts;
 }
 
 
@@ -2408,6 +2549,12 @@ async function copyReport() {
   if (state.busy || !ticked.length || blocked(ticked)) return;
 
   state.busy = true;
+  // Whether the keyboard was in the panel: on Copy, or wherever the shortcut
+  // was pressed, the field most often. Read before Copy is disabled, which in
+  // Chrome takes the focus off it and leaves it on the body (see
+  // focusAfterCopy).
+  const hadFocus = document.activeElement != null && document.activeElement !== document.body;
+  const copies = state.copies;
   el.submit.classList.add('busy');
   el.submit.disabled = true;
   el.submitLabel.textContent = 'Copying…';
@@ -2492,7 +2639,38 @@ async function copyReport() {
     // Must match the label in panel.html: this runs after every copy.
     el.submitLabel.textContent = 'Copy for Claude Code';
     updateSubmitState();
+    if (hadFocus) focusAfterCopy(state.copies !== copies);
   }
+}
+
+/**
+ * Give the keyboard back after a copy started with it in the panel: Copy
+ * pressed or clicked, or the shortcut pressed in the field.
+ *
+ * Chrome takes the focus off a control once it is disabled, as Copy is while
+ * it works, or hidden, as the field is once the copy empties the sheet, and
+ * leaves it on the body, from where the next Tab starts at the top of the
+ * panel. A hidden control loses it a moment later, so one that is no longer
+ * shown counts as lost already. Then it goes to Copy when Copy can be pressed
+ * again. When a missing file holds Copy back, it goes to that item's tick,
+ * since unticking is what lifts the block. When the copy emptied the sheet,
+ * it goes to Copy again, the receipt's first action. A control that can
+ * still take keys keeps them: the field after a copy that left items, or
+ * wherever the user has put the focus since.
+ */
+function focusAfterCopy(copied) {
+  const now = document.activeElement;
+  const kept = now && now !== document.body && now !== el.submit && !now.disabled && now.checkVisibility?.() !== false;
+  if (kept) return;
+  const missing = state.items.findIndex((item) => item.missing && item.included);
+  const target = !el.submit.disabled
+    ? el.submit
+    : missing !== -1
+      ? el.list.children[missing]?.querySelector('.row-tick')?.children[0]
+      : copied && !el.result.hidden
+        ? el.copyAgain
+        : null;
+  target?.focus();
 }
 
 /**
@@ -3239,7 +3417,11 @@ function handleBroadcast(message) {
         return { ...(await cropCapture(dataUrl, message.rect, message.viewport)), takenAt };
       })
       .then((cropped) => {
-        const notices = [armedSince ? ARMED_DURING_SCREEN : null, cropped.notice].filter(Boolean);
+        const notices = [
+          armedSince ? ARMED_DURING_SCREEN : null,
+          cropped.notice,
+          region && message.moved === true ? MOVED_UNDER_OVERLAY : null,
+        ].filter(Boolean);
         addItem({
           ...cropped,
           notice: notices.join(' ') || null,
@@ -3494,9 +3676,19 @@ window.addEventListener('focus', () => {
   refreshChips();
 });
 document.addEventListener('visibilitychange', () => {
+  // Hidden (its window minimized, say), the panel shows nothing, so the page
+  // has nothing to send it.
+  if (document.visibilityState === 'hidden') {
+    const tabId = countsPort?.tabId;
+    unwatchCounts();
+    if (tabId != null) countsWaiting = tabId;
+    return;
+  }
   if (document.visibilityState !== 'visible') return;
   checkFiles();
   refreshChips();
+  // The port again, whether or not that read is held back by its gap.
+  if (countsWaiting != null && countsWaiting === state.tab?.id && !state.restriction) watchCounts(countsWaiting);
 });
 document.addEventListener('pointerover', (event) => {
   if (!event.relatedTarget) refreshChips();

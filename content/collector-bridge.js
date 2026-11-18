@@ -25,15 +25,14 @@
     /* a mark that cannot answer belongs to no live bridge */
   }
   const runtime = chrome.runtime;
-  window.__cdrBridge = {
-    alive: () => {
-      try {
-        return Boolean(runtime.id);
-      } catch {
-        return false;
-      }
-    },
+  const alive = () => {
+    try {
+      return Boolean(runtime.id);
+    } catch {
+      return false;
+    }
   };
+  window.__cdrBridge = { alive };
 
   // The log is read over a channel of this bridge's own: a pair of event
   // types on the window, named with a random part, so that only the collector
@@ -67,6 +66,13 @@
   })();
   let paired = false;
 
+  // The panel's ports for the counts (see watchCounts), and where they stand.
+  const counting = new Set();
+  let watched = false; // the collector said it is watching for this bridge
+  let lastCounts = null; // the counts last posted, so the same are not posted again
+  let countsTimer = 0;
+  let countsDue = false; // a ring grew while the timer ran
+
   function sayHello() {
     window.dispatchEvent(new CustomEvent(HELLO, { detail: `bridge ${CHANNEL}` }));
     // Answered with nothing by a collector of this build that heard it.
@@ -78,7 +84,11 @@
   }
 
   window.addEventListener(HELLO, (event) => {
-    if (event.detail === 'main' && !paired) sayHello();
+    if (event.detail === 'main' && !paired) {
+      sayHello();
+      // A panel that connected before this collector arrived.
+      if (paired) watchCounts();
+    }
   });
   sayHello();
 
@@ -148,6 +158,211 @@
   async function askMainWorld(action) {
     const reply = askOverChannel(action);
     return reply === undefined ? askOverMessage(action) : reply;
+  }
+
+  // -------------------------------------------------------------- counts ---
+  // The panel's console and network chips follow the log while the panel is
+  // open on this tab. It holds a port here for as long as this tab is the one
+  // in view (chrome.tabs.connect, named cdr:counts) and the panel is shown.
+  // This end hears the panel close the port, or close with it, but not the
+  // two other ways a port ends, which are seen to below: the page going into
+  // the back/forward cache, and the extension being reloaded. With no port
+  // open nothing below runs: the collector is not watching, and a log line
+  // costs it one comparison more than before.
+  //
+  // With one open, the collector tells this bridge, over its channel, when a
+  // ring has grown (see countsChanged in collector-main.js), and says it once
+  // until this bridge has asked for the counts. This bridge asks on a timer
+  // of its own world, at once and then at most every COUNTS_GAP_MS, and posts
+  // two numbers to the port only when they differ from the last it posted.
+  // Each read of the panel's asks too, and posts what it finds (recount). A
+  // page that logs without pause costs four asks a second, and one whose
+  // rings are full costs nothing, since a full ring does not grow. Nothing
+  // but the two numbers is posted, so the port carries none of the log.
+  const COUNTS_PORT = 'cdr:counts';
+  const COUNTS_GAP_MS = 250;
+  // The most each count can be: three rings of RING_LIMIT and one.
+  const CONSOLE_MAX = 90;
+  const NETWORK_MAX = 30;
+
+  /** The two counts from the page's world, checked, or null. */
+  function countsOf(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    const consoleCount = raw.console;
+    const networkCount = raw.network;
+    if (!Number.isInteger(consoleCount) || !Number.isInteger(networkCount)) return null;
+    if (consoleCount < 0 || networkCount < 0) return null;
+    return { console: Math.min(consoleCount, CONSOLE_MAX), network: Math.min(networkCount, NETWORK_MAX) };
+  }
+
+  function postCounts(counts, ports) {
+    lastCounts = counts;
+    for (const port of ports) {
+      try {
+        port.postMessage({ type: 'cdr:counts', console: counts.console, network: counts.network });
+      } catch {
+        counting.delete(port); // closed under it
+      }
+    }
+  }
+
+  /** Ask for the counts and post them if they changed; null when nothing answered. */
+  function sendCounts() {
+    let counts = null;
+    try {
+      counts = countsOf(askOverChannel('counts'));
+    } catch {
+      /* posted at the next change */
+    }
+    if (counts && (!lastCounts || counts.console !== lastCounts.console || counts.network !== lastCounts.network)) {
+      postCounts(counts, counting);
+    }
+  }
+
+  /** Ask the collector to watch, once a port is open and a collector answers. */
+  function watchCounts() {
+    if (watched || !counting.size) return;
+    let counts = null;
+    try {
+      counts = countsOf(askOverChannel('watch'));
+    } catch {
+      /* a collector of an earlier build, or none: the panel reads as it did */
+    }
+    if (!counts) return;
+    watched = true;
+    postCounts(counts, counting);
+  }
+
+  /**
+   * At each of the panel's reads, and at Clear: the collector is asked to
+   * 'watch' again, which also has it say the next change, and the counts go
+   * to the ports as they are, whatever was posted last. The collector says a
+   * change once until it is asked, so a signal lost on the way left the
+   * chips standing for as long as the port lived, and the panel cannot take
+   * them from a read's reply, which Chrome does not keep in order with the
+   * port's posts. Posted here, they are. A signal is lost when the page logs
+   * with its stack all but used up, and on a page already open when the
+   * extension started there, a page script that heard this bridge's HELLO
+   * can ask to 'unwatch' on this channel. Either way the next read sets the
+   * chips right, and they follow the log again. Never throws: the read's
+   * reply goes after it.
+   */
+  function recount() {
+    try {
+      if (!counting.size) return;
+      if (!watched) {
+        watchCounts();
+        return;
+      }
+      const counts = countsOf(askOverChannel('watch'));
+      if (counts) postCounts(counts, counting);
+    } catch {
+      /* posted at the next change, or the next read */
+    }
+  }
+
+  function unwatchCounts() {
+    // Closed, not only dropped: the panel hears it, and takes the counts
+    // from its reads again, which no longer post here.
+    for (const port of counting) {
+      try {
+        port.disconnect();
+      } catch {
+        /* already closed */
+      }
+    }
+    counting.clear();
+    clearTimeout(countsTimer);
+    countsTimer = 0;
+    countsDue = false;
+    lastCounts = null;
+    if (!watched) return;
+    watched = false;
+    try {
+      askOverChannel('unwatch');
+    } catch {
+      /* the collector goes on saying so, to a bridge that does nothing with it */
+    }
+  }
+
+  function countsTick() {
+    countsTimer = 0;
+    if (!counting.size) return;
+    countsDue = false;
+    // The gap, after which a change seen meanwhile is asked for. Set before
+    // the ask, so that a change said during it waits for the gap too: a page
+    // that answers in the collector's place and says a change as it answers
+    // had each ask set a timer of its own, which this one then overwrote.
+    countsTimer = setTimeout(() => {
+      countsTimer = 0;
+      if (countsDue) countsTick();
+    }, COUNTS_GAP_MS);
+    sendCounts();
+  }
+
+  // Nothing is asked from here: the collector is in the middle of recording.
+  // Guarded: a page that logs on its way back from a stack overflow has the
+  // collector say so with all but no stack left, and this failed in the
+  // middle, which Chrome reported in the tab as an uncaught error of the
+  // extension's. The change is then asked for at the panel's next read (see
+  // recount).
+  window.addEventListener(`${CHANNEL}:changed`, () => {
+    try {
+      if (countsTimer) countsDue = true;
+      // A bridge the extension has been reloaded under can post to nobody,
+      // and in Chrome 156 its ports' onDisconnect never fires. Seen to as
+      // the timer fires, not now: a page that sends this event itself (on a
+      // late start, see recount) had a port that opened meanwhile dropped.
+      else countsTimer = setTimeout(() => (counting.size && alive() ? countsTick() : unwatchCounts()), 0);
+    } catch {
+      /* asked at the next read */
+    }
+  });
+
+  // A page going into the back/forward cache has its ports closed by Chrome,
+  // and in Chrome 156 this end hears nothing of it: no onDisconnect, and a
+  // post to such a port does not throw. Kept, one went on making the
+  // collector say every change, to nobody, after the panel closed. So they
+  // are closed here first, which the panel hears at once, and which leaves
+  // no port to a cached page in a Chrome before 123, where a message to one
+  // evicted the page from the cache. Restored, the page is a new page to the
+  // panel, which connects again. Only the browser's own pagehide: one a page
+  // script sends would stop the counts.
+  window.addEventListener('pagehide', (event) => {
+    if (event.isTrusted) unwatchCounts();
+  });
+
+  try {
+    runtime.onConnect.addListener((port) => {
+      if (port.name !== COUNTS_PORT) return;
+      // Only the extension's own pages can connect to a content script, but a
+      // port from anything else would be asking for what it may not have.
+      if (port.sender?.id !== runtime.id) {
+        port.disconnect();
+        return;
+      }
+      counting.add(port);
+      port.onDisconnect.addListener(() => {
+        void runtime.lastError;
+        counting.delete(port);
+        if (!counting.size) unwatchCounts();
+      });
+      if (!watched) {
+        watchCounts();
+        return;
+      }
+      // Asked again, not the counts last posted: those may have been posted
+      // to a port that was gone.
+      let counts = null;
+      try {
+        counts = countsOf(askOverChannel('counts'));
+      } catch {
+        /* posted at the next change */
+      }
+      if (counts) postCounts(counts, counting);
+    });
+  } catch {
+    /* no ports here: the chips are read as they were before */
   }
 
   // ------------------------------------------------------------- rebuild ---
@@ -250,6 +465,7 @@
       askMainWorld('snapshot')
         .catch(() => null)
         .then((reply) => {
+          recount();
           sendResponse({
             ok: true,
             page: pageInfo(),
@@ -267,7 +483,11 @@
     if (message.type === 'cdr:clear-context') {
       askMainWorld('clear')
         .catch(() => null)
-        .then(() => sendResponse({ ok: true }));
+        .then(() => {
+          // The user's own click, so the zeros go out now.
+          recount();
+          sendResponse({ ok: true });
+        });
       return true;
     }
 

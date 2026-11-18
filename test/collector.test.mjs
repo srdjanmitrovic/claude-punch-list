@@ -81,6 +81,10 @@ function domClasses() {
     querySelector(selector) {
       return this.children.find((child) => matches(child, selector)) ?? null;
     }
+    // '*' too, for every element of the root.
+    querySelectorAll(selector) {
+      return selector === '*' ? [...this.children] : this.children.filter((child) => matches(child, selector));
+    }
   }
   // The document's querySelectorAll and getElementsByTagName, over every
   // element not in a shadow root, in the order they were made. A test sets
@@ -93,7 +97,7 @@ function domClasses() {
       return all.filter((element) => !element.inShadow && matches(element, selector));
     }
     getElementsByTagName(tag) {
-      return all.filter((element) => !element.inShadow && element.tag === tag);
+      return all.filter((element) => !element.inShadow && (tag === '*' || element.tag === tag));
     }
   }
   const valued = () =>
@@ -347,7 +351,7 @@ function arm({ fetch, before, dom = false, loading = false } = {}) {
 
   let nextId = 0;
   function request(action, extra = {}) {
-    if (action === 'snapshot' || action === 'clear') return overChannel(action);
+    if (['snapshot', 'clear', 'watch', 'unwatch', 'counts'].includes(action)) return overChannel(action);
     nextId += 1;
     const data = { __cdr: 'request', action, id: nextId, ...extra };
     for (const listener of listeners.get('message') || []) listener({ source: self, data });
@@ -370,6 +374,8 @@ function arm({ fetch, before, dom = false, loading = false } = {}) {
     snapshot: () => request('snapshot'),
     realm: (code) => vm.runInContext(code, page),
     posted,
+    /** The name of the channel request() opens, once it has. */
+    channel,
   };
 }
 
@@ -475,6 +481,20 @@ test('collector: a logged object keeps its shape and loses the values of secret 
     page.snapshot().console[0].text,
     'login failed {"user":{"name":"ada","password":"<redacted>","hasPassword":true},' +
       '"headers":{"Authorization":"<redacted>","Accept":"json"},"className":"row","passHref":true,"apiKey":null}'
+  );
+});
+
+test('collector: a logged payment nonce loses its value, under any spelling of the name (F43)', () => {
+  const page = arm();
+  page.page.console.error('tokenize failed', {
+    nonce: 'tokencc_bh_F43A',
+    details: { paymentMethodNonce: 'F43B', payment_method_nonce: 'F43C', cardNonce: 'F43D' },
+    announcement: 'Sale',
+  });
+  assert.equal(
+    page.snapshot().console[0].text,
+    'tokenize failed {"nonce":"<redacted>","details":{"paymentMethodNonce":"<redacted>",' +
+      '"payment_method_nonce":"<redacted>","cardNonce":"<redacted>"},"announcement":"Sale"}'
   );
 });
 
@@ -1619,6 +1639,213 @@ test('collector: an unknown action answers null, and clear empties every ring', 
   page.request('clear');
   const after = page.snapshot();
   assert.deepEqual([after.console, after.errors, after.network], [[], [], []]);
+});
+
+// F46. The panel follows the counts while it is open, and the collector says
+// when they change, so nothing has to ask it on a timer.
+test('collector: a watched channel hears once that a ring grew, until the counts are asked; a full ring and an unwatched channel hear nothing (F46)', async () => {
+  const page = arm({ fetch: () => Promise.resolve(response(500)) });
+  page.page.console.error('before');
+  page.snapshot(); // opens the channel
+  let changed = 0;
+  page.page.addEventListener(`${page.channel}:changed`, (event) => {
+    changed += 1;
+    assert.equal(event.detail, null, 'the signal carried something');
+  });
+  page.page.console.error('not watched yet');
+  await page.page.fetch('/api/not-watched');
+  assert.equal(changed, 0);
+
+  assert.deepEqual(page.request('watch'), { console: 2, network: 1 });
+  page.page.console.warn('first');
+  page.page.console.error('second');
+  await page.page.fetch('/api/third');
+  assert.equal(changed, 1, 'told more than once before asking');
+  assert.deepEqual(page.request('counts'), { console: 4, network: 2 });
+  page.page.console.warn('after the ask');
+  assert.equal(changed, 2);
+
+  // The console ring full: one in, one out, the same count.
+  page.request('counts');
+  for (let i = 0; i < 40; i += 1) page.page.console.error(`fill ${i}`);
+  assert.deepEqual(page.request('counts'), { console: 32, network: 2 });
+  page.page.console.error('one more');
+  assert.equal(changed, 3, 'only the filling said so');
+  page.page.console.warn('a warning still grows its ring');
+  assert.equal(changed, 4);
+
+  page.request('counts');
+  assert.equal(page.request('unwatch'), null);
+  page.page.console.warn('unwatched');
+  await page.page.fetch('/api/unwatched');
+  assert.equal(changed, 4);
+  // Clear answers as before, and says nothing of it: the bridge asks.
+  page.request('watch');
+  page.request('clear');
+  assert.equal(changed, 4);
+  assert.deepEqual(page.request('counts'), { console: 0, network: 0 });
+  assert.deepEqual(page.posted, [], 'something went to window.postMessage');
+});
+
+// A page that logs on its way back from a stack overflow has the collector
+// record, and say so, with all but no stack left (seen in Chrome for Testing
+// 156). This fake's dispatchEvent lets a listener's throw out, which stands
+// in for a dispatch that threw.
+test('collector: a signal that could not go out is sent with the next entry, and a listener that logs again is not told of it (F46)', () => {
+  const page = arm();
+  page.snapshot(); // opens the channel
+  let heard = 0;
+  let fail = true;
+  page.page.addEventListener(`${page.channel}:changed`, () => {
+    if (fail) {
+      fail = false;
+      throw new RangeError('Maximum call stack size exceeded');
+    }
+    heard += 1;
+    page.page.console.error('logged while told');
+  });
+  page.request('watch');
+  page.page.console.error('lost');
+  assert.equal(heard, 0);
+  page.page.console.warn('next');
+  assert.equal(heard, 1, 'a signal that never went out left the channel marked as told');
+  page.page.console.warn('and the one after');
+  assert.equal(heard, 1, 'told twice before the counts were asked');
+  assert.deepEqual(page.request('counts'), { console: 4, network: 0 });
+  page.page.console.warn('after the ask');
+  assert.equal(heard, 2);
+});
+
+test('collector: a push that ran out of stack before it dropped an entry leaves its ring long only until the next, and counted at 30 (F46)', () => {
+  // What runs out first, on a stack all but used up, stands in for it: the
+  // look for a request the page ended, as the ring drops its oldest. The
+  // console wrapper swallows the throw.
+  const page = arm({
+    before: `
+      const hasOwn = Object.hasOwn;
+      globalThis.outOfStack = false;
+      Object.hasOwn = (object, key) => {
+        if (globalThis.outOfStack && key === 'outcome') throw new RangeError('Maximum call stack size exceeded');
+        return hasOwn(object, key);
+      };`,
+  });
+  for (let i = 0; i < 30; i += 1) page.page.console.warn(`fill ${i}`);
+  page.realm('outOfStack = true');
+  for (let i = 0; i < 5; i += 1) page.page.console.warn(`deep ${i}`);
+  assert.deepEqual(page.request('counts'), { console: 30, network: 0 }, 'counted past the 30 the bridge hands on');
+  page.realm('outOfStack = false');
+  page.page.console.warn('with the stack back');
+  const after = page.snapshot();
+  assert.equal(after.warnings.length, 30, 'the ring stayed long');
+  assert.equal(after.warnings.at(-1).text, 'with the stack back');
+  assert.equal(after.dropped.warnings, 6);
+});
+
+// Each entry the cut looks at is one Object.hasOwn(entry, 'outcome'), which
+// is counted here instead of timed. Dropped one at a time, each looked for
+// over the whole ring, a thousand such pushes cost half a million looks,
+// which in Chrome froze the page for seconds at the next console call.
+test('collector: a ring a thousand pushes left long is cut back in one pass at the next (F46)', () => {
+  const page = arm({
+    before: `
+      const hasOwn = Object.hasOwn;
+      globalThis.outOfStack = false;
+      globalThis.looks = 0;
+      Object.hasOwn = (object, key) => {
+        if (key === 'outcome') {
+          looks += 1;
+          if (outOfStack) throw new RangeError('Maximum call stack size exceeded');
+        }
+        return hasOwn(object, key);
+      };`,
+  });
+  for (let i = 0; i < 30; i += 1) page.page.console.warn(`fill ${i}`);
+  page.realm('outOfStack = true');
+  for (let i = 0; i < 1000; i += 1) page.page.console.warn(`deep ${i}`);
+  page.realm('outOfStack = false; looks = 0');
+  page.page.console.warn('with the stack back');
+  const looks = page.realm('looks');
+  assert.ok(looks <= 1031, `${looks} looks to cut 1,031 entries back to 30`);
+  const after = page.snapshot();
+  assert.deepEqual(
+    after.warnings.map((entry) => entry.text),
+    [...Array.from({ length: 29 }, (_, i) => `deep ${971 + i}`), 'with the stack back']
+  );
+  assert.equal(after.dropped.warnings, 1001);
+});
+
+test('collector: a cut that runs out of stack part way leaves no entry twice, and the next push finishes it, ended requests first (F46)', () => {
+  const page = arm({
+    before: `
+      const hasOwn = Object.hasOwn;
+      globalThis.looks = 0;
+      globalThis.failAt = 0;
+      Object.hasOwn = (object, key) => {
+        if (key === 'outcome' && (looks += 1) === failAt) throw new RangeError('Maximum call stack size exceeded');
+        return hasOwn(object, key);
+      };`,
+  });
+  const xhr = new page.page.XMLHttpRequest();
+  const request = (url, end) => {
+    xhr.open('GET', url);
+    xhr.send();
+    xhr.finish(0, '', [end]);
+  };
+  const failures = (from, count) => Array.from({ length: count }, (_, i) => `/api/f${from + i}`);
+  for (const url of failures(0, 10)) request(url, 'error');
+  request('/api/aborted', 'abort');
+  for (const url of failures(10, 19)) request(url, 'error');
+  // Five pushes that run out of stack at their first look, then one that
+  // runs out at its fourteenth: after dropping the aborted request and
+  // moving the two failures behind it up.
+  for (let i = 0; i < 5; i += 1) {
+    page.realm('looks = 0; failAt = 1');
+    request(`/api/deep${i}`, 'error');
+  }
+  page.realm('looks = 0; failAt = 14');
+  request('/api/part', 'error');
+  const part = page.snapshot();
+  const urls = part.network.map((entry) => entry.url);
+  assert.equal(new Set(urls).size, urls.length, 'an entry is in the ring twice');
+  assert.deepEqual(urls, [...failures(0, 29), '/api/deep0', '/api/deep1', '/api/deep2', '/api/deep3', '/api/deep4', '/api/part']);
+  assert.equal(part.dropped.network, 1);
+
+  page.realm('looks = 0; failAt = 0');
+  request('/api/after', 'error');
+  const after = page.snapshot();
+  assert.deepEqual(after.network.map((entry) => entry.url), [
+    ...failures(6, 23),
+    '/api/deep0', '/api/deep1', '/api/deep2', '/api/deep3', '/api/deep4', '/api/part', '/api/after',
+  ]);
+  assert.equal(after.dropped.network, 7);
+});
+
+// The ring the page logs to fills while there is no room to say so: then
+// only an entry into a ring with room said anything, and the chips stood.
+test('collector: a signal that could not go out is sent with the next entry into a full ring too (F46)', () => {
+  const page = arm();
+  page.snapshot(); // opens the channel
+  let heard = 0;
+  let fail = false;
+  page.page.addEventListener(`${page.channel}:changed`, () => {
+    if (fail) {
+      fail = false;
+      throw new RangeError('Maximum call stack size exceeded');
+    }
+    heard += 1;
+  });
+  page.request('watch');
+  for (let i = 0; i < 29; i += 1) page.page.console.error(`fill ${i}`);
+  assert.equal(heard, 1);
+  page.request('counts');
+  fail = true;
+  page.page.console.error('the thirtieth, not told');
+  assert.equal(heard, 1);
+  page.page.console.error('into the full ring');
+  assert.equal(heard, 2, 'the change was never told');
+  assert.deepEqual(page.request('counts'), { console: 30, network: 0 });
+  page.page.console.error('full, and nothing owed');
+  assert.equal(heard, 2, 'a full ring said it grew');
 });
 
 test('collector: messages from other windows are ignored', () => {
@@ -2901,6 +3128,55 @@ test('collector: a page listener that stops loadend or timeout ahead of the coll
   );
 });
 
+test('collector: a page listener that stops readystatechange and loadend ahead of the collector hides no failure (F10)', async () => {
+  const page = arm();
+  // Added before the first open(), and so ahead of every listener of the
+  // collector's: each stops readystatechange and loadend, and lets the event
+  // the request ends with through.
+  const stopping = () => {
+    const xhr = new page.page.XMLHttpRequest();
+    for (const type of ['readystatechange', 'loadend']) {
+      xhr.addEventListener(type, (event) => event.stopImmediatePropagation());
+    }
+    return xhr;
+  };
+  {
+    const xhr = stopping();
+    xhr.open('GET', '/api/cart');
+    xhr.send();
+    xhr.finish(500, 'Internal Server Error', ['readystatechange', 'load']);
+  }
+  {
+    const xhr = stopping();
+    xhr.open('GET', '/api/offline');
+    xhr.send();
+    xhr.finish(0, '', ['readystatechange', 'error']);
+  }
+  {
+    const xhr = stopping();
+    xhr.timeout = 1000;
+    xhr.open('GET', '/api/rates');
+    xhr.send();
+    xhr.finish(0, '', ['readystatechange', 'timeout']);
+  }
+  // And nothing for one that succeeded behind such a listener.
+  {
+    const xhr = stopping();
+    xhr.open('GET', '/api/ok');
+    xhr.send();
+    xhr.finish(200, 'OK', ['readystatechange', 'load']);
+  }
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.deepEqual(
+    page.snapshot().network.map(({ url, status, statusText, outcome }) => [url, status, statusText, outcome ?? null]),
+    [
+      ['/api/cart', 500, 'Internal Server Error', null],
+      ['/api/offline', 0, 'Network failure', null],
+      ['/api/rates', 0, '', 'timeout'],
+    ]
+  );
+});
+
 test('collector: handler text keeps readable member calls and still drops minified ones (PI16)', () => {
   const page = arm();
   const component = { tag: 0, type: function Panel() {}, memoizedProps: {}, return: null, _debugOwner: null };
@@ -3256,6 +3532,189 @@ test('collector: a show password toggle that made the field type="text" still ke
   reactTree(page, 'RevealBox', { initial: 'reveal-seed-secret', hint: 'Show' }, [label, field]);
   page.page.document.querySelector = () => label.stateNode;
   assert.deepEqual(page.request('inspect', { marker: 'pick1' }).component.props, ['initial=<redacted>', 'hint="Show"']);
+});
+
+test('collector: a seed the user changed in the middle is still withheld, and a prop that only begins like it prints', () => {
+  // A passphrase has no secret's shape, so only the field's value can say
+  // what it is. The user put a word in the middle of the seed, took one
+  // out, or changed a character of a long one with no space in it; the
+  // summary is handed the seed and renders no field.
+  const cases = [
+    ['correct horse battery', 'correct horse staple battery'],
+    ['correct horse staple battery', 'correct staple battery'],
+    ['Tr0ub4dor-and-2-more', 'Tr0ub4dor-and-3-more'],
+  ];
+  for (const [seed, typed] of cases) {
+    const page = arm({ dom: true });
+    new page.page.HTMLInputElement('input', { type: 'password' }).value = typed;
+    const box = hostFiber(page, 'div', {});
+    reactTree(page, 'SeedSummary', { initial: seed, title: 'correct answers only', note: 'Welcome back' }, [box]);
+    page.page.document.querySelector = () => box.stateNode;
+    assert.deepEqual(
+      page.request('inspect', { marker: 'pick1' }).component.props,
+      ['initial=<redacted>', 'title="correct answers only"', 'note="Welcome back"'],
+      seed
+    );
+  }
+  // What they share at the two ends has to be most of both: a greeting that
+  // begins with the word the password begins with prints.
+  const page = arm({ dom: true });
+  new page.page.HTMLInputElement('input', { type: 'password' }).value = 'Welcome to the jungle';
+  const box = hostFiber(page, 'div', {});
+  reactTree(page, 'Greeting', { note: 'Welcome back' }, [box]);
+  page.page.document.querySelector = () => box.stateNode;
+  assert.deepEqual(page.request('inspect', { marker: 'pick1' }).component.props, ['note="Welcome back"']);
+});
+
+test('collector: a prop a character away from a short password or a code is no edit of it, and prints, and one a digit away from a card number is withheld (F48)', () => {
+  // The edit rule is for a passphrase or a seed, a value with a space in it
+  // or of twelve characters or more. An ordinary word is a letter away from
+  // a short password, and an order number a digit away from a code: each
+  // printed in 0.6.0, and was withheld for that. A number of twelve digits
+  // or more is no code: a prop a digit away from the card in the field
+  // holds fifteen of its sixteen digits, and 0.6.0 printed that.
+  const cases = [
+    { control: { type: 'password' }, value: 'January2024', props: { period: 'January 2024', title: 'Billing' }, expected: ['period="January 2024"', 'title="Billing"'] },
+    { control: { type: 'password' }, value: 'Passw0rd', props: { label: 'Password', hint: 'At least 8 characters' }, expected: ['label="Password"', 'hint="At least 8 characters"'] },
+    { control: { type: 'password' }, value: 'hunXer', props: { initial: 'hunter' }, expected: ['initial="hunter"'] },
+    { control: { autocomplete: 'one-time-code' }, value: '482913', props: { orderNumber: 482918, items: 3 }, expected: ['orderNumber=482918', 'items=3'] },
+    { control: { autocomplete: 'tel', name: 'phone' }, value: '+1 (555) 010-4477', props: { support: '+1 (555) 010-4478' }, expected: ['support="+1 (555) 010-4478"'] },
+    { control: { autocomplete: 'cc-number' }, value: '4242 4242 4242 4242', props: { lastValid: '4242 4242 4242 4241', items: 3 }, expected: ['lastValid=<redacted>', 'items=3'] },
+    { control: { autocomplete: 'cc-number' }, value: '4242424242424242', props: { lastValid: '4242424242424243' }, expected: ['lastValid=<redacted>'] },
+    // However either is grouped: a card preview takes the raw digits a
+    // formatter hands back, or groups them its own way. A number of as many
+    // digits that is not the card's still prints.
+    { control: { autocomplete: 'cc-number' }, value: '4242 4242 4242 4242', props: { number: '4242424242424242', invoice: '9999 8888 7777 6666' }, expected: ['number=<redacted>', 'invoice="9999 8888 7777 6666"'] },
+    { control: { autocomplete: 'cc-number' }, value: '4242424242424242', props: { number: '4242-4242-4242-4242' }, expected: ['number=<redacted>'] },
+    { control: { autocomplete: 'cc-number' }, value: '3782 822463 10005', props: { number: '378282246310005' }, expected: ['number=<redacted>'] },
+    { control: { autocomplete: 'cc-number' }, value: '4242 4242 4242 4242', props: { draft: '424242424242424', near: '4242424242424241' }, expected: ['draft=<redacted>', 'near=<redacted>'] },
+    { control: { autocomplete: 'cc-number' }, value: '4242424242424242', props: { slashed: '4242/4242/4242/4242', thin: '4242\u20094242\u20094242\u20094242' }, expected: ['slashed=<redacted>', 'thin=<redacted>'] },
+    // The raw digits of a grouped card quoted whole in longer text: a
+    // sentence, JSON, a URL. Another card's digits there still print.
+    {
+      control: { autocomplete: 'cc-number' },
+      value: '4242 4242 4242 4242',
+      props: {
+        summary: 'Card 4242424242424242 declined',
+        payload: '{"pan":"4242424242424242","exp":"12/27"}',
+        url: '/pay?card=4242424242424242&cvc=1',
+        other: 'Card 9999888877776666 on file',
+      },
+      expected: ['summary=<redacted>', 'payload=<redacted>', 'url=<redacted>', 'other="Card 9999888877776666 on file"'],
+    },
+    // Only a number as long is judged by its digits: a PIN found in the
+    // joined digits of a reference number, across its dash, is no copy of it.
+    { control: { type: 'password', name: 'pin' }, value: '1234', props: { ref: '9912-3488 7766' }, expected: ['ref="9912-3488 7766"'] },
+  ];
+  for (const { control, value, props, expected } of cases) {
+    const page = arm({ dom: true });
+    new page.page.HTMLInputElement('input', control).value = value;
+    const box = hostFiber(page, 'div', {});
+    reactTree(page, 'Summary', props, [box]);
+    page.page.document.querySelector = () => box.stateNode;
+    assert.deepEqual(page.request('inspect', { marker: 'pick1' }).component.props, expected, value);
+  }
+});
+
+// A card's digits are worked out when a pick is judged, not held beside the
+// values: held, they took two of the 64 places a pick has for values, and a
+// passphrase after 32 grouped numbers was no longer held.
+test('collector: a passphrase after 40 grouped numbers in fields of the same form is still withheld', () => {
+  const page = arm({ dom: true });
+  const fields = [];
+  for (let index = 0; index < 40; index += 1) {
+    const field = hostFiber(page, 'input', { name: `account${index}` }, {}, 'HTMLInputElement');
+    field.stateNode.value = `1000 2000 ${String(3000 + index)}`;
+    fields.push(field);
+  }
+  const password = hostFiber(page, 'input', { type: 'password' }, {}, 'HTMLInputElement');
+  password.stateNode.value = 'correct horse battery staple';
+  reactTree(page, 'AccountsForm', { hint: 'correct horse battery staple', items: 3 }, [...fields, password]);
+  page.page.document.querySelector = () => fields[0].stateNode;
+  assert.deepEqual(page.request('inspect', { marker: 'pick1' }).component.props, ['hint=<redacted>', 'items=3']);
+});
+
+test('collector: a field in an open shadow root whose host says nothing of it still keeps its value out of props', () => {
+  // A <login-form> of the page's own keeps its field in its shadow root, or
+  // in the shadow root of an element inside that one. A passphrase has no
+  // secret's shape, and the summary is handed it and renders no field.
+  const cases = [
+    { attributes: { type: 'password' }, nested: false },
+    { attributes: { autocomplete: 'current-password' }, nested: true },
+    // After a show password toggle: its name still says what it holds.
+    { attributes: { type: 'text', name: 'password' }, nested: false },
+    // After a hundred icons with shadow roots of their own, earlier in the
+    // document, as on a page of web components.
+    { attributes: { type: 'password' }, nested: false, icons: 100 },
+  ];
+  for (const { attributes, nested, icons = 0 } of cases) {
+    const page = arm({ dom: true });
+    for (let i = 0; i < icons; i += 1) {
+      new page.page.Element('x-icon', {}).shadow = new page.page.DocumentFragment([new page.page.Element('svg', {})]);
+    }
+    const input = new page.page.HTMLInputElement('input', attributes);
+    input.value = 'shadow pass phrase';
+    const host = new page.page.Element('login-form', {});
+    if (nested) {
+      const inner = new page.page.Element('x-field', {});
+      inner.shadow = new page.page.DocumentFragment([input]);
+      host.shadow = new page.page.DocumentFragment([inner]);
+    } else {
+      host.shadow = new page.page.DocumentFragment([input]);
+    }
+    const box = hostFiber(page, 'div', {});
+    reactTree(page, 'Meter', { input: 'shadow pass phrase', label: 'Strength' }, [box]);
+    page.page.document.querySelector = () => box.stateNode;
+    assert.deepEqual(
+      page.request('inspect', { marker: 'pick1' }).component.props,
+      ['input=<redacted>', 'label="Strength"'],
+      JSON.stringify({ attributes, nested, icons })
+    );
+  }
+});
+
+test('collector: a field two shadow roots down is found however many roots follow its shell in the document (F48)', () => {
+  // An <app-shell> first in the body, its <login-form> in its root, the
+  // field in the form's root, and 600 icons with roots of their own after
+  // the shell. The roots are taken depth first in document order, so the
+  // icons cannot use up the 512 before the form's root is reached.
+  const page = arm({ dom: true });
+  const input = new page.page.HTMLInputElement('input', { type: 'password' });
+  input.value = 'nested pass phrase';
+  const login = new page.page.Element('login-form', {});
+  login.shadow = new page.page.DocumentFragment([input]);
+  const shell = new page.page.Element('app-shell', {});
+  shell.shadow = new page.page.DocumentFragment([login]);
+  for (let i = 0; i < 600; i += 1) {
+    new page.page.Element('x-icon', {}).shadow = new page.page.DocumentFragment([new page.page.Element('svg', {})]);
+  }
+  const box = hostFiber(page, 'div', {});
+  reactTree(page, 'Meter', { input: 'nested pass phrase', label: 'Strength' }, [box]);
+  page.page.document.querySelector = () => box.stateNode;
+  assert.deepEqual(page.request('inspect', { marker: 'pick1' }).component.props, ['input=<redacted>', 'label="Strength"']);
+});
+
+test('collector: the document is asked for open shadow roots among its first 100,000 elements only (F48)', () => {
+  // Every element asked costs the page's thread, on a page of any size.
+  const page = arm({ dom: true });
+  let asked = 0;
+  Object.defineProperty(page.page.Element.prototype, 'shadow', {
+    configurable: true,
+    get() {
+      asked += 1;
+      return this.ownShadow;
+    },
+    set(root) {
+      this.ownShadow = root;
+    },
+  });
+  for (let i = 0; i < 150000; i += 1) new page.page.Element('span', {});
+  const box = hostFiber(page, 'div', {});
+  reactTree(page, 'Meter', { label: 'Strength' }, [box]);
+  page.page.document.querySelector = () => box.stateNode;
+  asked = 0;
+  assert.deepEqual(page.request('inspect', { marker: 'pick1' }).component.props, ['label="Strength"']);
+  assert.ok(asked >= 100000 && asked <= 100100, `${asked} elements asked for a shadow root`);
 });
 
 test('collector: a login form and a checkout form print their ordinary props', () => {
@@ -3927,6 +4386,55 @@ test('collector: started after zone.js, its timer and listeners are the natives 
     [
       ['/api/cart', 404],
       ['/api/save', 500],
+    ]
+  );
+});
+
+// What zone.js's error plugin (zone-error 0.15) leaves behind: window.Error
+// is its ZoneAwareError, which reads the stack of every error it makes at
+// once and writes the zone's name after every frame, and the native is kept
+// under its __zone_symbol__ name. Checked against the real plugin in Chrome
+// for Testing 156, where the collector of 0.6.0 recorded no caller at all.
+test("collector: started after zone.js's error plugin, it makes its stacks with the Error zone.js kept, and names the caller", async () => {
+  const page = arm({
+    before: `
+      globalThis.calls = {};
+      fetch = () => Promise.resolve({ status: 500, statusText: 'Server Error' });
+      const NativeError = Error;
+      globalThis.__zone_symbol__Error = NativeError;
+      function ZoneAwareError() {
+        calls.Error = (calls.Error || 0) + 1;
+        const error = NativeError.apply(this, arguments);
+        const frames = String(error.stack).split('\\n');
+        error.stack = frames.map((line, i) => (i ? line + ' [<root>]' : line)).join('\\n');
+        return error;
+      }
+      ZoneAwareError.prototype = NativeError.prototype;
+      Object.defineProperty(ZoneAwareError, 'stackTraceLimit', {
+        get: () => NativeError.stackTraceLimit,
+        set: (value) => { NativeError.stackTraceLimit = value; },
+      });
+      Error = ZoneAwareError;
+    `,
+  });
+  const script = (code) => vm.runInContext(code, page.page, { filename: 'http://localhost/assets/cart.js' });
+  script(`
+    function loadCart() { return fetch('/api/cart'); }
+    loadCart();
+  `);
+  const xhr = script(`
+    function saveCart() { const xhr = new XMLHttpRequest(); xhr.open('POST', '/api/cart'); xhr.send(); return xhr; }
+    saveCart();
+  `);
+  xhr.finish(500, 'Internal Server Error', ['readystatechange', 'load']);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  // Not one error made through the page's constructor.
+  assert.deepEqual(plain(page.realm('calls')), {});
+  assert.deepEqual(
+    page.snapshot().network.map(({ url, caller }) => [url, (caller || [])[0]]),
+    [
+      ['/api/cart', 'saveCart (http://localhost/assets/cart.js:2:65)'],
+      ['/api/cart', 'loadCart (http://localhost/assets/cart.js:2:34)'],
     ]
   );
 });

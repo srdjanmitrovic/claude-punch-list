@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Punch List for Claude Code",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Mark bugs and suggestions on any page, then hand Claude Code one prompt with every screenshot and the console behind them.",
   "incognito": "not_allowed",
   "minimum_chrome_version": "116",
@@ -36,7 +36,7 @@
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
-      "js": ["content/collector-bridge.js"],
+      "js": ["content/press-gate.js", "content/collector-bridge.js"],
       "run_at": "document_start",
       "world": "ISOLATED",
       "all_frames": false

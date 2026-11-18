@@ -917,6 +917,49 @@ test('prompt: a letters only token as a user name goes, a name made of words sta
   for (const text of plain) assert.ok(prompt.includes(text), `changed: ${text}`);
 });
 
+// F52: a token of small letters with no digit, short enough to read as a
+// word, printed. Five consonants in a row (y a vowel) are in about one word
+// of English in a thousand, and in about half of such tokens.
+test('prompt: a user name of small letters with five consonants in a row goes, one with fewer stays (F52)', () => {
+  const report = sampleReport('bug');
+  const tokens = [
+    ['https://xkcdqwertyzpqlm@a.test/', 'xkcdqwertyzpqlm'],
+    ['clone ssh://qmzbtrwhalk@git.test/x', 'qmzbtrwhalk'],
+    ['https://ops.vbnmkzrt@a.test/', 'vbnmkzrt'],
+  ];
+  tokens.forEach(([text], index) => report.consoleLines.push({ level: 'warn', text, t: 100 + index }));
+  report.network.push({ method: 'GET', url: 'https://hjklzxcvb@api.test/x', status: 500, ms: 1, t: 200 });
+  const plain = [
+    'postgres://postgres@db.example.com/app', 'sftp://sftp@files.example.com/in', 'https://administrator@host.example/',
+    'ssh://hg@bitbucket.org/team/repo', 'mysql://mysql@db.example.com/app', 'https://rhythm@a.example/',
+  ];
+  plain.forEach((text, index) => report.consoleLines.push({ level: 'warn', text, t: 120 + index }));
+  const prompt = buildPrompt(report);
+  for (const [, token] of tokens) assert.ok(!prompt.includes(token), `${token} printed`);
+  assert.ok(!prompt.includes('hjklzxcvb'));
+  for (const text of plain) assert.ok(prompt.includes(text), `changed: ${text}`);
+});
+
+// A one time payment nonce (Braintree's payment_method_nonce, Square's
+// cardNonce) is spent like a card number, and WordPress's _wpnonce is its
+// CSRF token; none was a secret name.
+test('prompt: a payment nonce in a url, a parameter or a JSON state is masked (F43)', () => {
+  const report = sampleReport('bug');
+  report.network.push(
+    { method: 'POST', url: 'https://shop.test/checkout?payment_method_nonce=F43NONCEA&plan=pro', status: 500, ms: 1, t: 200 },
+    { method: 'GET', url: 'https://blog.test/wp-admin/post.php?post=7&action=trash&_wpnonce=F43NONCEB', status: 403, ms: 1, t: 201 }
+  );
+  report.consoleLines.push(
+    { level: 'warn', text: 'Retry /pay#paymentMethodNonce=F43NONCEC', t: 100 },
+    { level: 'warn', text: `Return to https://shop.test/done?state=${encodeURIComponent('{"cardNonce":"F43NONCED"}')}`, t: 101 },
+    { level: 'warn', text: 'Announcement https://shop.test/news?announce=F43KEPT', t: 102 }
+  );
+  const prompt = buildPrompt(report);
+  for (const marker of ['F43NONCEA', 'F43NONCEB', 'F43NONCEC', 'F43NONCED']) assert.ok(!prompt.includes(marker), `${marker} printed`);
+  assert.ok(prompt.includes('payment_method_nonce=<redacted>&plan=pro'));
+  assert.ok(prompt.includes('announce=F43KEPT'), 'announce was taken for a nonce');
+});
+
 test('prompt: an address run into a url keeps a secret value\'s numbers inside the mask, a Firefox stack keeps its positions (F25)', () => {
   const report = sampleReport('bug');
   const said = (text, t) => report.consoleLines.push({ level: 'warn', text, t });
@@ -1061,8 +1104,30 @@ test('prompt: with the page toggle off, a list gives the clock zone above the fi
   const late = buildPrompt(after).split('\n');
   assert.equal(late[late.indexOf('## Console and network') + 1], zone.replace('UTC,', 'UTC,'));
   assert.ok(late.indexOf(zone) > late.indexOf('## 3. What should change') && late.indexOf(zone) < firstLog(late));
-  // With the page on, the Captured line gives the zone, as before.
-  assert.ok(!buildPrompt(sampleReport('mixed')).includes('Clock times in the log'));
+});
+
+// F56: with the page on, a list split by item gave the zone of the log's
+// clock times only on the page section's Items captured line, after every
+// item and so below the lines it qualifies.
+test('prompt: with the page toggle on, a list split by item gives the clock zone above the first log line (F56)', () => {
+  const zone = 'Clock times in the log are UTC, on 2026-08-07 unless a line gives its date.';
+  const firstLog = (lines) => lines.findIndex((line) => /^\d\d:\d\d:\d\d\.\d{3} /.test(line));
+  const prompt = buildPrompt(sampleReport('mixed'));
+  const lines = prompt.split('\n');
+  assert.equal(prompt.split(zone).length, 2, 'said once');
+  assert.ok(lines.indexOf(zone) < lines.indexOf('## 1. What should change'), 'given after the items');
+  assert.ok(lines.indexOf(zone) < firstLog(lines));
+  assert.ok(lines.includes('- Items captured: 2026-08-07 20:49:02 to 20:51:33 UTC'), 'the page section lost its zone');
+  // A log printed whole, or only after the last capture, comes below the page
+  // section, whose Captured line gives the zone, so nothing more is said.
+  assert.ok(!buildPrompt(sampleReport('bug')).includes('Clock times in the log'));
+  const after = sampleReport('mixed');
+  for (const list of [after.consoleLines, after.errors, after.network]) {
+    for (const entry of list) entry.t += 10 * 60 * 1000;
+  }
+  const late = buildPrompt(after);
+  assert.match(late, /\n## Logged after the last capture on this page\n/);
+  assert.ok(!late.includes('Clock times in the log'));
 });
 
 // R6: on a log the panel started late, the first item's share of it was
@@ -1363,4 +1428,474 @@ test('prompt: text whose escapes are all ASCII is decoded in one call, not one p
   assert.equal(calls(), 1);
   // A stray '%' or a byte past ASCII still goes run by run, as before.
   assert.equal(decodeLoosely('100% %41%C3%A9 %FF'), '100% Aé ÿ');
+});
+
+// F40: a query is read pair by pair, and a raw '&' (or &) in a string
+// of the JSON a value holds ended the pair, so the key after it was read as
+// no parameter at all. A request url is what the page passed, quotes and
+// all, and Chrome writes the page's own url with its quotes encoded and the
+// '&' left as it is.
+test('prompt: JSON that a raw "&" cuts into pairs is read whole, in a message, a request and the page (F40)', () => {
+  const report = sampleReport('bug');
+  const said = (text, t) => report.consoleLines.push({ level: 'warn', text, t });
+  said('GET /cb?s={"user":"a&b","token":"F40A"} 400', 100);
+  said('GET https://a.test/cb?s={"user":"a\\u0026b","token":"F40B"}', 101);
+  report.network.push({ method: 'GET', url: 'https://a.test/cb?s={"user":"a&b","token":"F40C"}&step=2', status: 500, ms: 1, via: 'fetch', t: 200 });
+  report.network.push({ method: 'GET', url: 'https://a.test/cb?s={%22user%22:%22a&b%22,%22token%22:%22F40D%22}', status: 500, ms: 1, via: 'xhr', t: 201 });
+  report.page.url = 'http://localhost:3000/cb?s={%22user%22:%22a&b%22,%22token%22:%22F40E%22}';
+  const prompt = buildPrompt(report);
+  for (const marker of ['F40A', 'F40B', 'F40C', 'F40D', 'F40E']) assert.ok(!prompt.includes(marker), `${marker} printed`);
+  for (const kept of ['GET /cb?s=<redacted> 400', 'https://a.test/cb?s=<redacted>&step=2', '- URL: /cb?s=<redacted>\n']) {
+    assert.ok(prompt.includes(kept), `${kept} is missing`);
+  }
+  // JSON with a '&' and nothing secret prints as it was written.
+  const clean = sampleReport('bug');
+  const plain = ['GET /s?f={"q":"salt & pepper","page":2} 400', 'GET /s?f={%22q%22:%22salt%20&%20pepper%22,%22page%22:2}'];
+  plain.forEach((text, index) => clean.consoleLines.push({ level: 'warn', text, t: 100 + index }));
+  clean.network.push({ method: 'GET', url: '/s?f={"q":"salt & pepper","page":2}', status: 500, ms: 1, t: 200 });
+  const kept = buildPrompt(clean);
+  for (const text of plain) assert.ok(kept.includes(text), `changed: ${text}`);
+  assert.ok(kept.includes('GET /s?f={"q":"salt & pepper","page":2} -> 500'));
+});
+
+// F20: the quotes of JSON written out in a url end a run of url characters,
+// so in a message the url stopped at the first one, and no key of the JSON
+// was ever read: {"token":…} printed whole. Keys in single quotes, keys whose
+// quotes are escaped (JSON written into a string of other JSON) and keys
+// holding a \u escape were read nowhere.
+test('prompt: JSON written out in a url in a message is read past its quotes, in either quote and escaped (F20)', () => {
+  const report = sampleReport('bug');
+  const lines = [
+    'GET https://a.test/cb?state={"token":"F20J1"} 400',
+    'redirect /cb?state={"returnTo":"/home", "token": "F20J2"}',
+    "GET /cb?state={'token':'F20J3'}",
+    '{"next":"/cb?state={\\"token\\":\\"F20J4\\"}","n":1}',
+    'GET /cb?s="{\\"token\\":\\"F20J5\\"}" 400',
+    'GET /cb?state={"user":{"name":"a b"},"list":["x","y"],"sessionId":"F20J6"}&step=2',
+    // An apostrophe between letters belongs to the url: encodeURIComponent
+    // leaves the quotes of JSON in single quotes as they are.
+    "GET /cb?s=%7B'token'%3A'F20J7'%7D",
+    "GET /search?q=don't&token=F20J8",
+    // A url whose value is a string of JSON, logged in JSON: escaped twice.
+    JSON.stringify({ next: `https://a.test/x#n=${JSON.stringify(JSON.stringify({ token: 'F20J9' }))}` }),
+  ];
+  lines.forEach((text, index) => report.consoleLines.push({ level: 'warn', text, t: 100 + index }));
+  const prompt = buildPrompt(report);
+  for (const line of lines) {
+    const marker = /F20J\d/.exec(line)[0];
+    assert.ok(!prompt.includes(marker), `${marker} printed: ${lineOf(prompt, `[warn] ${line.slice(0, 12)}`)}`);
+  }
+  for (const kept of ['[warn] GET https://a.test/cb?state=<redacted> 400\n', '{"next":"/cb?state=<redacted>","n":1}', 'GET /cb?state=<redacted>&step=2', 'q=don\'t&token=<redacted>']) {
+    assert.ok(prompt.includes(kept), `${kept} is missing`);
+  }
+});
+
+test('prompt: keys in single quotes, with escaped quotes or with escapes, and JSON with no name, are read in request and page urls (F20)', () => {
+  const report = sampleReport('bug');
+  const urls = [
+    "https://a.test/cb#s={'user':'a&b','token':'F20K1'}",
+    'https://a.test/cb?s="{\\"token\\":\\"F20K2\\"}"',
+    `https://a.test/cb?s=${encodeURIComponent(JSON.stringify(JSON.stringify({ token: 'F20K3' })))}`,
+    'https://a.test/cb?s={"\\u0074oken":"F20K4"}',
+    'https://a.test/app#{"view":"grid","token":"F20K5"}',
+  ];
+  urls.forEach((url, index) => report.network.push({ method: 'GET', url, status: 500, ms: 1, t: 200 + index }));
+  report.page.url = "http://localhost:3000/cb#s={'user':'a&b','sessionId':'F20K6'}";
+  const prompt = buildPrompt(report);
+  for (const marker of ['F20K1', 'F20K2', 'F20K3', 'F20K4', 'F20K5', 'F20K6']) assert.ok(!prompt.includes(marker), `${marker} printed`);
+  assert.ok(prompt.includes('https://a.test/app#<redacted>'));
+});
+
+test('prompt: JSON in a data: url\'s content is read, and so is text in one that says ;base64 (F20)', () => {
+  const report = sampleReport('bug');
+  const enc = encodeURIComponent;
+  const cases = [
+    ['text', 'data:application/json,{"token":"F20D1"}'],
+    ['text', `data:application/json,${enc('{"a":"b?c","apiKey":"F20D2"}')}`],
+    ['url', 'data:application/json,{"a":"b?c","token":"F20D3"}'],
+    ['url', `data:text/html;base64,${enc('<a href="https://a.test/?token=F20D4">x</a>')}`],
+    ['text', `Failed to load data:text/html;base64,${enc('<a href="https://a.test/?token=F20D5">x</a>')}`],
+  ];
+  cases.forEach(([via, text], index) => {
+    if (via === 'text') report.consoleLines.push({ level: 'warn', text, t: 100 + index });
+    else report.network.push({ method: 'GET', url: text, status: 500, ms: 1, t: 200 + index });
+  });
+  const prompt = buildPrompt(report);
+  for (let index = 1; index <= cases.length; index += 1) assert.ok(!prompt.includes(`F20D${index}`), `F20D${index} printed`);
+  // Both lines print the same, so they are folded into one.
+  assert.ok(prompt.includes('[warn] data:application/json,<redacted> (×2'));
+  // Base64 content, an svg and JSON with nothing secret print as they were.
+  const clean = sampleReport('bug');
+  const plain = [
+    'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==',
+    'data:application/json;base64,eyJuYW1lIjoieCJ9', 'data:application/json,{"name":"x","page":1}',
+    "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg'%3E%3Cpath fill='%23fff' d='M0'/%3E%3C/svg%3E",
+  ];
+  plain.forEach((text, index) => clean.consoleLines.push({ level: 'warn', text, t: 100 + index }));
+  const kept = buildPrompt(clean);
+  for (const text of plain) assert.ok(kept.includes(text), `changed: ${text.slice(0, 50)}`);
+});
+
+// The runs a url is now read past and the quotes it is read through must not
+// take in ordinary text, which prints as it was.
+test('prompt: quotes and brackets near a url in ordinary text print as they were', () => {
+  const report = sampleReport('bug');
+  const plain = [
+    '{"url":"https://api.example.com/v1/items?page=2&sort=desc","status":500}', '[{"href":"https://a.test/x"},{"href":"https://b.test/y?z=1"}]',
+    'Fetch failed for "https://api.example.com/items?ids=[1,2,3]" with 404', '<a href="https://a.test/x?ref=nav">Home</a> <img src="https://a.test/logo.png?v=2">',
+    'console: https://example.com/?q={"term":"it\'s fine","page":3}', 'WARN https://a.test/x?q=[ "a", "b" ] trailing text here',
+    "url=https://a.test/x?a=1 data='{\"k\":\"v\"}'", "fetch('https://a.test/api?x=[1]').then(r => r.json())", "Can't load https://a.test/x?id=1's",
+    'https://a.test/x?a={"b":1}"tail" and more', 'Retrying ["https://a.test/x?y=1","https://a.test/z"]', 'https://a.test/x?q=[it\'s broken] more words',
+    'GET /api/items?where={"status":{"$in":["open","closed"]}} 500', 'Message: "Visit https://a.test/x?y={\\"a\\":1} now"',
+  ];
+  plain.forEach((text, index) => report.consoleLines.push({ level: 'warn', text, t: 100 + index }));
+  const prompt = buildPrompt(report);
+  for (const text of plain) assert.ok(prompt.includes(text), `changed: ${text}`);
+});
+
+// F55: the scheme of an absolute url was looked for from every letter that
+// starts a word, reading on through up to 32 characters a scheme can hold,
+// and in dotted names (t.o.k.e.n.…) every letter starts one. A megabyte of
+// them took 70 ms in a message where plain parameters take 8, the encoded
+// scheme as much again; about 4 ms each now that both are found by their
+// '://'. The limit is three times plain, at least 40 ms.
+test('prompt: a megabyte of dotted names in a message is screened in bounded time (F55)', () => {
+  const MB = 1 << 20;
+  const fill = (unit) => {
+    let text = '';
+    for (let index = 0; text.length < MB; index += 1) text += unit(index.toString(36));
+    return text.slice(0, MB);
+  };
+  const put = (report, text) => report.consoleLines.push({ level: 'warn', text, t: 50 });
+  const limit = megabyteBudget(put, 40);
+  const dotted = fill((index) => `${'t.o.k.e.n.'.repeat(8)}${index}=1&`);
+  for (const text of [dotted, `${dotted} https://a.test/`, `${dotted} https%3A%2F%2Fa.test%2F`, fill((index) => `a.b.c.d.e.f.g.h.i.${index}.`)]) {
+    const report = sampleReport('bug');
+    put(report, text);
+    const { took } = timedPrompt(report, limit);
+    assert.ok(took < limit, `${text.slice(-24)} took ${Math.round(took)} ms, over ${Math.round(limit)}`);
+  }
+});
+
+// The scheme patterns were rewritten to be found by their '://', and must
+// find a url where the old ones did, from the same character.
+test('prompt: the scheme patterns start a url where the patterns before them did', () => {
+  const source = readFileSync(new URL('../shared/prompt-template.js', import.meta.url), 'utf8');
+  const pattern = (name) => new Function(`${/const SCHEME = [^\n]+/.exec(source)[0]}\nconst ENCODED_SCHEME =${source.split('const ENCODED_SCHEME =')[1].split(';\n')[0]};\nreturn ${name};`)();
+  const SCHEME = pattern('SCHEME');
+  const ENCODED_SCHEME = pattern('ENCODED_SCHEME');
+  const OLD_SCHEME = /\b[a-z][a-z0-9+.-]{0,31}:\/\//i;
+  const OLD_ENCODED =
+    /(?:(?<=%[0-9a-f]{2})|(?<![a-z]))(?!(?<=%[0-9a-f])[0-9a-f])(?!(?<=%)[0-9a-f]{2})[a-z][a-z0-9+.-]{0,31}%(?:25)*3A%(?:25)*2F%(?:25)*2F/i;
+  const parts = ['a', 'B', 'h', 'ttps', 'x', 'D', 'e', '1', '9', '.', '-', '+', '_', ':', '/', '//', '://', '%', '%3', '%3A', '%2F', '%25', '25', '3A', '2F', '%3A%2F%2F', '%253A%252F%252F', '%3a%2f%2f', ' ', '?', '@', 'é', 'aaaaaaaaaaaaaaaa', 'a.b.c.d.e.f.g.h.'];
+  // mulberry32, a fixed sequence with a long period, so a failure can be run again.
+  let seed = 3;
+  const random = () => {
+    seed = (seed + 0x6d2b79f5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+  const start = (match, read) => (match ? (read ? match.index - match[1].length : match.index) : -1);
+  for (let count = 0; count < 100000; count += 1) {
+    let text = '';
+    for (let length = 1 + (count % 14); length > 0; length -= 1) text += parts[Math.floor(random() * parts.length)];
+    assert.equal(start(SCHEME.exec(text), true), start(OLD_SCHEME.exec(text), false), JSON.stringify(text));
+    assert.equal(start(ENCODED_SCHEME.exec(text), true), start(OLD_ENCODED.exec(text), false), JSON.stringify(text));
+  }
+});
+
+// What F40 and F20 now read is read in one pass: JSON that never closes,
+// quotes and apostrophes by the thousand, and a url per JSON.
+test('prompt: JSON read past its quotes in a message costs one pass', () => {
+  const rep = (s) => s.repeat(Math.ceil(500_000 / s.length)).slice(0, 500_000);
+  const places = {
+    message: (report, text) => report.consoleLines.push({ level: 'warn', text, t: 50 }),
+    'request url': (report, text) => report.network.push({ method: 'GET', url: text, status: 500, ms: 1, via: 'fetch', t: 51 }),
+  };
+  for (const text of [
+    '/x?s={' + rep('"'), '/x?s={' + rep("'a"), '/x?s=[' + rep('\\"'), '/x?s={' + rep('"a":"b",'), rep('/x?s={"a":1}"'), rep('/x?s="{a}"'),
+    '/x?s=' + rep("a'b"), '/x?s=' + rep("%7B'a'%3A'b'%7D"), '/x?s=' + rep('{"u":"a&b","n":1}&s='), '/x?s=' + rep('{\\"a\\":\\"b\\"}'), rep('\\'), '/x?s={' + rep('['),
+    'data:,' + rep('"a":1,'), 'data:,' + rep("'a'"),
+  ]) {
+    for (const [place, put] of Object.entries(places)) {
+      const report = sampleReport('bug');
+      put(report, text);
+      const { took } = timedPrompt(report, 500);
+      assert.ok(took < 500, `${place} ${text.slice(0, 10)}… took ${Math.round(took)} ms`);
+    }
+  }
+});
+
+// V1-1: splitJson read the whole query again for every JSON it hid, decoded
+// every key before asking whether it had been seen, and pathOf ran several
+// times a prompt. The page url Chrome gives for a fragment of a megabyte of
+// single quoted keys, then ten JSON a raw '&' cuts, took 0.4 to 0.9 s. Every
+// key and every span is now found in one pass, and a prompt shows each url
+// once. About 20 to 30 ms now. The limit is megabyteBudget of a plain request
+// url in every place: the page place's own plain cost grew with each pathOf
+// a prompt ran, so a budget made from it grew with the fault it checks.
+test('prompt: a megabyte page url in the form Chrome writes, with ten JSON a raw "&" cuts, is screened in bounded time (V1-1)', () => {
+  const MB = 1 << 20;
+  const marker = 'V11' + 'SPAN';
+  const tail = `&g={'u':'&','token':'${marker}'}`.repeat(10);
+  const page = (url, item) => (report) => {
+    report.page = { ...report.page, url };
+    report.items[0].url = item ?? url;
+  };
+  const places = [
+    ['page and item on one origin', (report, part) => page(`http://localhost:3000/checkout#${part}`)(report)],
+    ['page on its own origin', (report, part) => page(`http://localhost:3000/checkout#${part}`, 'https://other.test/')(report)],
+    ...MEGABYTE_PLACES,
+  ];
+  const limit = megabyteBudget(MEGABYTE_PLACES[0][1], 150);
+  for (const unit of ["'a':1,", "'\\u0061':1,"]) {
+    const fragment = 'f={' + unit.repeat(Math.ceil(MB / unit.length)).slice(0, MB - tail.length - 4) + '}' + tail;
+    for (const [place, put] of places) {
+      const report = sampleReport('bug');
+      put(report, fragment);
+      const { prompt, took } = timedPrompt(report, limit);
+      assert.ok(!prompt.includes(marker), `${unit} in a ${place}: printed`);
+      assert.ok(took < limit, `${unit} in a ${place} took ${Math.round(took)} ms, over ${Math.round(limit)}`);
+    }
+  }
+});
+
+// V1-6: splitJson ran its patterns and a second decode on every url printed,
+// and a data: url's content was decoded once more than anything in it could
+// need, so a megabyte message of short urls carrying JSON took 2 to 3 times
+// what 0.6.0 took. 0.6.0 took 0.55 to 0.75 times the plain a=1& message; each
+// shape now takes 0.9 to 1.25 times it, within twice 0.6.0. The limit, 1.5
+// times the plain message, best of five each, scales with the machine.
+test('prompt: a megabyte message of short urls carrying JSON costs about what a plain one does (V1-6)', () => {
+  const MB = 1 << 20;
+  const fill = (unit) => unit.repeat(Math.ceil(MB / unit.length)).slice(0, MB);
+  const best = (text) => {
+    const report = sampleReport('bug');
+    report.consoleLines.push({ level: 'warn', text, t: 50 });
+    let least = Infinity;
+    for (let run = 0; run < 5; run += 1) {
+      const started = performance.now();
+      buildPrompt(report);
+      least = Math.min(least, performance.now() - started);
+    }
+    return least;
+  };
+  const plain = best(`GET /x?${fill('a=1&')}`);
+  for (const unit of ['/x?s={"a":1}%20 ', '/x?s={"\\u0061":1}%20 ', 'data:,{"a":"b"}%20 ', 'data:,%7B%22a%22:1%7D?x ']) {
+    const took = best(fill(unit));
+    assert.ok(took < 1.5 * plain, `${unit} took ${Math.round(took)} ms, a plain message ${Math.round(plain)}`);
+  }
+});
+
+// V1-2: what runEnd and jsonUrlEnd read on into is read as the tail of the
+// first url, which missed what 0.6.0 masked when it read the runs as urls of
+// their own: a second url's ;jsessionid=, or one in a data: url's content.
+// An absolute url in data: content is now read as one, path parameters too,
+// while an svg's styles are still no parameters.
+test('prompt: text a url is read on into is screened as well as on its own, and a data: url\'s links keep no ;jsessionid= (V1-2)', () => {
+  const report = sampleReport('bug');
+  const said = (text, t) => report.consoleLines.push({ level: 'warn', text, t });
+  said("Image failed: data:image/svg+xml,%3Csvg%3E%3Ctext%3EDon't%20panic%3C/text%3E%3Cimage%20href%3D%22https://a.test/i.png;jsessionid=V12A%22/%3E%3C/svg%3E", 100);
+  said("data:text/html,x='{ see https://a.test/app;jsessionid=V12B", 101);
+  said("data:,it's https://a.test/x;jsessionid=V12C", 102);
+  said("data:,don'thttps://a.test/x;jsessionid=V12D", 103);
+  report.network.push({ method: 'GET', url: 'data:text/html,<a href="https://a.test/x;jsessionid=V12E">x</a>', status: 500, ms: 1, t: 200 });
+  const svg = "data:image/svg+xml,<svg><style>.a{fill:%23fff;stroke:red}</style><a href='https://a.test/p'>x</a></svg>";
+  said(svg, 104);
+  const prompt = buildPrompt(report);
+  for (const marker of ['V12A', 'V12B', 'V12C', 'V12D', 'V12E']) assert.ok(!prompt.includes(marker), `${marker} printed`);
+  assert.ok(prompt.includes(svg), 'an svg with a link and styles changed');
+});
+
+// V1-7: a pair with no name was skipped, so a url in its value printed with
+// its secret. Its value is now read as any other.
+test('prompt: a url in the value of a pair with no name is screened (V1-7)', () => {
+  const report = sampleReport('bug');
+  report.consoleLines.push({ level: 'warn', text: 'GET /x?a=1&=https://b.test/cb?token=V17A', t: 100 });
+  report.consoleLines.push({ level: 'warn', text: "hash #=O'Neil#access_token=V17B", t: 101 });
+  report.network.push({ method: 'GET', url: 'https://a.test/x?=https://b.test/cb?token=V17C', status: 500, ms: 1, t: 200 });
+  report.page.url = 'http://localhost:3000/checkout#=%2Fcb%3Ftoken%3DV17D';
+  const prompt = buildPrompt(report);
+  for (const marker of ['V17A', 'V17B', 'V17C', 'V17D']) assert.ok(!prompt.includes(marker), `${marker} printed`);
+  assert.ok(prompt.includes('https://b.test/cb?token=<redacted>'));
+});
+
+// V1-4: a quoted word before a colon counted as a key anywhere, so a case
+// label, a ternary or a question in a search hid a data: url or a query that
+// 0.6.0 printed. A key counts where JSON puts one: after a '{' or a ',',
+// raw or encoded, and any white space. A key with escaped quotes, one in
+// single quotes, and one a raw '&' cut off from its bracket still count.
+test('prompt: only a key where JSON puts one hides JSON, in either quote and escaped (V1-4)', () => {
+  const report = sampleReport('bug');
+  const plain = [
+    "data:text/html,<script>switch (mode) { case 'code': run(); break; default: stop(); }</script><p>Hello</p>",
+    "data:text/html,<script>const store = persist ? 'session' : 'local';</script><p>Hello</p>",
+    "https://a.test/x?q=what's 'code': 5&f=[1]",
+  ];
+  plain.forEach((url, index) => report.network.push({ method: 'GET', url, status: 500, ms: 1, t: 200 + index }));
+  const secret = [
+    "data:application/json,{'token':'V14A'}",
+    'data:application/json,{"a":"{\\"token\\":\\"V14B\\"}"}',
+    "https://a.test/cb?s={'u':'a&b', 'token':'V14C'}",
+    'https://a.test/cb?s={"n":1,\n "sessionId":"V14D"}',
+  ];
+  secret.forEach((url, index) => report.network.push({ method: 'GET', url, status: 500, ms: 1, t: 210 + index }));
+  const prompt = buildPrompt(report);
+  for (const url of plain) assert.ok(prompt.includes(url), `changed: ${url}`);
+  for (const marker of ['V14A', 'V14B', 'V14C', 'V14D']) assert.ok(!prompt.includes(marker), `${marker} printed`);
+});
+
+// V1-3: JSON in single quotes encoded twice (%2527, %253A), as a return
+// address holding an encoded state arrives, and keys whose quotes are written
+// ", printed. Keys are now found with their quotes, braces, commas and
+// colons written raw, as " or ', or percent encoded to any depth.
+test('prompt: JSON with its quotes encoded twice, or written as \\u0022, is read (V1-3)', () => {
+  const report = sampleReport('bug');
+  const twice = (text) => encodeURIComponent(encodeURIComponent(text));
+  const urls = [
+    `https://a.test/cb?s=${twice("{'token':'V13A'}")}`,
+    `https://a.test/cb?next=%2Fdone&s=${twice("{'u':'a',")}&b${twice(",'token':'V13B'}")}`,
+    'https://a.test/cb?s={\\u0022token\\u0022:\\u0022V13C\\u0022}',
+    `https://a.test/cb?s=${twice('{"user":"a",')}&b${twice(',"access_token":"V13D"}')}`,
+  ];
+  urls.forEach((url, index) => report.network.push({ method: 'GET', url, status: 500, ms: 1, t: 200 + index }));
+  report.consoleLines.push({ level: 'warn', text: `GET /cb?state=${twice("{'sessionId':'V13E'}")}`, t: 100 });
+  const prompt = buildPrompt(report);
+  for (const marker of ['V13A', 'V13B', 'V13C', 'V13D', 'V13E']) assert.ok(!prompt.includes(marker), `${marker} printed`);
+  // JSON encoded twice with nothing secret prints as it was.
+  const clean = sampleReport('bug');
+  const kept = `https://a.test/cb?s=${twice("{'view':'grid','page':2}")}`;
+  clean.network.push({ method: 'GET', url: kept, status: 500, ms: 1, t: 200 });
+  assert.ok(buildPrompt(clean).includes(kept));
+});
+
+// V1-5: F52's five consonants in a row counted English and German letter
+// groups as several, so surnames (armstrong, schmidt with an initial,
+// dijkstra) and service accounts (pgsql, mssql, httpd, lightdm) lost the user
+// name 0.6.0 printed. A group (sch, tch, ght, str, sql, ch, th, ...) now
+// counts as one consonant; a random token is caught about as often.
+test('prompt: a user name made of letter groups stays, a random token still goes (V1-5)', () => {
+  const report = sampleReport('bug');
+  const plain = [
+    'https://armstrong@a.example/', 'ssh://jschmidt@bitbucket.org/team/repo.git', 'https://dijkstra@a.example/x',
+    'postgres://pgsql@db.example.com/app', 'mssql://mssql@db.example.com/app', 'sftp://httpd@files.example.com/in',
+    'ssh://lightdm@host.example/', 'https://tmcbride@a.example/',
+  ];
+  plain.forEach((text, index) => report.consoleLines.push({ level: 'warn', text, t: 100 + index }));
+  const tokens = ['xkcdqwertyzpqlm', 'qmzbtrwhalk', 'hjklzxcvb'];
+  tokens.forEach((token, index) => report.consoleLines.push({ level: 'warn', text: `https://${token}@a.test/`, t: 120 + index }));
+  const prompt = buildPrompt(report);
+  for (const text of plain) assert.ok(prompt.includes(text), `changed: ${text}`);
+  for (const token of tokens) assert.ok(!prompt.includes(token), `${token} printed`);
+});
+
+// W1-1: every absolute url in a data: url's content was screened as a url
+// again on each decoded layer, so a megabyte of ';x=1' path parameters behind
+// an escape encoded six times took 240 ms a url, against 2 ms in 0.6.0. Only
+// the names of its path parameters are read now, once, in the last layer:
+// about 25 ms. W1-4: that url ran on through encodeURI'd markup, whose
+// quotes and spaces are %22 and %20, so an entity's ';' and the words up to a
+// later '=' read as a secret parameter and hid ordinary html. It now ends at
+// a quote, '<', '>' or space, raw or encoded, and only a name made of url
+// characters counts.
+test('prompt: a data: url\'s links are read for path parameters once, by name, and ordinary html stays (W1-1, W1-4)', () => {
+  const href = `data:,http://h/%2525252525253D${';x=1'.repeat((1 << 18) - 10)}`;
+  const [place, put] = MEGABYTE_PLACES[0];
+  const limit = megabyteBudget(put, 150);
+  const report = sampleReport('bug');
+  report.network.push({ method: 'GET', url: href, status: 500, ms: 1, t: 50 });
+  const { prompt, took } = timedPrompt(report, limit);
+  assert.ok(took < limit, `a ${place} took ${Math.round(took)} ms, over ${Math.round(limit)}`);
+  assert.ok(prompt.includes(href), 'a data: url with no secret changed');
+  const kept = [
+    `data:text/html,${encodeURI('<a href="https://a.test/">Home</a>&nbsp;&middot;&nbsp;Account settings <a href="/settings">open</a>')}`,
+    `data:text/html,${encodeURI('<a href="https://a.test/help">Help</a><p style="color:red;font-weight:bold">Your account is locked=true</p>')}`,
+    'data:text/css,body{background:url(https://cdn.test/bg.png);font-family:Inter}.token-balance{width=1}',
+  ];
+  const plain = sampleReport('bug');
+  kept.forEach((url, index) => plain.network.push({ method: 'GET', url, status: 500, ms: 1, t: 200 + index }));
+  plain.network.push({ method: 'GET', url: `data:text/html,${encodeURI('<img src="https://a.test/i.png;jsessionid=W14A">')}`, status: 500, ms: 1, t: 210 });
+  const printed = buildPrompt(plain);
+  for (const url of kept) assert.ok(printed.includes(url), `changed: ${url.slice(0, 60)}`);
+  assert.ok(!printed.includes('W14A'), 'a ;jsessionid= in an encoded link printed');
+});
+
+// W1-2: a key counted only with its quote straight after the '{' or ',' and
+// white space, so Python's repr of a dict, whose strings carry a prefix
+// ({u'token': u'…'}, {b'token': b'…'}), printed. W1-3: a url whose JSON is
+// all in one value is handed back on the strength of nestedUrl having read
+// it, which decoded only on an encoded '"', '?', '#' or '@', so single quoted
+// keys that show only once decoded ({%5C%27token%5C%27:…}, {%5Cn%27token%27:…})
+// printed. It decodes on an encoded apostrophe or backslash too, when a colon
+// can follow. Round four took that decode to where a '{' or ',' can start a
+// key, for what decoding prose and paths cost, and three shapes printed
+// again: a key in raw double quotes whose colon is encoded, credentials in an
+// encoded link, and a '{' written as escapes of its digits. They decode too.
+test('prompt: keys with a string prefix, or in single quotes that show only once decoded, are read (W1-2, W1-3)', () => {
+  const report = sampleReport('bug');
+  const urls = [
+    "https://a.test/cb?state={u'next': u'/a&b', u'token': u'W12A'}",
+    'https://a.test/cb?state={u%27next%27:%20u%27/home%27,%20u%27token%27:%20u%27W12B%27}',
+    "https://a.test/cb?state=%7Bu'next'%3A%20u'%2Fhome'%2C%20u'token'%3A%20u'W12C'%7D",
+    "https://a.test/cb?state={b'token': b'W12D'}",
+    'https://a.test/cb?state={%5C%27token%5C%27:%5C%27W13A%5C%27}',
+    'https://a.test/cb?state={%5Cn%27token%27:%27W13B%27}',
+    "https://a.test/cb?state={%27token':'W13C'}",
+    'https://a.test/app#state={%5C%27token%5C%27:%5C%27W13D%5C%27}',
+    'https://a.test/cb?s="token"%3A"W14A%27x"',
+    'https://a.test/cb?next=ftp%3A//admin%3AW14B@files.test/it%27s.txt',
+    'https://a.test/cb?s=%25%37%42%27token%27:%27W14C%27%25%37%44',
+  ];
+  urls.forEach((url, index) => report.network.push({ method: 'GET', url, status: 500, ms: 1, t: 200 + index }));
+  report.page.url = "http://localhost:3000/cb?state={u'token': u'W12E'}";
+  report.consoleLines.push({ level: 'warn', text: 'GET /cb?state={%5Cn%27token%27:%27W13E%27} 500', t: 100 });
+  const prompt = buildPrompt(report);
+  for (const marker of ['W12A', 'W12B', 'W12C', 'W12D', 'W12E', 'W13A', 'W13B', 'W13C', 'W13D', 'W13E', 'W14A', 'W14B', 'W14C']) {
+    assert.ok(!prompt.includes(marker), `${marker} printed`);
+  }
+  // A prefixed string in a ternary is no key, and an encoded apostrophe with
+  // no colon after it is left as written.
+  const clean = sampleReport('bug');
+  const kept = [
+    "data:text/html,<script>t = x ? u'session' : 2</script>",
+    'https://a.test/s?q=it%27s%20fine&f=[1]',
+    'https://a.test/s?q=it%27s:1&p=C%3A%5Cdir',
+  ];
+  kept.forEach((url, index) => clean.network.push({ method: 'GET', url, status: 500, ms: 1, t: 200 + index }));
+  const printed = buildPrompt(clean);
+  for (const url of kept) assert.ok(printed.includes(url), `changed: ${url}`);
+});
+
+// V3-picker-3 (F37): a pick inside a closed shadow root carries the component
+// and handlers the page's world read from that root's host, counted from the
+// element through the host. The prompt says whose they are, and does not
+// claim the framework did not render the element itself, which that world
+// cannot see. Without closedHost the same component reads as before.
+test('prompt: a component read through a closed shadow root is said to be its host\'s', () => {
+  const report = sampleReport('bug');
+  const element = report.items[0].element;
+  element.selector = '#sealed >>> button.pay';
+  Object.assign(element.component, { hops: 2, closedHost: 'x-sealed.card' });
+  element.handlers = { hops: 2, label: 'x-sealed.card', list: ['onClick=ƒ pay'] };
+  const prompt = buildPrompt(report);
+  assert.ok(
+    prompt.includes(
+      'Component: `Total` (React, development build). The selected element is inside the closed shadow root of ' +
+        "`x-sealed.card`, which the page's own scripts cannot see into; this is the component nearest that host, " +
+        '2 DOM elements up.\n'
+    ),
+    prompt
+  );
+  assert.ok(!prompt.includes('not rendered by'));
+  assert.ok(prompt.includes('Handlers on `x-sealed.card`, 2 elements up the DOM, not on the picked element: onClick=ƒ pay\n'));
+  assert.ok(prompt.includes('Selector: `#sealed >>> button.pay`'), prompt);
+  element.component.closedHost = 'x`y\n## Injected';
+  assert.ok(buildPrompt(report).includes("closed shadow root of `x'y ## Injected`, which"));
+  delete element.component.closedHost;
+  assert.ok(
+    buildPrompt(report).includes(
+      'The selected element was not rendered by React itself; this is the nearest component node, 2 DOM elements up.\n'
+    )
+  );
 });
