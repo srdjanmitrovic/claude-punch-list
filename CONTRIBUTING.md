@@ -60,8 +60,9 @@ npm run prompt minified # the same, for a production build with no real componen
 npm run prompt reloaded # any other sample, by the name of its file in test/golden
 ```
 
-The tests use `node:test`, which ships with Node, so there is nothing to install. They live in
-`test/`:
+The tests use `node:test`, which ships with Node, so there is nothing to install but Node 22 or
+newer, as `package.json` asks (`engines` is `>=22`). CI runs them on Node 22 and 24, the lines
+still supported. They live in `test/`:
 
 * `test/prompt.test.mjs` renders the template against the samples in `tools/preview-prompt.mjs`,
   plus every variation in its `EXTRA` table, which the preview also renders by name, and compares
@@ -73,23 +74,32 @@ The tests use `node:test`, which ships with Node, so there is nothing to install
 * `test/bridge.test.mjs` runs `content/collector-bridge.js` and `content/collector-main.js`
   together in one `node:vm` realm: the handshake over the bridge's channel whichever half starts
   first, what the bridge does with an answer that is not the collector's, the fallback to
-  `window.postMessage` for a collector of 0.5.0 still running in a tab, and the page facts it
-  hands the panel.
+  `window.postMessage` for a collector of 0.5.0 still running in a tab, the page facts it hands
+  the panel, and the counts it posts on the panel's `cdr:counts` port: as they change, at most
+  four times a second, again at every read, and nothing while no port is open, with the ports it
+  closes when it stops watching, also against a page that floods the change event or answers in
+  the collector's place.
 * `test/picker.test.mjs` runs the picker's masking block, lifted out of `content/picker.js`
   between its `MASKING BEGIN` and `MASKING END` markers, against markup a picked form produces.
 * `test/picker-events.test.mjs` runs `content/picker.js` in a `node:vm` realm against a model of
-  the page. The model keeps to behaviour observed in Chrome 156, listed at the top of the file:
-  frames take every pointer event over them unless an adopted style sheet of their tree gives
-  them `pointer-events: none`, disabled controls get pointer events and no mouse events, `:hover`
-  moves at a frame, everything outside an open modal dialog is inert, a closed shadow root hides
-  what is inside it, and window listeners run in the order they were added. When the picker
-  comes to rely on another browser behaviour, check it in Chrome first, then add it to the model
-  with a note of where it was seen.
+  the page. The model keeps to behaviour observed in Chrome 156, listed at the top of the file.
+  Frames take every pointer event over them unless an adopted style sheet of their tree gives
+  them `pointer-events: none` and no `!important` rule of the page's beats it. Disabled controls
+  get pointer events and no mouse events, `:hover` moves at a frame, and everything outside an
+  open modal dialog is inert. A closed shadow root hides what is inside it from the page but not
+  from `chrome.dom`. Window listeners run in the order they were added. A press or key grants
+  transient activation that `showPicker()` spends. A popover's `toggle` goes no further than its
+  own tree, and a frame's discrete transition of `pointer-events` holds its old value for half
+  its time. A test that needs the press gate runs `content/press-gate.js` in the realm first.
+  When the picker comes to rely on another browser behaviour, check it in Chrome first, then add
+  it to the model with a note of where it was seen.
 * `test/capture.test.mjs` runs `content/overlay.js`, `content/stop.js` and a second injection of
   `content/collector-bridge.js` in a `node:vm` realm against a stub DOM that keeps a tree,
-  listeners and a top layer and lays nothing out (how the overlay looks was checked in Chrome),
-  runs the crop lifted out of `sidepanel/panel.js` against a canvas that records what it draws,
-  and holds the worker and the panel to who may ask for what: a content script cannot arm,
+  listeners, a top layer, a fullscreen element and shadow roots (closed ones behind a stand in for
+  `chrome.dom.openOrClosedShadowRoot`) and a clock that each frame moves on by one frame of a
+  display at 60 Hz or another rate, and lays nothing out (how the overlay looks was checked in
+  Chrome), runs the crop lifted out of `sidepanel/panel.js` against a canvas that records what it
+  draws, and holds the worker and the panel to who may ask for what: a content script cannot arm,
   disarm or start a collector, closing the panel disarms the tab it held, and a tab with no
   collector gets one only where the manifest declares one.
 * `test/worker.test.mjs` runs `background.js` in a `node:vm` realm against a model of the pages
@@ -102,7 +112,8 @@ The tests use `node:test`, which ships with Node, so there is nothing to install
 * `test/panel-ui.test.mjs` runs the panel in the same realm, with `panel.html` and `panel.css`
   read as text, and checks what it says and where the keyboard goes: the live regions, the line
   under Copy, the shortcut Chrome has bound, the contrast of muted text in both themes, the row
-  tooltip, the chips, and the keys handed on to the page while a mode is armed.
+  tooltip, the chips and the port that keeps them current, where focus goes after a copy, and the
+  keys handed on to the page while a mode is armed.
 * `test/sheet.test.mjs` runs one panel realm per window over one shared storage and one downloads
   list, as the side panels of two windows share them in Chrome, and checks what survives two
   windows writing at once, which files a discard, a copy or the weekly expiry deletes, and what
@@ -114,12 +125,18 @@ The tests use `node:test`, which ships with Node, so there is nothing to install
 * `test/build.test.mjs` runs `tools/build.mjs` on copies of the tree in a temporary folder and
   reads the zips it writes: LICENSE is in them, a file git does not track is not, CRLF line
   endings change nothing, a broken path, an import Chrome could not link, an `import()` whose path
-  the build cannot check, a syntax error or a file in an unresolved merge conflict fails the
-  build, git converts exactly the shipped files the build packs as text, and the archive for a
-  fixed input has a pinned checksum, so CI on two Node versions shows it does not depend on the
-  Node or the zlib that built it. It also holds
-  `tools/release-check.mjs` to the release rules below, against throwaway git repositories, and
-  the stage's download fake to Chrome's ids.
+  the build cannot check, a phase import, a syntax error or a file in an unresolved merge conflict
+  fails the build, an import check that never answers is stopped and named, a temp directory the
+  build cannot use fails it in words, a build removes the folders of builds stopped an hour
+  before, git converts exactly the shipped files the build packs as text, and the archive for a
+  fixed input has a pinned checksum, so CI on Node 22 and 24 shows it does not depend on the Node
+  or the zlib that built it. Each build runs with its stdin not connected and a limit of 60 s, and
+  its children with one of 15 s, so a stuck child is stopped by the build, which then removes its
+  folder. It also holds `tools/release-check.mjs` to the release rules below, against throwaway
+  git repositories, including a `git` or `gh` that never answers and leaves a child of its own
+  running, Ctrl+C on a local run, a tag lookup git cannot answer and a version file that is not
+  JSON. It holds the workflows to the Node versions `package.json` allows, every workflow job to a
+  time limit, and the stage's download fake to Chrome's ids.
 
 None of this runs Chrome. The worker and panel realms model the order in which Chrome was seen to
 run injections and deliver messages, and the picker's page model keeps to what Chrome was seen to
@@ -135,16 +152,24 @@ the collector, or anything to do with capture. A few constraints there are not o
 reading a single file, and breaking them tends to fail silently rather than loudly:
 
 * `content/collector-main.js` runs in the page's own JavaScript world and has no access to
-  `chrome.*`. It also runs on every page the user visits, so a defect there breaks real
-  websites. Every wrapper in it must preserve `this`, pass return values through, re-reject
-  rejections, and swallow its own errors. Wrap a native with `wrapNative()`, a Proxy with only an
-  apply trap, rather than a named function, so the wrapper keeps the native's name, length and
-  `toString`. The collector's own stack frames are recognised by its address, not by function
-  names. The log goes to the bridge over its channel and never over `window.postMessage`. While a
-  request on that channel is answered, read and send events only through the natives taken at
-  the top of the file (`detailOf`, `newEvent`, `cancel`), and add to an array with `append()`
-  rather than `push` or an index: a getter or a setter the page put on a prototype would
-  otherwise run with the request, and so the channel's name, on `window.event`.
+  `chrome.*`. It also runs on every page the user visits, so a defect there breaks real websites.
+  Every wrapper in it must preserve `this`, pass return values through, re-reject rejections, and
+  swallow its own errors. Wrap a native with `wrapNative()`, a Proxy with only an apply trap,
+  rather than a named function, so the wrapper keeps the native's name and length, and its
+  `toString` says `[native code]` (with no name, as V8 prints any callable proxy, where the
+  native's names itself: `function fetch() { [native code] }`). The collector's own stack frames
+  are recognised by its address, not by function names. The log goes to the bridge over its
+  channel and never over `window.postMessage`. While a request on that channel is answered, read
+  and send events only through the natives taken at the top of the file (`detailOf`, `newEvent`,
+  `cancel`), and add to an array with `append()` rather than `push` or an index: a getter or a
+  setter the page put on a prototype would otherwise run with the request, and so the channel's
+  name, on `window.event`. The collector tells a watching bridge that a ring grew
+  (`countsChanged`) only from `push()`, never from inside a request handler, for the same reason,
+  and only when 1,600 more calls fit on the stack (`roomToTell`): with less, Chrome could fail to
+  call the bridge's listener at all and report the failure in the tab as the extension's. A change
+  it could not tell then is told with the next entry, into a full ring too (`owed`). A ring a push
+  left long is cut back in one pass, never by a search of the ring per entry, which froze a page
+  for seconds.
 * The last line of `content/collector-main.js` is a hand written source map that puts the file on
   DevTools' ignore list. Without it, DevTools links every `console.warn`, `console.error` and
   failed request on every page to the collector instead of the page's own code. The same map
@@ -230,16 +255,53 @@ ships something under a version already tagged hears about it before it merges. 
 asks GitHub, so its message says only that the version is tagged, and never offers the way out
 through the tag. A change that ships nothing (docs, tests, tools) needs no bump.
 
-Before it writes the zip, the build checks every path the manifest, the worker and the panel
-name, links every module without running it, and parses every script. It also reads every dynamic
+Each `git` and `gh` call the check makes is stopped after a minute, and the run then fails and
+names the call in one line, so a hung one cannot hold the release workflow until GitHub's own six
+hour limit. On CI (`GITHUB_ACTIONS` is `true`, or `CI` is set) each call runs in a process group
+of its own, and what it started is stopped with it, except on Windows, which has no process
+groups. Locally the call stays in the terminal's group, so Ctrl+C stops it with the check, and a
+call that runs out of time is stopped while what it started itself keeps running, as in 0.6.0. The
+tag lookup takes only git's exit 1 to mean the version is not tagged; any other failure, such as
+git finding no repository, fails the run instead of releasing. A `manifest.json` or `package.json`
+that is not valid JSON is named, as a `SyntaxError`. The version check and the release build run
+on Node 24, and every workflow job has a time limit of its own (15 minutes for the tests and the
+version check, 20 for the release).
+
+Before it writes the zip, the build checks every path the manifest, the worker and the panel name,
+links every module without running it, and parses every script. It also reads every dynamic
 `import()` in a shipped script. A quoted path, or a template with nothing put into it, is checked
-as a static import is, with white space or comments allowed between `import` and its `(`. Any
-other path fails the build, and so does an `import()` in a file the build does not follow as a
-module (a content script, for example), because it cannot check what such an import would load.
-A method named `import` is no import, whether called (`loader.import(...)`) or defined
-(`import(name) {`). A definition whose parameters hold a `(` or a line break, a call with a
-comment between its `.` and `import`, and an `import(` inside a string or a comment are still read
-as imports, which can fail a build but never lets a broken one pass.
+as a static import is, with white space or comments allowed around the `(` and the path. Any other
+path fails the build, and so does an `import()` in a file the build does not follow as a module (a
+content script, for example), because it cannot check what such an import would load. A method
+named `import` is no import, whether called (`loader.import(...)`) or defined (`import(name) {`),
+nor is a private `#import`, nor an `import(` inside a string, a comment, a template or a regular
+expression. The build finds every `import` followed by `(` in the text, with any comment
+JavaScript allows between them, trying the pattern at each keyword `import` on its own, so a match
+that starts at an earlier one (`obj.import-->`, or `"import //"` in a string) cannot run on
+through a real `import()` and hide it. It then asks V8 which of them are imports. One is when the
+file parses as it is and stops parsing once that `import` is spelled `class `, since `class (` is
+never an expression while a method named `class` parses as well as one named `import`. In a file
+that does not parse, each one found counts, which can add a problem to a build that fails anyway
+but never lets a broken import pass. A phase import fails the build whatever Node runs it: a
+static `import source` or `import defer`, read from V8's own record of the module's imports, in a
+module the build follows and in one nothing imports, and a dynamic `import.source()` or
+`import.defer()`, found the same way as `import()`. Chrome 156 refuses all of them, while Node 24
+parses the source phase, so without this check the release build on Node 24 passed a panel Chrome
+cannot load. Line numbers in the build's messages count line feeds only, so after a lone carriage
+return, U+2028 or U+2029 they differ from V8's.
+
+The build's children take no input through a pipe. The import check runs as a child process
+(`node --experimental-vm-modules tools/build.mjs --link`) that reads every script from a JSON file
+in a new temporary folder and writes its answer to a file there. Its stdin and stdout are not
+connected, and the folder is removed when it ends. Data handed to a child on stdin through
+`spawnSync`'s `input` now and then never arrived on macOS, and the build then waited for good.
+Every child has a time limit of 120 s, after which it is killed and the build fails saying
+which. Node's own syntax check (`node --check`) runs only for a module V8 refused, to find the
+line of the error, since V8's message from `vm.SourceTextModule` gives none. A temporary folder
+that cannot be made or written (no such `TMPDIR`, a full disk) fails the build with one line per
+check that could not run, and no stack. A build stopped by a signal (Ctrl+C, a kill) never
+removes its folder, which holds a copy of every shipped script, so each build first removes the
+`punch-list-build-` folders in the temp directory that were last changed over an hour ago.
 
 The zip is reproducible. `node tools/build.mjs` packs only what git tracks (and says what it left
 out, or what was edited since the last commit), packs text with LF line endings whatever the

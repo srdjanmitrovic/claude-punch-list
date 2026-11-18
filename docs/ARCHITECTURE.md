@@ -20,12 +20,15 @@ sidepanel/panel.js ......... orchestrates everything. Captures the tab, crops
    |                         map of which tab is currently armed.
    |
    +-- content/overlay.js .. drag a rectangle (injected on demand)
+   +-- content/press-gate.js ISOLATED world, always on. Hands the picker
+   |                         the presses and keys first, while it picks.
    +-- content/picker.js ... hover and click an element (injected on demand),
    |                         and asks the main world what rendered it
    |                              |
-   +-- content/collector-bridge.js .. ISOLATED world, always on. Relays.
-        ^                             |
-        | channel events (the log)    | window.postMessage (inspect, from the picker)
+   +-- content/collector-bridge.js .. ISOLATED world, always on. Relays,
+        ^                             and posts the counts on a port to the panel.
+        | channel events              |
+        | (the log, the counts)       | window.postMessage (inspect, from the picker)
         v                             v
        content/collector-main.js .... MAIN world, always on. Wraps console,
                                       fetch and XHR from document_start, and
@@ -104,6 +107,53 @@ it could not put there by logging made up lines, which any page can do, and what
 the page's own console and network activity, which it could record anyway by wrapping the same
 functions.
 
+While the side panel is open and shown on a tab, it also holds a port to that tab's bridge,
+`cdr:counts`, opened with `chrome.tabs.connect` to the top frame once a read has found the
+collector (`watchCounts` in `sidepanel/panel.js`), with no relay through the worker. The bridge
+asks the collector over its channel to `watch` (`watchCounts` in `content/collector-bridge.js`).
+From then on a ring that grows says so once, with an empty `<channel>:changed` event
+(`countsChanged`), and says it again only after the bridge has asked for the `counts`. The bridge
+asks on a timer of its own world, at once after a quiet spell and then at most every 250 ms
+(`COUNTS_GAP_MS`), and posts the two counts to the port only when they change, checked as whole
+numbers and capped at 90 and 30. The gap's timer is set before the ask (`countsTick`), so a change
+said while the ask is answered waits for the gap too: a page that answered in the collector's
+place and said a change as it answered had each ask start a timer of its own, about 350,000 port
+posts in 5 s in Chrome. No log content crosses. With no port open the collector is not
+watching, and recording an entry costs one comparison more. A full ring does not grow, so a page
+that logs without pause past it costs nothing either. The signal is sent while an entry is
+recorded, never while a request is answered, so it gives a page script no moment with the
+channel's name on `window.event`, and a channel a page watches is marked on its own.
+
+A channel is marked as told only once its event has gone out, and the event is sent only when
+1,600 more calls fit on the page's stack (`roomToTell`), about 13 to 16 percent of what Chrome for
+Testing 156 gives a page's main thread (10,295 calls of a one line function cold, 12,351 warm).
+A page that logged on its way back from a stack overflow had the event sent with almost no stack
+left: Chrome could not call the bridge's listener at all, reported an uncaught `RangeError` of the
+extension's in the tab, and the chips stood still until the port closed. Below that headroom, or
+when the event throws, the change is owed (`owed`) and told with the next entry the page logs,
+also when that entry goes into a ring that is already full: a ring filled during an overflow
+otherwise kept the chips at 0 until the next read. The probe costs about 13 microseconds warm and
+runs at most four times a second, only while a panel watches. While a change is owed, each
+console call into a full ring runs it again until the event goes out, about 25 microseconds more
+a call: 20,000 calls within about 200 frames of the stack limit, with the panel open, took about
+2.2 s against 1.7 s before. A page that only ever logs within 1,600 calls of its stack limit
+leaves the chips standing until the panel reads. Every read of the log the panel makes, and every
+Clear, also has the bridge ask `watch` again and post the counts it finds, whether or not they
+changed (`recount`), so a signal lost any other way, or an `unwatch` a page sent on the channel of
+a late start, holds the chips back only until the next read. That post travels on the port, so it
+stays in order with the port's other posts. A read's reply and the port's posts are not kept in
+order between them, so once the port has posted, its numbers are the chips' and a read's reply
+leaves them alone (`countsFollowed`). Chrome 156 tells the bridge nothing when a port ends
+because the page went into the back/forward cache, or because the extension was reloaded. So the
+bridge closes its ports on the browser's own `pagehide` (one a page script sends is ignored), and
+a bridge whose extension context has gone asks the collector to stop at its first signal. That
+check is made when the signal's timer fires, not when the signal comes: on a late start a page
+that sent the `<channel>:changed` event itself, before the panel connected, had the port that
+opened meanwhile dropped, and the chips froze. When the bridge stops watching it closes every
+port it holds (`unwatchCounts`), so the panel hears it and takes the counts from its reads
+again. The panel closes the port on a change of tab or page and while it is hidden, and opens it
+again when it is shown.
+
 The picker still asks what rendered a node over `window.postMessage`, and that answer is about
 the node alone. The same boundary is why the element picker cannot read a React fiber itself.
 React hangs the fiber off the DOM node as a `__reactFiber$<random>` property and Vue hangs
@@ -113,7 +163,15 @@ what the handoff uses: the picker sets a random `data-cdr-pick` attribute on the
 element, asks for it by that value, and the main world finds the node with `querySelector`, and
 inside open shadow roots when that finds nothing (`findMarked`, which walks at most 20 000
 elements looking for them). Both sides remove the attribute, because the timeout path is a page
-where nobody over there ever saw it.
+where nobody over there ever saw it. A node inside a closed shadow root is out of the main world's
+reach, so the picker marks the host of the outermost closed root on its way up instead, the
+deepest node that world can reach (`reachOf`), and nothing is written inside a closed tree, where
+the component's own `MutationObserver` would see it. What comes back is counted through that
+host: the hops of the component and of the handlers include the steps from the picked element up
+to it, and `component.closedHost` names it (`throughHost`). The prompt then says the element is
+inside that host's closed shadow root and that this is the component nearest the host, and makes
+no claim about whether the framework rendered the element itself, which the page's world cannot
+know.
 
 Two ordering constraints fall out of that. The attribute goes on **after** the picker has read
 `outerHTML` and the node's attributes, or `data-cdr-pick` appears in the markup printed in the
@@ -142,25 +200,52 @@ this code can read, and too loose, because a production build that keeps functio
 has a minified body behind a real name.
 
 Props are printed unless they could carry a secret (`summariseProps`). A prop whose own name is a
-secret name is withheld. When a component is inspected, the collector also reads the live values
-of the page's secret controls (`reactGuard`, `vueGuard`): the controls the component renders, up to
+secret name is withheld. When a component is inspected, the collector also reads the live values of
+the page's secret controls (`reactGuard`, `vueGuard`): the controls the component renders, up to
 3,000 nodes, and the document's own (`documentValues`). Those are elements of type password,
 elements whose autocomplete says `current-password`, `new-password`, `one-time-code`, `cc-number`
 or `cc-csc`, and form controls whose name or id is a secret name such as `csrf_token`. In the
 document it reads at most 32 of each kind, judging the names of the first 256 inputs, text areas
-and selects, and looks one level into the open shadow root of a design system's own element. A
-string or number prop is withheld when it equals one of those values, contains one of four
-characters or more, or is a piece of four characters or more that covers at least half of one, so
-a seed the user typed on the end of still matches (`holdsSecret`). `value`, `defaultValue` and
+and selects, and looks one level into the open shadow root of a design system's own element. It
+also looks into the document's open shadow roots (`shadowValues`): the first 100,000 elements of
+the document are asked for an open root (`SHADOW_LIGHT`), at most 512 of those roots are kept, and
+each is looked into with every root inside it, the first first, before the next (`shadowTree`), so
+the roots are taken depth first in document order. At most 512 roots are looked into, 10,000
+elements inside them asked for roots of their own, 10,000 controls judged and 32 read. The roots of
+the light DOM are collected before any is looked into: looking into each as the scan found it gave
+the same order and cost 1.5 ms more a pick on a page of 60,000 elements. A string or number prop is
+withheld when it equals one of those values, contains one of four characters or more, or is a piece
+of four characters or more that covers at least half of one, so a seed the user typed on the end of
+still matches (`holdsSecret`). It is also withheld when it differs from one in a single place (a
+run of characters put in, taken out or replaced), what the two share at their ends is four
+characters or more and three quarters of the longer, and the value reads as a passphrase or a seed:
+it holds white space or has 12 characters or more (`SEED_LENGTH`), and it is not a number of fewer
+than 12 digits however it is grouped, with white space, dashes, dots, slashes, parentheses or a
+plus (`editedFrom`, `seedLike`). So a passphrase the user changed in the middle matches, and so
+does a card number changed in one digit (`4111 1111 1111 1112` beside a card field holding `4111
+1111 1111 1111`), while a label `Password` beside the password `Passw0rd`, a period `January 2024`
+beside the password `January2024`, and an order number or a card security code one digit away from
+a one time code print, as they did in 0.6.0. A value of 12 digits or more written with nothing but
+white space, dashes, dots, slashes, parentheses or a plus between them is also compared by its
+digits alone with a prop of 64 characters or fewer of that shape (`cardDigits`, `cardForms`), so a
+card preview handed the raw digits `4111111111111111` beside a field that shows them in groups
+loses them, as do the same digits in dashes, slashes or groups of 4, 6 and 5. Only such numbers are
+compared by their digits: a four digit PIN found in the joined digits of a reference number is no
+copy of it. The digits of such a held number run together are also looked for in every prop as
+written (`holdsSecret`), so `Card 4111111111111111 declined`, a JSON payload or a URL holding them
+loses them beside a field that groups them. A card number grouped inside a longer prop is caught
+only when it is grouped as the field groups it (`Card 4111-1111-1111-1111 declined` beside a field
+holding `4111 1111 1111 1111` prints), and so is a prop holding fewer than 12 of its digits. A
+phone number of 12 digits or more counts as a card number does. `value`, `defaultValue` and
 `modelValue` of a component that renders a secret control, or whose own `type` or `autoComplete`
 says it is one, are always withheld. A hidden input is what a form carries along (a product id, a
 CSRF token beside a search box), so its value is held only when it is the pick itself or its name
-or id is a secret name, and rendering one does not make a component's value props secret, though
-a component whose own `type` is hidden has them withheld. `cc-name` and
-`cc-exp` alone mark nothing: they hold nothing secret, and a form whose card number sits in a
-payment provider's frame has only those. All the text and number props of a component that
-rendered a password field used to be withheld, its title, its error message and its total
-included, while a strength meter handed the password without rendering the field still printed it.
+or id is a secret name, and rendering one does not make a component's value props secret, though a
+component whose own `type` is hidden has them withheld. `cc-name` and `cc-exp` alone mark nothing:
+they hold nothing secret, and a form whose card number sits in a payment provider's frame has only
+those. All the text and number props of a component that rendered a password field used to be
+withheld, its title, its error message and its total included, while a strength meter handed the
+password without rendering the field still printed it.
 
 A component that renders a control taking a password, a one time code or a card's digits, known by
 its type or autocomplete rather than by a name alone (`guard.password`), also has its string props
@@ -179,14 +264,29 @@ form were withheld when it did.
 
 What that cannot catch is a value in no field with no secret's shape (a passphrase with spaces, a
 password of letters only or shorter than eight characters), any such value handed to a component
-that renders no password, code or card control, and a seed of that kind the user changed in the
-middle rather than typed on the end of. In a component the shape rule applies to, ordinary strings
-of that shape are withheld too, such as a coupon code or an order number like `ORD-2024-00123`. A
-field inside a shadow root is found in the document only when its host element says it takes a
-secret (type password or a secret autocomplete), and one in a frame is not found.
-`payment_method_nonce` and other one time payment nonces are not secret names, so they print.
-Measured in Chrome for Testing on a page of 60,000 elements, 20,000 of them inputs, the document
-scan costs about 3 ms a pick, nearly all of it the selector, which has to look at every element.
+that renders no password, code or card control, and a password under 12 characters with no space
+that was seeded and then changed in one place (`Xk9#mQ2z` beside the seed `Xk9#mQ2p`), which 0.6.0
+did not catch either, though a component that renders the field withholds it by its shape. In a
+component the shape rule applies to, ordinary strings of that shape are withheld too, such as a
+coupon code or an order number like `ORD-2024-00123`, and anywhere on the page a string that shares
+three quarters of a held passphrase or seed at its ends is withheld, such as an e-mail address one
+character away from the one in a field named `email`. A field in a closed shadow root, in a root
+past the first 512 in that order, in one whose host comes after the first 100,000 elements, or in a
+frame is not found, so an app shell whose own root holds more than 511 roots ahead of its form
+hides that form. One two shadow roots deep inside what a component renders brings neither the shape
+rule nor the component's value props. Measured in Chrome for Testing on a page of 60,000 elements,
+20,000 of them inputs, the document scan costs about 3 ms a pick, nearly all of it the selector,
+which has to look at every element. With the shadow walk, a pick took (Chrome for Testing 156,
+median of 7) 16.1 to 17.1 ms on a page of 300,000 elements with no shadow root, against 13.0 ms in
+0.6.0; 5.3 to 5.4 ms on 60,000 elements with 202 open roots, against 2.7 ms; and 1.1 ms on 5,000
+elements with 600 hosts that each nest two roots, against 0.4 ms in 0.6.0, which looked into none
+of the nested ones. The bounds are on roots (512), on the elements asked for a root of their own
+(10,000) and on the controls read (32), not on the elements a root's selector looks at: each root
+looked into is searched whole, at about 60 nanoseconds an element, about what the document's own
+selector costs an element of the light DOM. So 300 roots of 1,000 elements each took 17.9 ms, and
+512 roots of 2,000 elements each 58.9 ms, where 0.6.0 took 0.1 and 0.2 ms. A budget of elements
+shared by the roots would cap that, but one root of 10,000 elements or more, such as a data grid,
+would then hide a password field in every root after it.
 
 #### A tab that was open before
 
@@ -309,9 +409,16 @@ forcing its own Promise) sees no extra calls. After a late start the `then` on t
 whatever the page left there, so an `await` stands in, which reacts inside the engine where the
 promise's constructor is still the engine's, as on zone.js and Bluebird pages. Where core-js has
 replaced the engine's Promise, each failed or answered fetch costs one call of the page's `then`.
-On a zone.js page the collector takes `setTimeout` and `addEventListener` from the natives
-zone.js kept under its own names, so recording a request adds no change detection pass in
-Angular.
+On a zone.js page the collector takes `setTimeout`, `addEventListener` and `Error` from the
+natives zone.js kept under its own names (`beforeZone`), so recording a request adds no change
+detection pass in Angular, and zone.js's error plugin (`zone.js/plugins/zone-error`) does not run
+at every request. Its `ZoneAwareError` read the stack as it was made, ran the page's
+`prepareStackTrace` and zone.js's own rewriting, and wrote the zone's name after every frame, so a
+collector that made its stacks with it recorded no caller. Measured in Chrome for Testing 156 with
+zone.js 0.15, 200 requests had made 200 calls of the page's `String.prototype.split`; now they
+make none, and the caller is named. Anything else that replaced these before a late start (fake
+timers, a listener tracker) leaves no untouched copy in the page's realm, so the collector uses
+it as it is.
 
 ### The heavy lifting is in the side panel, not the service worker
 
@@ -398,11 +505,12 @@ could see.
 | `cdr:collect` | panel | worker | Start collecting on a tab where nothing answered the panel's read: bridge a collector already running there, or start one where the manifest's `content_scripts` would have run (see [A tab that was open before](#a-tab-that-was-open-before)). `{ tabId }` gets `{ ok: true, fresh }` once a collector and a bridge are in the tab, `{ ok: false, outside: 'site' }` when the manifest keeps the collector off the tab's whole site (nothing is injected), `{ ok: false, outside: 'path' }` when the site is declared, the tab's URL is not, and no collector was found running there, or `{ ok: false, error }` |
 | port `cdr:panel` | panel | worker | Opened while a mode is armed. The panel posts `cdr:holding` with the tab it holds, or `null`. When the port closes because the panel closed, the worker disarms that tab. A panel still armed reopens the port when the worker is stopped, after a growing pause if it keeps being shut as it opens |
 | `cdr:armed` | worker | panel | A capture mode is now waiting on a tab. Carries the `armId` of the `cdr:arm` behind it, or none for the shortcut, so a panel can ignore the echo of an arm it cancelled in flight, and the `run` the injection answered with |
-| `cdr:region-selected` | overlay | panel | A rectangle was dragged, or selected with the keys |
+| `cdr:region-selected` | overlay | panel | A rectangle was dragged, or selected with the keys. Carries `moved: true` when the host, put into the element shown fullscreen, moved that element's last children while armed, so the panel says the crop may be off |
 | `cdr:element-picked` | picker | panel | An element was picked |
 | `cdr:capture-cancelled` | overlay, picker | panel | The user pressed Escape, or a pick failed on the way |
 | `cdr:get-context` | panel | bridge | Read the collected buffers plus page info |
 | `cdr:clear-context` | panel | bridge | Empty the buffers |
+| port `cdr:counts` | panel | bridge | Opened with `chrome.tabs.connect` to the top frame of the tab in view once a read has found its collector, and closed on a change of tab or page and while the panel is hidden. The bridge posts `cdr:counts` with `{ console, network }` when the two counts change, at most four times a second, and again at every read and Clear, and nothing else. It closes the port itself on the browser's own `pagehide` (see [The collector is split in two](#the-collector-is-split-in-two)) |
 
 Each start of the overlay or the picker names a run. The injection returns it, `cdr:armed` and
 `cdr:check-tab` carry it, and every message from that start carries it, so a late message from
@@ -537,28 +645,27 @@ the page leaves unhandled is not reported by the browser as an unhandled rejecti
 still recorded as a failed request. Plain engine promises are unaffected.
 
 An XHR object can carry two requests at once. A page may reopen it from inside a handler of the
-request that is just finishing (a retry in `ontimeout`, the next long poll in `onload`), and
-Chrome still dispatches that request's `loadend` afterwards, with the status already reset by
-the reopen. So each `open()` starts a record of its own, a reopen parks the finishing record
-with the status it ended on, and late events are credited to it. They are told apart by
-`readyState`: the finishing request's own events arrive while the object is DONE, the late ones
-after the reopen has moved it back to OPENED. An `abort()` on a finished request parks it the
-same way, because Chrome fires no event for it and drops the object to UNSENT with status 0
-before the `loadend` arrives. A park is only committed once the native call has gone through,
-so an `open()` the browser refuses (a bad method or URL) leaves the bookkeeping as it was. Parks
-can nest: a handler of a parked request can finish a second request synchronously and reopen
-again, and Chrome then delivers the inner request's late events before the outer one's, so the
-parked slot is a stack. A handler can also run a synchronous request to the end without
-reopening, leaving the object DONE for a request that has already settled; a settled record
-gets no more events of its own, so what arrives next goes to the parked one. If no late event
-ever comes, a zero delay timer settles the parked record. Chrome can also deliver a `loadend`
-before the abort or timeout event, when a handler runs a synchronous request to the end, so a
-parked request that ended with no response and has no label yet is left to that timer and
-recorded a task later. That timer, and the collector's own listeners, go through the `setTimeout` and
-`addEventListener` the page had at `document_start`, not whatever zone.js or a fake clock has
-put in their place since, so an Angular page does not run change detection for them. A collector
-started after zone.js takes the natives zone.js kept (see
-[A tab that was open before](#a-tab-that-was-open-before)).
+request that is just finishing (a retry in `ontimeout`, the next long poll in `onload`), and Chrome
+still dispatches that request's `loadend` afterwards, with the status already reset by the reopen.
+So each `open()` starts a record of its own, a reopen parks the finishing record with the status it
+ended on, and late events are credited to it. They are told apart by `readyState`: the finishing
+request's own events arrive while the object is DONE, the late ones after the reopen has moved it
+back to OPENED. An `abort()` on a finished request parks it the same way, because Chrome fires no
+event for it and drops the object to UNSENT with status 0 before the `loadend` arrives. A park is
+only committed once the native call has gone through, so an `open()` the browser refuses (a bad
+method or URL) leaves the bookkeeping as it was. Parks can nest: a handler of a parked request can
+finish a second request synchronously and reopen again, and Chrome then delivers the inner
+request's late events before the outer one's, so the parked slot is a stack. A handler can also run
+a synchronous request to the end without reopening, leaving the object DONE for a request that has
+already settled; a settled record gets no more events of its own, so what arrives next goes to the
+parked one. If no late event ever comes, a zero delay timer settles the parked record. Chrome can
+also deliver a `loadend` before the abort or timeout event, when a handler runs a synchronous
+request to the end, so a parked request that ended with no response and has no label yet is left to
+that timer and recorded a task later. That timer, and the collector's own listeners, go through the
+`setTimeout` and `addEventListener` the page had at `document_start`, not whatever zone.js or a
+fake clock has put in their place since, so an Angular page does not run change detection for them.
+A collector started after zone.js takes the natives zone.js kept (see [A tab that was open
+before](#a-tab-that-was-open-before)).
 
 The bookkeeping lives in a `WeakMap` inside the collector, not on the object, so the page never
 sees it in `Object.keys` or `JSON.stringify`, and nothing is written onto a `this` that is not an
@@ -567,7 +674,13 @@ because Chrome cancels it without dispatching any event, `loadend` included. An 
 its request before the native call and settles it after, so a page listener that stops the abort
 or `loadend` event cannot hide it. The listeners go on at the first `open()` rather than the first
 `send()`, so a listener the page adds between the two cannot stop an event before it reaches
-them; one added before the first `open()` still can.
+them. One added before the first `open()` runs ahead of them, since listeners on one target run
+in the order they were added, whatever their capture flag (checked in Chrome for Testing 156). So
+a failure is also caught at each event before `loadend`: the `readystatechange` to DONE, then
+`load`, `error`, `timeout` or `abort`. The first of them to reach the collector sets a zero delay
+timer, one per request (the record's `backstop`), that records the failure a task later unless
+its `loadend` has. Such a listener hides a failed request only by stopping every event the
+request ends with, and then until the object is opened again.
 
 A synchronous request that fails at the network level is the one case with no event at all:
 Chrome throws `NetworkError` out of `send()` and fires nothing, `loadend` included. The send
@@ -603,9 +716,13 @@ is printed as it is, never folded under the name of the page function below it, 
 the helper's line under that name and send the reader to the wrong file.
 
 Every wrapper is a Proxy of the native it replaces (`wrapNative`, with only an `apply` trap), so
-its name, length and `toString` read as the native's, and `callerFrames()` recognises the
-collector's own frames by its address rather than by function names. It matches the whole
-address, so a page file that happens to be called `collector-main.js` is still the page's.
+its name and length read as the native's and its `toString` says `[native code]`, though with no
+name, as V8 prints any callable proxy (`function () { [native code] }`, where the native's reads
+`function fetch() { [native code] }`). Only replacing `Function.prototype.toString`, which every
+page uses, could hide that, and such a replacement prints that text for itself unless it lies about
+itself too, and adds its own frame to every error it passes on. `callerFrames()` recognises the
+collector's own frames by its address rather than by function names. It matches the whole address,
+so a page file that happens to be called `collector-main.js` is still the page's.
 
 That address is `punch-list://extension/collector-main.js`, which the collector declares as its
 `sourceURL`. V8 gives the script that address in stacks and console messages, and a CSP report
@@ -638,26 +755,36 @@ The collector keeps four rings of `LIMIT` entries: console errors, warnings, unc
 failed loads, and failed requests. Warnings have their own because a development build can warn
 dozens of times per render, and in a shared ring that pushed out the error the report was about.
 For the same reason, a full ring of failed requests drops a request the page ended itself (an
-abort, a timeout it set, an `open()` over it) before any real failure, so a type-ahead that
-cancels a request per keystroke cannot push out the failure the report is for. Each ring counts
-what it drops, and the snapshot carries the counts, so the prompt can say the
-log is the tail of a longer one. Every entry gets `t`, milliseconds since the collector started
-(`armedAt` in the snapshot), and `seq`, one count across all four rings: a failed request, the
-warning it causes and the throw after it routinely share a millisecond, and only the count keeps
-them in the order they happened. Both clocks the collector reads, `Date.now` and
-`performance.now`, are the ones the page had at `document_start`. MockDate, sinon's fake timers
-and Playwright's `page.clock` replace them later, and `t` is compared with the panel's own clock.
+abort, a timeout it set, an `open()` over it) before any real failure, so a type-ahead that cancels
+a request per keystroke cannot push out the failure the report is for. Each ring counts what it
+drops, and the snapshot carries the counts, so the prompt can say the log is the tail of a longer
+one. A push that runs out of stack between adding its entry and dropping the oldest leaves its ring
+one long, since the console wrapper swallows the throw, so the next push drops as many as it takes
+to get back to 30, counting each, and the live counts read a ring as 30 at most (`push`, `counts`).
+It drops them in one pass, requests the page ended itself first and then the oldest: dropping one
+at a time, each found by a search of the whole ring, froze a page that had made thousands of such
+pushes for 1 to 11 s at its next console call (Chrome for Testing 156), where one pass takes under
+a millisecond. If that pass runs out of stack itself, what it has not looked at moves up behind
+what it kept, so no entry is left twice, and the next push finishes the cut. Every entry gets `t`,
+milliseconds since the collector started (`armedAt` in the snapshot), and `seq`, one count across
+all four rings: a failed request, the warning it causes and the throw after it routinely share a
+millisecond, and only the count keeps them in the order they happened. Both clocks the collector
+reads, `Date.now` and `performance.now`, are the ones the page had at `document_start`. MockDate,
+sinon's fake timers and Playwright's `page.clock` replace them later, and `t` is compared with the
+panel's own clock.
 
 The template merges the rings by `t` and then `seq` and prints a clock time in front of each
 entry, built by hand rather than with `toLocaleTimeString` so every line of a prompt has the same
 width, with the date in front when the entry falls on another day than the report. The page
 section gives its times year first with the machine's offset from UTC
 (`2026-08-07 20:51:33 UTC+02:00`), so they read the same in every locale and can be set beside a
-server's log. The zone is given once: by the Captured line when the page prints, and, with the
-page toggle off, by a line that names the zone and the day of the entries that carry no date
-(`clockNotice`). A single report gives that line under Console and network. A list that prints a
-log under any item gives it above the first item, so before the first log line it qualifies, and
-not again at the end. The frames printed under errors and requests, and a component's call site
+server's log. The zone is given by the Captured line when the page prints, and by a line that
+names the zone and the day of the entries that carry no date (`clockNotice`) wherever no Captured
+line comes before the first log line. With the page toggle off, a single report gives that line
+under Console and network. A list that prints a log under any item gives it above the first item,
+so before the first log line it qualifies, whether or not the page prints, and not again at the
+end. With the page on, the page section's Items captured line still gives the zone of its own
+times. The frames printed under errors and requests, and a component's call site
 read from a stack, are positions in the code the browser ran, and the prompt says so once, beside
 the sentence that marks page text and screenshots as evidence rather than instructions
 (`pageData`), rather than on every frame. The call site line says only that it was read from a
@@ -759,15 +886,27 @@ up through the tree as it is drawn, so a node slotted from the light DOM goes up
 That also finds a dialog inside a component's shadow root around content the page hands it, as
 `md-dialog` does. With nothing focused (a framework that re-rendered the focused field, or a page
 that called `blur`), the dialog the host is already in stays the answer for as long as it is open.
-Otherwise the overlay looks for open modal dialogs in the document and in the page's open shadow
-roots, which it walks each time the host is placed, at most 20 000 elements (`collectRoots`). Of
+Otherwise the overlay looks for open modal dialogs in the document and in the page's shadow roots
+(`collectRoots`). A closed shadow root answers null to `shadowRoot`, but a content script can ask
+Chrome for it with `chrome.dom.openOrClosedShadowRoot`, which needs no permission and costs about
+half a microsecond (`shadowOf`). The focus walk and the hit test below ask it of every host they
+pass. The walk asks it only of custom elements, each once per arm (`closedRootOf`), since asking
+every element cost 15 ms a walk at 24 000 elements. So a dialog in a closed root is found, and
+the host put inside it, as in an open one. The walk is a tree walker over at most 20 000 elements
+(`ROOT_SCAN`): half of them forward from the start of the page and half backward from its end,
+each shadow tree walked where its host stands, until the two meet. A page under the budget is
+walked whole, and a larger one has its first and its last 10 000 elements walked, so a toast stack
+or a dialog portal appended to the body is found as well as a component near the top. It takes
+about 1.4 ms over 20 000 elements in Chrome for Testing 156, closed roots included, where reading
+each element's children for open roots took 8 ms. Of
 several it takes the one on top by hit testing the middle of each (`modalOnTop`): Chrome passes
 over inert nodes, and the top dialog's backdrop answers for the rest of the viewport (checked in
 Chrome for Testing 156). Going by document order put the host into an older dialog underneath, or
 on the body under a shadow root's dialog, where it was inert. While Region is armed the host is
 kept there. Every animation frame the overlay checks that the host is still in the document, that
 the dialog it is in is still modal and that its popover is still shown, and every fifteenth frame,
-or at once on `focusin`, `toggle` and `close`, that no other modal dialog has opened. When any of
+or at once on `focusin`, `toggle`, `close` and `fullscreenchange`, that no other modal dialog has
+opened and that no element has gone fullscreen or left it. When any of
 that has changed it takes the host out and mounts it again, so a dialog the page closes or
 removes, or one it opens after the arm, no longer leaves the overlay invisible or inert while the
 panel shows Region armed. A popover the page shows while Region is armed (a toast) goes above the
@@ -775,21 +914,106 @@ host in the top layer, so on its `toggle` the host is hidden and shown again, wh
 in the top layer, above the toast. A popover a component shows from its shadow root sends its
 `toggle` no further than that root, so the same fifteenth frame check also compares what is in the
 top layer, in the document and in the shadow roots known, with what was there when the host was
-last raised, and raises it over anything new: such a popover covers the overlay for about a
-quarter of a second. A shadow root attached after the host was placed is seen only when the host
-is next placed. Pressing the shortcut again raises the host over whatever covers it. A page that
-removes or covers the host every time it comes back is answered a hundred times per arm and then
-left alone; arming Region again answers once more. A dialog in a closed shadow root cannot be
-found, and the overlay is inert under it: a drag reaches the page, and a dialog that closes on a
-click outside its box closes. While an element of the page is fullscreen, Region cannot be used:
-Chrome draws a popover that is not inside the fullscreen element under it, even one shown after
-it (seen in Chrome for Testing 156, armed before and after the element went fullscreen), and the
-host cannot go inside the element, which may be a video whose children are never drawn. Each
-frame the overlay also checks that the extension is still there: a reload or a removal leaves the
-script running with no extension id, and nothing it sends would arrive, so it stops itself and the
-page gets its pointer back. A browser without popovers gets a fixed position host on the
-body. The root sets `touch-action: none`, so a finger drag selects instead of panning, and a
-cancelled pointer (`pointercancel`, or lost pointer capture) ends the drag without sending
+last raised, and raises it over anything new. Of the shadow roots, only those the last walk found
+holding a popover or a dialog are queried (`holdsLayer`, `queryAll`), whether or not the page has
+changed since: querying every known root once anything had changed cost a page that changes all
+the time 10 to 13 times what 0.6.0 spent with closed roots. Pressing the shortcut again raises the
+host over whatever covers it at once. A page that removes or covers the host every time it comes
+back is answered a hundred times per arm and then left alone; arming Region again answers once
+more.
+
+The walk runs each time the host is placed, when the shortcut is pressed again, and at a fifteenth
+frame check when the page has changed since the last walk, at most once a second by the clock
+(`ROOT_WALK_MS`, against `performance.now`), whatever the display's frame rate. A bound of 60
+frames, as before, was half a second at 120 Hz. The check at the first frame after an arm does not
+walk, since the arm has just walked. A `MutationObserver` on the document and on every shadow root
+walked says whether the page has changed (`watchChanges`): it watches child lists and the
+`popover` attribute, ignores the host's own moves, and disconnects at the first change until the
+next walk reconnects it, so a page that changes all the time pays for one batch of records per
+walk. A live count of the document's elements is cheaper to read, but sees no change inside a
+shadow root and none to a `popover` attribute. So a popover put into a root that held a popover or
+a dialog at the last walk covers the overlay until the next check, a quarter of a second at most
+at 60 Hz. One put into a root that held neither, or into a root attached since the last walk, waits
+for the next walk, which that change brings at the next check when the last walk was a second or
+more before, and otherwise within a second and a check (1.25 s at 60 Hz). Some are not found that
+way. A component in the middle of a page larger than the budget is never walked. A shadow root
+attached to an element already in the page (a component defined after the arm, or `attachShadow`
+on an existing element) changes no child list, so it waits for a walk something else causes, the
+next placement or the shortcut. A closed root attached during the arm to a custom element the walk
+has already asked about waits for the next arm. And a modal dialog in a closed root on a built in
+element (a `div`) is reached only through the focus, so not while nothing in that root has focus.
+
+Measured as the overlay's CPU over 3 s armed at 60 Hz (Chrome for Testing 156, a CDP profile, two
+runs of 0.6.0 and three of this release), a quiet page costs 13.6 to 14.2 ms at 51 000 elements
+against 12.3 to 13.6 in 0.6.0, 4.2 to 7.3 ms with 2,000 or 6,000 closed roots against 2.5 to 6.7,
+and 4.3 to 7.8 ms with 2,000 or 6,000 open roots, where 0.6.0, which queried every known root at
+every check, took 21 to 47 ms. Its longest check took 1.1 ms. A page that changes its tree every
+frame costs 18 to 19 ms at 51 000 elements against 12 to 14, and 11 to 13 ms with 2,000 open roots
+and 22 to 24 ms with 6,000, about half of 0.6.0's 22 to 23 and 45 to 48. With closed roots it costs
+about three times 0.6.0: 11 to 12 ms with 2,000 against 4, and 23 to 24 ms with 6,000 against 6.5
+to 6.7. That is the walk itself, about 6 to 7 ms over 6,000 roots once a second, which is also the
+longest single stretch there; 0.6.0 walked only when it placed the host, and saw no closed root.
+Asking Chrome about each custom element once makes an arm cost 20 to 29 ms of CPU on a page of
+20 000 custom elements (its longest stretch 8 to 14 ms), against 11 to 13 ms in 0.6.0.
+
+An element shown fullscreen makes everything outside it inert, as a modal dialog does: the host,
+shown after it, was drawn above it, and every press passed through it to the page (seen in Chrome
+for Testing 156). So with no modal dialog open the host goes inside the fullscreen element, found
+through shadow roots (`fullscreenHolder`), unless that element holds the body, as when the whole
+page is shown fullscreen. Which element may take it is decided from its type before anything in the
+page is touched. One that draws no children, or whose children are what it shows or loads (audio,
+canvas, embed, fencedframe, frame, iframe, img, input, object, optgroup, option, script, select,
+style, template, textarea and video, `NO_HOST`), and any element outside the HTML namespace (svg,
+math), never gets it: Chrome loads an `<object>`'s document again when a child is added to it, so a
+host put there and taken out again reloaded a fullscreen PDF on every arm. Over such an element the
+host stays on the body, drawn above the element and inert, and Region cannot be used until the page
+leaves fullscreen. When the fullscreen element has a shadow root, open or closed, the host goes
+into that root, where the element's light children, its slots and its own `:last-child` rules never
+see it, no `slotchange` fires, and a component with no default slot draws it all the same. Without
+one the host is the element's last child, since every position is seen by some selector and last
+trips the fewest (`:last-child`, `:nth-last-child`, `:last-of-type`, `:only-child`, `:empty`). On a
+slide laid out with Tailwind's `space-y` the cards moved up 20 px while armed, and the screenshot,
+taken once the host is gone and the slide has moved back, was 20 px off what was selected. So the
+overlay reads the boxes of up to the last 64 children before and after placing the host
+(`childBoxes`, `movedSince`), and when any moved or resized by more than half a pixel,
+`cdr:region-selected` carries `moved: true` and the panel says the crop may be off
+(`MOVED_UNDER_OVERLAY` in `sidepanel/panel.js`). That costs one more forced layout per placement,
+about 0.1 ms with 64 children. Only direct children are measured. Any other element in which the
+host gets no box (one hidden with `display: none`) is found by asking (`drawn`), and the host goes
+back on the body until fullscreen changes or the shortcut is pressed again. Looking for a box
+forces a layout, so it is done only in a fullscreen element. When an element goes fullscreen while
+the host stays outside it or is already in it (the body), the host is raised above it on
+`fullscreenchange`, and the fifteenth frame check counts a new fullscreen element as new in the top
+layer. While the host is inside the element shown fullscreen (directly, in its shadow root, or in a
+modal dialog inside it), the overlay's root also stops `mousemove`, `mouseover`, `mouseout`,
+`pointerover`, `pointerout`, `wheel` and the touch events at itself, with passive listeners
+(`swallowInFullscreen`), since the element's own handlers would hear them there. `pointerenter` and
+`mouseenter` go to each element the pointer enters and cannot be stopped. On the body, or in a
+modal dialog when nothing is fullscreen, those events reach the page as in 0.6.0, on purpose:
+smooth scrolling libraries and document `mousemove` listeners rely on them. In a dialog or a
+fullscreen element the host is a child the page's own code can see, as it is on the body, and the
+page's elements are around it. So a click, a double click and a middle click (`auxclick`) on the
+overlay are cancelled as well as stopped there (`cancel`): inside a fullscreen element nested in a
+link, a label or a form's button, a press too short to select followed the link, toggled the
+checkbox or submitted the form, and a touch tap did the same, while the page's own handler that
+would have prevented it never ran. The page's capture listeners still hear such a click first, and
+its bubble listeners do not. In a fullscreen component's shadow root the component's own rules
+apply to the host and beat its `:host` reset, so the host's inline style also sets
+`pointer-events: auto`, `visibility: visible` and `opacity: 1`, which beat any rule of the page's
+but an `!important` one: a `* { pointer-events: none }` there left the overlay drawn while every
+press went through to the component. Not `display`, which would override the rule that hides a
+popover that is not shown, so a component rule such as `div { display: none }` still leaves the
+host without a box, and `drawn` puts it back on the body. Other properties a component's rules set
+on every element, such as a transform, a filter or a clip path, still apply to it. On disarm the
+overlay lets go of every page node it held, the shadow roots of its last walk, the top layer it
+last saw, the fullscreen element it gave up on and its observer's registrations (`stop`), so a
+component removed after a disarm can be collected.
+
+Each frame the overlay also checks that the extension is still there: a reload or a removal
+leaves the script running with no extension id, and nothing it sends would arrive, so it stops
+itself and the page gets its pointer back. A browser without popovers gets a fixed position host
+on the body. The root sets `touch-action: none`, so a finger drag selects instead of panning, and
+a cancelled pointer (`pointercancel`, or lost pointer capture) ends the drag without sending
 anything.
 
 The overlay also takes keys, heard on the page's window, and from the panel, which hands the
@@ -801,13 +1025,15 @@ makes each step one pixel, and Enter captures it once there is a box to capture.
 **The picker.** The picker draws on a host whose own style is set inline with `!important`, so
 page CSS cannot move, hide or fade it. When the top layer is in use (a modal dialog, an open
 popover, a fullscreen element), the host is made a manual popover and shown, which puts it above
-what is there, and it is shown again whenever something enters or leaves the top layer. A popover
-the page shows inside a shadow root fires a `toggle` that never reaches the window, so every
-fifteenth frame the picker also compares what is in the top layer, in the document and in the
-open shadow roots it knows, with what was there when it last raised the host, and raises it
-again over anything new; such a popover can cover the highlight for about a quarter of a second.
-One the page hides and shows again between two of those checks is nothing new to them, and can
-cover the highlight until the next time it is shown. Every frame, and every frame of the tail
+what is there, and it is shown again whenever something enters or leaves the top layer. A
+popover or a dialog that the page shows or closes inside a shadow root fires a `toggle` or a
+`close` that goes no further than that root. So the picker listens for both on every shadow root
+it has found, open or closed (`addRoot`), and raises the host as soon as one comes, a task after
+the change, also for one the page hides and shows again at once (checked in Chrome 156). Every
+fifteenth frame it also compares what is in the top layer, in the document and in those roots,
+with what was there when it last raised the host, and raises it over anything new. That covers a
+root it has not found yet: a popover in one can cover the highlight for about a quarter of a
+second. Every frame, and every frame of the tail
 after a pick, the picker also checks that the extension is still there (`orphaned`): a picker left
 by a reloaded or removed extension stops itself, takes its sheet out of the page and gives the page
 its pointer back.
@@ -815,49 +1041,136 @@ its pointer back.
 A frame (an iframe, frame, embed or object) takes every pointer event over it, so left alone the
 page never hears the pointer there and a press goes into the framed page, for real. While the
 picker is armed, and through the tail after a pick, frames let the pointer through instead. The
-picker adopts one constructed style sheet,
-`iframe, frame, embed, object { pointer-events: none !important }`, into the document's
-`adoptedStyleSheets`, and into those of every open shadow root that holds a frame. A move or a
-press over a frame then reaches the page, where the capture listeners keep it, and nothing goes
-into the frame. What the page draws over a frame (a hover menu, a tooltip) keeps the pointer and
-its hover, as it would with no picker. A frame is still picked whole, since what is inside it is
-another document, and the picker finds it in two steps (`frameAt`). With the sheet on, the hit test
-passes through every frame, so where the pointer is inside no frame's box, which is nearly every
-move, no frame is there and nothing on the page is restyled. Where it is inside one, the picker
-takes the sheet off for a single hit test and lets the browser say what is drawn there, which
-accounts for clipping, stacking, visibility, rounded corners and fixed frames as drawing does: a
-carousel's slide out of view, the lower of two frames, and an `<object>` showing its fallback are
-not picked where they are not seen. That restyles the whole page, 28 ms a move at 100 000 elements
-(measured in Chrome), as every move once did, but only while the pointer is over a frame. A menu
-drawn over a frame is what that hit test finds, so the menu is picked. The boxes of up to 2,000
-frames are read, after the hit test has brought the layout up to date. The box is taken a pixel
-wider on each side, since a frame at a fractional offset is drawn and hit tested on a pixel row its
-box starts just past. At a press the frames are looked for again, so one the page put in since the
-last survey (every 15 animation frames) is picked too. The children of an `<object>`, drawn only as
-its fallback, inherit `none` from it and show no hover while picking, but the lifted hit test finds
-them, so a missing PDF's link can be picked. Giving them `auto` back took the page's own `none`
-from them and slowed every restyle by a quarter (measured in Chrome). A page that sets its own
-adopted style sheets while you pick drops the sheet. The picker puts it back on the next animation
-frame, again just after the page's own animation frame callbacks, at every press, and as soon as
-the pointer enters a frame (`keepPassing`). A press made in the same frame as such an assignment,
-with no pointer movement since, can still reach the frame. A page script that reads
-`adoptedStyleSheets` while the sheet is there can see it. When picking ends the sheet is taken out
-of every list and emptied, so a copy of the list that the page kept and puts back later holds a
-sheet that does nothing. A frame inside a closed shadow root is not seen at all: it keeps the
-pointer, and a press on it goes into the frame and picks nothing. One in an open shadow root
-attached after the arm is found by the next survey, or as soon as the pointer enters it.
+picker adopts one constructed style sheet into the document's `adoptedStyleSheets`, and into those
+of every shadow root, open or closed, that holds a frame. It gives each frame tag
+`pointer-events: none !important` under a selector with the specificity of eight ids,
+`iframe:is(*, #\:#\:#\:#\:#\:#\:#\:#\:)` and the same for frame, embed and object
+(`PASS_SELECTOR`). `:is()` counts as its most specific argument, and `*` makes it match every
+frame, so a page's own `!important` rule on a frame by id no longer beats the sheet, and each
+selector still names its tag, so only frames are matched against it on a restyle (checked in Chrome
+156). A move or a press over a frame then reaches the page, where the capture listeners keep it,
+and nothing goes into the frame. What the page draws over a frame (a hover menu, a tooltip) keeps
+the pointer and its hover, as it would with no picker. A frame is still picked whole, since what is
+inside it is another document, and the picker finds it in two steps (`frameAt`). With the sheet on,
+the hit test passes through every frame, so where the pointer is inside no frame's box, which is
+nearly every move, no frame is there and nothing on the page is restyled. Where it is inside one,
+the picker takes the sheet off for a single hit test and lets the browser say what is drawn there,
+which accounts for clipping, stacking, visibility, rounded corners and fixed frames as drawing
+does: a carousel's slide out of view, the lower of two frames, and an `<object>` showing its
+fallback are not picked where they are not seen. That restyles the whole page, 28 ms a move at
+100 000 elements (measured in Chrome), as every move once did, but only while the pointer is over a
+frame. A menu drawn over a frame is what that hit test finds, so the menu is picked. The boxes of
+up to 2,000 frames are read, after the hit test has brought the layout up to date. The box is taken
+a pixel wider on each side, since a frame at a fractional offset is drawn and hit tested on a pixel
+row its box starts just past. At a press the frames are looked for again, so one the page put in
+since the last survey (every 15 animation frames) is picked too. The children of an `<object>`,
+drawn only as its fallback, inherit `none` from it and show no hover while picking, but the lifted
+hit test finds them, so a missing PDF's link can be picked. Giving them `auto` back would take a
+`none` from them that the page meant: `:where(object > *) { pointer-events: auto }` costs no
+restyle time that can be measured at 100 000 elements, and keeps a `none` the page sets on the
+fallback or inside it, but a `none` the page sets above the object reaches the fallback only by
+inheriting through the object, and that rule cuts it off, so the fallback took the pointer where
+Chrome finds what lies under it (checked in Chrome 156). No CSS inherits past the object. An
+earlier note here said the rule slowed every restyle by a quarter; that did not reproduce. A page
+that sets its own adopted style sheets while you pick drops the sheet. The picker puts it back on
+the next animation frame, again just after the page's own animation frame callbacks, at a survey
+before any style is read, at every press, and as soon as the pointer enters a frame
+(`keepPassing`). It puts it back directly, with nothing held and before anything restyles, so the
+frames, which still hold `none` from their last restyle, start no transition: putting it back under
+the hold below, after a hit test that restyled the tree without the sheet, made a page that resets
+its own lists in an animation frame loop hear 363 transition events in a second (6 in 0.6.0, and
+now). If the page's change is restyled before the sheet goes back (it reads a style right after
+setting its list, or sets it in an animation frame callback added after the picker's), its frames
+run their own `pointer-events` transition and the page hears it, as in 0.6.0. A press made in the
+same frame as such an assignment, with no pointer movement since, can still reach the frame. A page
+script that reads `adoptedStyleSheets` while the sheet is there can see it. When picking ends the
+sheet is taken out of every list and emptied, so a copy of the list that the page kept and puts
+back later holds a sheet that does nothing.
+
+A frame inside a closed shadow root is handled as one in an open root. A page script gets null
+for a closed root, but a content script can ask Chrome for it (`chrome.dom.openOrClosedShadowRoot`,
+about a microsecond an element, `shadowOf`). Only the elements that can hold a shadow root are
+asked: custom elements and the eighteen built in ones `attachShadow` takes (`SHADOW_HOSTS`). The
+survey asks about each element once an arm, about 14 ms at 20 000 elements (measured in Chrome),
+and asks again each time about a custom element not defined yet (`surveyedShadowOf`). The pick,
+the top layer check and the focus walks go into closed roots the same way, and the pointer's own
+paths ask Chrome afresh. A frame in a shadow root attached after the arm is found by the next
+survey, or as soon as the pointer enters it; in a closed root attached after the arm, only by the
+pointer. On a page of 20 000 elements with 60 shadow roots, half of them closed, an arm took 21 to
+45 ms against 6 to 22 ms before, and frame pacing while armed did not change.
+
+A page rule can give a frame a discrete transition of `pointer-events` (`transition: all .3s
+allow-discrete`, or one naming `pointer-events` with `allow-discrete` and a duration or delay above
+0). Such a frame kept its old value for half the transition as the sheet came in and as it was
+lifted, so the lifted hit test passed through it and picked what lay under it, and the page heard
+transition events on every move over it (66 over four picks in 0.6.0). So on a page where some
+frame's own computed style gives `pointer-events` such a transition (`transitionsPointer`), the
+picker holds discrete transitions back, with `transition-behavior: normal !important`, but only for
+the moments its sheet changes a frame's `pointer-events` (`holding`): when the sheet is adopted
+into a tree for the first time in an arm, when it is lifted for the hit test and put back, and when
+it is removed at the end. Each time it first brings the page's own pending style changes up to date
+with a hit test, so they run with the page's transitions, then swaps in the held rule (`HELD_RULE`,
+or `LIFT_RULE` for the lift), makes its change, restyles at once (`restyle`, a read of the html
+element's computed style, which restyles every tree whose adopted sheets changed, closed roots
+included), and goes back to the plain rule before any script of the page's runs. The page's own
+fades of a frame (`display`, `overlay`, `opacity`) run as written and fire all their events, and
+such a frame is picked where it is drawn. Whether some frame has such a transition is asked of
+every frame found and drawn, up to 2,000 (`FRAME_BOXES`), at the arm and at each survey until one
+answers yes, and of the frame under the pointer at each lift and of a frame the pointer enters. A
+frame not drawn (`display: none`, or in content the browser skips: `content-visibility: auto` off
+screen) is passed over, since reading the style of one in skipped content lays it out, and so does
+`checkVisibility()` with no options. The frames passed over are kept and asked again before each
+change of the sheet (`drawnSince`, with `checkVisibility({ contentVisibilityAuto: true })`, which
+costs no layout), so one shown or scrolled into view while armed is held from the first change
+after it, not from the next survey. Once found it stays found until the next arm (`discrete`), so a
+frame seen once keeps the hold through Escape. Asking only the first 100 frames at each survey left
+a frame past them unheld at the arm, where a press right after it went into the framed page in 2 of
+3 tries. Holding back discrete transitions for the whole arm, as a first attempt did, cut the
+page's fade of a chat frame short: it snapped to `display: none`, fired nothing, and the
+`transitionend` that removed the frame never ran. On a page with no such frame nothing is held, and
+a lift is the sheet's `disabled` toggle as before (median 4.1 to 4.2 ms at 60 000 elements with 100
+frames); with one, each lift takes one more full restyle (8.5 to 8.7 ms). Asking every frame costs
+a page with more than 100 and none such: on 2,000 plain iframes a survey took a median of 1.0 to
+1.2 ms against 0.3 ms when only 100 were asked, about four times a second, and the one at the arm
+up to 3.8 to 6 ms against 2.6 to 2.8 ms (Chrome 156). Once one is found the surveys skip the
+question, and on that page each lift then took 5.4 to 7 ms against 3.2 to 3.7 ms. Past 2,000
+frames, when none of the first 2,000 has such a transition, a frame beyond them is adopted without
+a hold: the page hears its transition at the arm, and for half of it the frame takes a press; once
+the pointer has been over that frame, the hold stays for the rest of the arm. A frame that gains
+such a transition after the arm, while none had one, is found by the next survey (within 15 frames)
+or by the pointer, and picking that ends before then removes the sheet without a hold.
 
 Before the sheet, a transparent shield over every frame kept the pointer from it, and took the
 hover from whatever the page drew over a frame; one put up only once the pointer reached a frame
 would come too late, since a cross site frame tells its parent nothing when the pointer goes into
-it (checked in Chrome 156). Shields are left only for a frame whose own style beats the sheet (an
-id rule with `!important`, an inline `!important`), which a survey every fifteenth frame finds by
-its computed `pointer-events`; a menu drawn over such a frame loses its hover while the picker is
-armed. Only such a frame puts the host inside a modal dialog, where everything outside is inert
+it (checked in Chrome 156). Shields are left only for a frame whose own `pointer-events` beats the
+sheet: an inline `!important`, an `!important` in a cascade layer of the page's, or one whose
+selector holds more than eight ids. A survey every fifteenth frame finds such a frame by its
+computed `pointer-events`, and a menu drawn over it loses its hover while the picker is armed.
+Nothing in the page's own origin beats the first two, whatever its specificity: an inline
+`!important` beats every other author `!important`, and for `!important` the layer declared first
+wins, while the page's sheets come before the picker's (CSS Cascade 5; seen in Chrome 156). A
+sheet the extension inserts with user origin (`chrome.scripting.insertCSS`) would beat them, but
+only the worker can insert or remove one, asynchronously, and `frameAt` lifts the sheet in the
+middle of a move. The sheet has no layer of its own: a layer would beat an unlayered `!important`,
+as the eight ids do, but a sheet holding one made every lift six times slower (194 to 375 ms
+against 28 to 35 ms, measured in Chrome).
+
+Only a frame with a shield puts the host inside a modal dialog, where everything outside is inert
 and a shield from outside let the pointer through to the frame. Otherwise the host stays at the
-end of the body, in the top layer above the dialog, since the box, the tag and the hint take no
-pointer. In the dialog the host would be its last child, which a `:last-child` rule (Tailwind's
-`space-y`) then misses, and the dialog would move while the picker is armed.
+end of the body, in the top layer above the dialog when there is one, since the box, the tag and
+the hint take no pointer. As body's last child it takes `:last-child` from the page's own last
+element, so a page that spaces body's children by margin (Tailwind's `space-y`) moves while the
+picker is armed (4 px on a vertically centred test page), which is undone before the element is
+read and photographed. No other place is better. After body, as the html element's last child,
+the host took `:last-child` from body itself, so a page's `body:last-child` or `html >
+:last-child` rule stopped matching body while armed (a background of `rgb(1, 2, 3)` went
+transparent in Chrome 156). Before head it changes body's `:nth-child` and takes head's
+`:first-child`, and to be drawn above the page from there it would have to be a popover all the
+time, which a page hears as `toggle` events and matches with `:popover-open`. No place under the
+html element leaves every structural pseudo class of body unchanged. In a dialog the host is its
+last child, and the same rule moves the dialog while the picker is armed, which only a frame that
+needs a shield there brings about.
 
 A pick is committed on the pointerup of a primary press that went down while the picker was
 armed, so a control Chrome sends no click to, such as a disabled button, can still be picked.
@@ -872,16 +1185,43 @@ press captures its pointer to what it pressed, which the page heard as `gotpoint
 `lostpointercapture`, so the picker releases that capture as the press begins. The browser's own
 context menu still opens, since its default is left alone.
 
-Two things it cannot keep from the page. Window is the first node on the capture path, and
-Chrome runs the listeners on one target in the order they were added, across worlds, so a page
-script that put a capture listener on the window before the picker was armed hears the press that
-picks, every press of a double click included, before the picker can stop it. The press still
-does nothing on the page: its default action is cancelled, and no listener below the window hears
-it. And Chrome grants the page transient user activation in the browser when it dispatches the
-press, before any listener runs. Neither `preventDefault` nor `stopImmediatePropagation` takes it
-back, and no API clears it short of one that spends it (`window.open`, `requestFullscreen`), which
-would itself change the page, so for about five seconds after a pick the page may open a popup or
-start playback as if it had been clicked.
+What it keeps from the page's own listeners. Window is the first node on the capture path, and
+Chrome runs the listeners on one target in the order they were added, across worlds. So a page
+script that put a capture listener on the window before the picker was armed heard the press that
+picks, every press of a double click included, and the keys, before the picker could stop them.
+A small content script declared first in the bridge's entry, at document_start,
+`content/press-gate.js`, adds capture listeners on the window for the 17 event types the picker
+keeps (presses, clicks, pointer and touch events, pointer capture, `contextmenu`, the keys and
+`selectstart`; the touch ones passive) before any script of the page's own runs. It hands each
+event to the picker through a hook the picker sets at its first arm in the page
+(`window.__cdrPressGate.hook`, set to `route`), and calls nothing before that. `route` acts on an
+event only while the picker is armed, through the tail, and while the Enter that picked is held,
+and otherwise returns without reading it. The picker keeps its own listeners for a tab
+where the gate came too late or not at all, and handles each event once, whichever listener hears
+it first (`seen`). Those tabs are one open from before the extension was installed or enabled,
+since Chrome does not inject declared content scripts into open tabs, and a site the narrowed
+`matches` leave out. A tab open across an update or reload of the extension keeps the old
+version's gate, and whether the new picker is handed its events there was not checked. On such a
+tab a page capture listener on the window added before the arm runs first. One that only listens
+hears the press and the keys; the picker still gets them after it, picks, and cancels the default
+action of the mouse events and of the keys it takes, and no listener below the window hears them.
+One that calls `stopImmediatePropagation` keeps the press from the picker entirely: nothing is
+picked, and the press does what it would with no picker (a link is followed). Keys stopped that
+way, Escape, the arrows and Enter among them, do not reach the picker either. The gate is not
+injected into open tabs at install, since that would touch every tab the user has open, and it
+would come after the listeners those pages already have.
+
+Chrome also grants the page transient user activation as it dispatches a press or a key, before
+any listener runs: on a mouse's `pointerdown`, a finger's `pointerup` and `touchend` and the
+`mousedown` its tap makes, and on every `keydown` but Escape's (checked in Chrome 156). Neither
+`preventDefault` nor `stopImmediatePropagation` takes it back, and no API withdraws it. So the
+picker spends it on every such event it keeps (`spend`): `showPicker()` on a button input that is
+in no document spends it and shows nothing (checked in Chrome 156). After a pick the page can no
+longer open a popup or start playback as if it had been clicked. An activation the page already
+had from a click of its own in the five seconds before the pick is spent with it. What stays is
+sticky activation (`navigator.userActivation.hasBeenActive`), which nothing takes back, so a page
+that was never clicked reads as clicked once after a pick, and some features ask for that, such as
+audio that plays with sound.
 
 Styles are read and the screenshot is taken at the pick, in whatever hover state the element is in
 at that moment. Nothing is put over the page between the press and the screenshot, because a menu
@@ -896,23 +1236,26 @@ begins in that second is kept from the page until the button is released, its cl
 click without its `pointerdown`, and followed a link. Each press begun in the tail has five
 seconds from its own start. A press held longer is released to the page, which then sees how it
 ends but not how it began. If the pick was made with Enter and the key is held, its repeats and
-its release are kept from the page while the tail lasts; repeats after that reach the page, and
-so does any other key. The highlight goes at once, and so does the host, unless it shields a
+its release are kept from the page until it is let go, past the tail too (`holdEnter`), since
+each repeat sent the form whose field had focus (62 submits in three seconds in 0.6.0). The hold
+ends at the key's release, at a press of Enter that is no repeat (the key was let go where the
+page could not see), or when the window loses focus or the page is hidden. Any other key reaches
+the page. The highlight goes at once, and so does the host, unless it shields a
 frame the sheet does not reach, which would otherwise take the rest of the press for real. The
 payload is read with the host taken out of the page and put back in the same task, so the host
 never shows up in the markup, the text or the selector.
 
-The selector is tested with `querySelectorAll` as levels are added, up to eight tests, and stops
-at the first one that is unique. No CSS selector crosses a shadow boundary, so inside an open
-shadow root the path stops at the root and the host's own path goes in front of it, joined with
+The selector is tested with `querySelectorAll` as levels are added, up to eight tests, and stops at
+the first one that is unique. No CSS selector crosses a shadow boundary, so inside a shadow root,
+open or closed, the path stops at the root and the host's own path goes in front of it, joined with
 ` >>> `, the deep combinator Puppeteer and WebdriverIO read. When the whole is longer than 200
-characters, ancestor classes are dropped, and the selector is then sent whole; only one longer
-than 4,000 characters, which is no path a page builds, is cut to the element's own level in the
-picker. The template prints at most 200 characters (`formatSelector`). It leaves out leading
-steps first and then the element's own classes, never the element's own step, and says what it
-left out; when a step it left out is a shadow host, it says the selector starts inside a shadow
-root and does not match from the document. The picker leaves the shortening to the template so
-that the template knows which hosts were left out.
+characters, ancestor classes are dropped, and the selector is then sent whole; only one longer than
+4,000 characters, which is no path a page builds, is cut to the element's own level in the picker.
+The template prints at most 200 characters (`formatSelector`). It leaves out leading steps first
+and then the element's own classes, never the element's own step, and says what it left out; when a
+step it left out is a shadow host, it says the selector starts inside a shadow root and does not
+match from the document. The picker leaves the shortening to the template so that the template
+knows which hosts were left out.
 
 From the keyboard, the picker follows Tab focus. The first arrow key highlights the focused
 element, or else the element under the middle of the viewport, under a point across it, or the
@@ -1040,6 +1383,7 @@ cannot write a report for the panel to adopt. The messages only the panel sends 
 in a page that may be hostile, cannot ask the worker to inject anything into any tab.
 
 Note what is **not** in that table. The collector arms via the two `content_scripts` entries
+(the isolated world one also carries `content/press-gate.js`, ahead of the bridge)
 and their own `"matches": ["<all_urls>"]`, which is a grant entirely separate from
 `host_permissions`. A statically declared content script injects on its own match patterns, so
 narrowing `host_permissions` alone does not stop the collector wrapping `console`, `fetch` and
@@ -1075,6 +1419,10 @@ incognito window, and its entries in the download history, would outlive the win
 `chrome://` pages, the Chrome Web Store, other extensions' pages and `view-source:` cannot be
 captured or injected into at all. The panel detects these and explains rather than failing
 obscurely.
+
+The banner says so for as long as such a page is in view. Asked to say nothing there,
+`showBanner` puts the restriction back instead of hiding, so a copy, or a missing file's banner
+going, does not leave it away until the next tab event.
 
 Note that Chrome withholds `tab.url` entirely for any page the extension has no host
 permission for, so an absent URL is itself the signal that a page is off limits. That is also
@@ -1113,13 +1461,16 @@ screen is the actual code; only the platform is faked. What it does not reproduc
 * **The screenshot.** `captureVisibleTab` is the stage drawing the demo frame, not Chrome's
   compositor, so device pixel ratio, zoom and the visual viewport play no part, and no capture
   quota applies.
-* **Downloads.** They complete instantly unless `?save=<ms>` slows them, and there is no
-  "Save as" dialog to take focus away. No file is written: the path is made up, and
+* **Downloads.** They complete instantly unless `?save=<ms>` slows them, and there is no "Save as"
+  dialog to take focus away. No file is written: the path is made up, and
   `conflictAction: 'uniquify'` is ignored, so two captures in the same second get the same path
   where Chrome would add ` (1)` to the second. Nothing removes a file behind the panel's back
-  unless a driver says so through `__shim.downloadChanged`. Download ids and records live on the stage, beside storage,
-  so they survive the panel frame reloading, as Chrome's download history survives the side
-  panel closing, and start again when the stage itself reloads.
+  unless a driver says so through `__shim.downloadChanged`. Download ids and records live on the
+  stage, beside storage, so they survive the panel frame reloading, as Chrome's download history
+  survives the side panel closing, and start again when the stage itself reloads.
+* **The counts port.** The panel's shim has no `tabs.connect` and the demo tab's has no
+  `runtime.onConnect`, so on the stage the console and network chips are read on focus and at
+  each read, as before 0.6.1, and do not follow the page live.
 * **Storage.** It is held in memory by the stage page, so it too survives the panel frame
   reloading and is lost when the stage reloads. No quota applies, and only the one panel hears
   `storage.onChanged`.
@@ -1132,7 +1483,9 @@ screen is the actual code; only the platform is faked. What it does not reproduc
   for a web page rather than those for an extension page. The panel frame is a fixed 380 pixels
   wide, where a real side panel is as wide as the user drags it. In Chrome for Testing 156, driven
   over CDP with a real side panel, the panel's `focus()` on its field after a drag left the
-  keyboard with the page, and `window.focus()` changed nothing; a click into the panel moved it.
+  keyboard with the page, and `window.focus()`, `chrome.sidePanel.open` and
+  `chrome.windows.update` with `focused` changed nothing, though the panel heard the drag's
+  message with transient user activation; a click into the panel moved it.
   So the panel reads `document.hasFocus()` and says under the field that the page still has the
   keyboard. On the stage both share one document, so that line never shows there.
 
@@ -1140,6 +1493,71 @@ It exists for two reasons. Working on the panel's design no longer means reloadi
 extension for every change, and the README's screenshots and GIF are produced from it by
 `tools/make-media.mjs`, so they can be regenerated rather than redrawn. Nothing under
 `tools/` is included in the release zip.
+
+## The build
+
+`tools/build.mjs` refuses a zip Chrome could not load, and CONTRIBUTING.md says what it checks.
+Two choices in how it checks are design rather than detail.
+
+It asks V8, not a pattern, which places in a script are imports. The text search finds every
+`import` followed by `(`, with any comment JavaScript allows between them (a line comment ends at
+any line terminator, and an HTML like comment counts anywhere on a line, which can only add a place
+for V8 to rule out), and `inCode` keeps a place only when the file parses as it is and stops
+parsing once that `import` is spelled `class `. The pattern is tried at each keyword `import` on
+its own (`starts`). Matches read one after another never overlap, so one that started at an earlier
+`import` (a property named `import` followed by `-->`, or `"import //"` in a string) ran on to a
+later parenthesis and hid the real `import()` it ran through. So a method named `import`, a private
+`#import` and an `import(` in a string, a comment or a regular expression build, and on the
+checker's 63 shapes that parse the build agrees with what Chrome 156 requests, on Node 22 and 24.
+The search finds nothing in the shipped scripts, in 0.9 ms. On input written against it, it is
+quadratic: a line of 20,000 keywords that each match takes 0.7 to 1.8 s, and 20,000 `import` each
+followed by a comment opener on one line 3 to 6 s. Phase imports, which Chrome 156 refuses as a
+SyntaxError while Node 24 parses the source phase, fail the build on Node 22 and 24: a static one
+read from V8's record of the module's imports (its `phase`), in a module the build follows and in
+one nothing imports, and a dynamic `import.source()` or `import.defer()` found as `import()` is
+(`PHASE_CALL`, `phaseCalls`). Line numbers in its messages count line feeds only, and a file under
+`content/` that a module also imports is parsed only as a module, where Chrome's classic injection
+would read it as a script; no shipped file is both.
+
+Its children take no input through a pipe (`runNode`). Data handed to a child on stdin through
+`spawnSync`'s `input` now and then never arrived on macOS: the child waited on its stdin for good
+while the build waited for the child, in 7 of 2,880 children across Node 22 and 24. So the import
+check (`node --experimental-vm-modules tools/build.mjs --link`) reads every script from a JSON
+file in a new folder under the system's temp directory and writes its answer to a file there,
+with stdin and stdout not connected and its error output to a file in that folder, which is
+removed when the check ends (`checkImports`, `inScratch`). Every child has a limit of 120 s
+(`CHILD_TIMEOUT_MS`), after which it is killed and the build fails saying which check did not
+finish. V8 parses every module in the import check, and Node's own syntax check (`node --check`,
+on a copy named `module.mjs`) runs only for a module V8 refused, to find the line, or for every
+module when the import check could not run; V8's verdict stands if they differ. A clean build
+starts one child instead of four, and the real tree builds in 0.13 s instead of 0.18 to 0.19 s.
+
+So the build needs a temp directory it can write to, which 0.6.0 did not. A folder that cannot be
+made (`TMPDIR` names one that does not exist) or written (a full disk) fails the build with one
+line per check and no stack: the import check, then the syntax check of each module, each saying it
+could not run and why. A build stopped by a signal (Ctrl+C, `SIGTERM`, `SIGKILL`) never reaches the
+code that removes its folder, which holds a copy of every shipped script (about 0.8 MB). So before
+it makes one, each build removes the folders in the temp directory named `punch-list-build-` and
+six letters or digits that were last changed over an hour ago, skipping any it may not remove
+(`sweepScratch`). A stopped build's folder therefore stays until the next build at least an hour
+later. With an empty temp directory that costs nothing measurable, and 8 to 10 ms with one of
+21,365 entries. When the build alone is killed while a child is stuck, and not its process group,
+the child keeps running with no limit.
+
+`tools/release-check.mjs` runs each `git` and `gh` call with stdin not connected and a limit of 60
+s, after which the call is killed and the run fails naming it (`run`). On CI (`GITHUB_ACTIONS` is
+`true`, or `CI` is `true` or `1`, as CI services set it; `CI=false` is a local run) the call leads
+a process group of its own (`spawnSync` with `detached`, which Node 22 and 24 honour), and the
+whole group is killed with it, so a `git` that `gh` started goes too. Locally it stays in the
+terminal's foreground group, where Ctrl+C reaches it: in a group of its own, Ctrl+C stopped the
+check and left a hung call running with nothing to enforce its limit. So locally a call that runs
+out of time is stopped while what it started keeps running, as in 0.6.0. On Windows, which has no
+process groups, only the call itself is stopped. A call that failed or ran out of time prints its
+message alone, since that names the call (`CallFailed`); any other error keeps its type and stack,
+and a `manifest.json` or `package.json` that is not valid JSON is named as a `SyntaxError`. The tag
+lookup takes only exit 1 from `git rev-parse -q --verify` as no tag (`tagCommitOf`). Any other
+failure, such as exit 128 outside a repository, fails the run; read as no tag, it had a run on
+`main` decide to release.
 
 ## Conventions in the code
 
@@ -1152,4 +1570,5 @@ keeps to the same rule.
 The collector wrappers must never break a host page. Every one of them preserves `this`, passes
 return values through unchanged, re-rejects rejections, and swallows its own errors. Each is made
 with `wrapNative()`, a Proxy of the native with only an `apply` trap, so the page sees the
-native's name, length and `toString`.
+native's name and length, and a `toString` that says `[native code]` with no name, as for any
+callable proxy.

@@ -2,8 +2,8 @@
 
 Reviewed at commit `a0c9335` on 2026-11-15. The analysis was made without changing code. Two
 sections at the end, added on 2026-11-16, record what was implemented afterwards and what turned
-up while doing it; the 0.6.0 round was recorded in them on 2026-11-17. Line references in the
-sections before them point at `a0c9335`.
+up while doing it; the 0.6.0 round was recorded in them on 2026-11-17, and the 0.6.1 round on
+2026-11-17 and 2026-11-18. Line references in the sections before them point at `a0c9335`.
 
 This file sits under `docs/`, which the release zip does not include. `tools/build.mjs:32` packages
 from an allowlist of six paths (`manifest.json`, `background.js`, `icons`, `content`, `shared`,
@@ -961,8 +961,9 @@ Stated here so nothing above reads as more certain than it is.
   rests on the stage and on reading. For 0.6.0 a real side panel, opened in headless Chrome for
   Testing 156, settled UX5.
 * The fullscreen half of CW3, and whether `_execute_action` opens the panel, come from
-  documentation and Chrome's samples. The fullscreen half was observed for 0.6.0: the overlay stays
-  under a fullscreen element (F36).
+  documentation and Chrome's samples. The fullscreen half was observed for 0.6.0 and read wrongly
+  then: the overlay was drawn above the fullscreen element, inert, so every press reached the page.
+  Since 0.6.1 it goes inside a fullscreen element that can hold it (F36).
 * The cross window races (SS4, SS5) reproduce with artificial delays of 5 to 40 ms; the real gap
   in Chrome was not measured. SS3 was run against a fake storage.
 * SP3 was not run with an edited manifest; it rests on the tabs reference and Chromium's source.
@@ -980,7 +981,9 @@ Stated here so nothing above reads as more certain than it is.
 
 The first three subsections on 2026-11-16, on the branch `review-fixes`, and their line references
 point at that branch. The fourth, for 0.6.0, on 2026-11-17, on the branch `open-items`; its line
-references, and those in the table after it, point at that tree.
+references point at that tree. The fifth, for 0.6.1, on 2026-11-17 and 2026-11-18; its line
+references, and those in the table after it, point at the 0.6.1 tree. A note in parentheses marked
+"since 0.6.1" in an earlier subsection says what changed later.
 
 ### Items 2 and 3 of the top 5
 
@@ -988,7 +991,7 @@ references, and those in the table after it, point at that tree.
 prompt in `test/golden/`, the real collector in a `node:vm` realm against a fake XMLHttpRequest
 that behaves as Chrome 156 was observed to, and static checks on every path the manifest, the
 worker and the panel name. `.github/workflows/ci.yml` runs it on Node 20 and 24, and `release.yml`
-runs it before building.
+runs it before building. (Since 0.6.1, CI runs on Node 22 and 24, and the release on Node 24.)
 
 **Small fixes (improvements 2 to 5).**
 
@@ -1391,7 +1394,8 @@ open items. Items that turned out to be fixed already are marked so. Line refere
   and again after a tab switch (`:317`, `sidepanel/panel.html:113`). They are read again when the
   panel takes focus, is shown, or has the pointer back, at most once a second
   (`sidepanel/panel.js:2153`), and an older reply can no longer overwrite a newer count. They stay a
-  snapshot while the panel is left alone (F46).
+  snapshot while the panel is left alone (F46). (Since 0.6.1 they follow the tab in view while the
+  panel is open and shown, which fixes F46.)
 
 **The worker, the overlay and capture.**
 
@@ -1406,7 +1410,7 @@ open items. Items that turned out to be fixed already are marked so. Line refere
   root within 15 frames (`:340`, `:376`, `:401`), at most 100 times per arm (`:40`). The picker does
   the same (`content/picker.js:2646`) and hides its own `::backdrop`, so a page rule cannot dim the
   screenshot (`:887`). Not fixed: a fullscreen element (F36) and a dialog in a closed shadow root
-  (F37).
+  (F37). (Since 0.6.1 both are handled, save the cases left in F36 and F37.)
 * CW4. While a mode is armed the panel holds a port to the worker, and closing the panel disarms
   the tab (`sidepanel/panel.js:1749`, `background.js:921`). A port shut by a worker stop is
   reopened, after 100 ms doubling up to 2 s when it keeps shutting. A shortcut arm whose
@@ -1479,6 +1483,7 @@ open items. Items that turned out to be fixed already are marked so. Line refere
 * PI7, partial. The pick descends through open shadow roots (`:1987`), the selector joins one path
   per tree with ` >>> ` (`:985`), and the collector finds the marked node there and reads its
   component (`content/collector-main.js:3790`). A closed shadow root still yields its host (F37).
+  (Since 0.6.1 the pick goes inside a closed root too, and its component is read through the host.)
 * PI10, M5 (improvement 22). The element is read and photographed the moment it is picked, with the
   pointer over it, and the payload says when it matched `:hover` (`content/picker.js:2882`); the
   prompt then says "Styles and screenshot show it hovered." (`shared/prompt-template.js:1203`).
@@ -1621,7 +1626,8 @@ open items. Items that turned out to be fixed already are marked so. Line refere
   shaped frame keeps its line and column only when a line next to it is a frame too (`:1738`,
   `:1761`). Decoding checks for valid UTF-8 before it calls `decodeURIComponent` and has a fast
   path for plain escapes (`:1479`, `:1490`, `:1509`): a megabyte of invalid escapes went from about
-  300 ms to under 75. What F20 and F24 leave is in the table.
+  300 ms to under 75. What F20 and F24 leave is in the table. (F20 was finished in 0.6.1; what
+  F24 leaves is F52.)
 
 **Tooling, release and docs.**
 
@@ -1648,7 +1654,7 @@ open items. Items that turned out to be fixed already are marked so. Line refere
 * SP3, SP11, SP12, PI17. The restriction recipe was run both ways in Chrome for Testing 156, and
   the README gives the result. The `activeTab` sentence points at its section. `PRIVACY.md` is new.
   PI17 was already right in the README and the preview.
-* TR11 is not fixed (F53).
+* TR11 is not fixed (F53). (The owner has since set the repository's description and homepage.)
 
 **How it was checked.** Each area was implemented in its own copy of the branch, each fix with a
 test that fails on the tree before it, and the seven copies were then combined. Three rounds of
@@ -1675,36 +1681,38 @@ before had written, or in older edge cases further out, and the older share grew
   that was handed it without rendering the field, such as a strength meter or a rules list.
 
 A regression check of the last fix round followed: four checkers in Chrome, each asked only whether
-that round's fixes held and whether anything that worked before had broken. They found 5 new
-defects (1 medium). A component that renders a password control printed a secret handed to it under
-another name when no control held it, such as a confirm field handed the first password after the
-step that held it had unmounted. The site check refused a running collector after a route change
-when an include glob had no slash before its text (`*app*`). Frames were picked by their box rather
-than by what is drawn there, and one past the first hundred could not be picked at all. And after a
-late start, a page whose `fetch` returns a Bluebird promise or another thenable no longer reports
-its unhandled rejections, which is kept (F49). A fourth fix round took the rest, each fix followed
-by an adversarial check of that fix alone, and those checks found 12 defects in the fixes and
-around them (5 medium, one of them older). The shape rule also fired beside fields known only by a
-secret name, hiding the ids of every shipping and profile form, and it missed every secret made
-only of digits; the frame test modelled clipping by hand, and so passed over fixed frames, frames
-under an overflow the viewport takes from `body`, and an `<object>`'s fallback frame. All three
-were redone by hand: the shape rule is keyed on password, code and card controls known by type or
-autocomplete, with a digit rule beside the last two; the site check asks Chrome's own rule about
-URLs the manifest's rules suggest; and the frame test asks the browser itself, once, and only where
-the pointer is inside a frame's box. A last check by three skeptics then found 2 medium and 10 low
-defects in those. A date beside a card field was withheld, because the digit rule ran before the
-exemptions. An exclude that took out the few URLs the site check tried (the root, a pattern's own
-path) lost a running collector that the round before had bridged. Among the lows, a pattern's path
-was not escaped as Chrome escapes a URL's (`café`, `a"b`), and the picker's rule giving an
-`<object>`'s fallback the pointer back beat the page's own `none` and slowed every restyle by about
-a quarter. All but one were fixed, each with a test that fails on the tree before it (the one left
-is in F50: a frame with a discrete `pointer-events` transition), and the checkers' own Chrome
-scripts were then run again on the result. Every props case they built prints or withholds as
-documented. The worker's matcher agrees with Chrome on all 7141 manifest variants at 60 URLs, the
-ten site cases bridge the running collector, and of the 878 rows where the site check had lost one,
-56 remain, all of one stated limit: an include glob that names a scheme is not tried as a path
-(`*://*app*`). Every picker case picks what plain Chrome's hit test finds, save the stated limits
-(a closed shadow root, a frame past the 2,000th), and a move over a frame costs 13.9 ms at 100 000
+that round's fixes held and whether anything that worked before had broken. They found 5 new defects
+(1 medium). A component that renders a password control printed a secret handed to it under another
+name when no control held it, such as a confirm field handed the first password after the step that
+held it had unmounted. The site check refused a running collector after a route change when an
+include glob had no slash before its text (`*app*`). Frames were picked by their box rather than by
+what is drawn there, and one past the first hundred could not be picked at all. And after a late
+start, a page whose `fetch` returns a Bluebird promise or another thenable no longer reports its
+unhandled rejections, which is kept (F49). A fourth fix round took the rest, each fix followed by an
+adversarial check of that fix alone, and those checks found 12 defects in the fixes and around them
+(5 medium, one of them older). The shape rule also fired beside fields known only by a secret name,
+hiding the ids of every shipping and profile form, and it missed every secret made only of digits;
+the frame test modelled clipping by hand, and so passed over fixed frames, frames under an overflow
+the viewport takes from `body`, and an `<object>`'s fallback frame. All three were redone by hand:
+the shape rule is keyed on password, code and card controls known by type or autocomplete, with a
+digit rule beside the last two; the site check asks Chrome's own rule about URLs the manifest's
+rules suggest; and the frame test asks the browser itself, once, and only where the pointer is
+inside a frame's box. A last check by three skeptics then found 2 medium and 10 low defects in
+those. A date beside a card field was withheld, because the digit rule ran before the exemptions. An
+exclude that took out the few URLs the site check tried (the root, a pattern's own path) lost a
+running collector that the round before had bridged. Among the lows, a pattern's path was not
+escaped as Chrome escapes a URL's (`café`, `a"b`), and the picker's rule giving an `<object>`'s
+fallback the pointer back beat the page's own `none` and slowed every restyle by about a quarter (a
+slowdown that did not reproduce for 0.6.1, where the rule measured no restyle cost; it stays removed
+because it cuts off a `none` the page sets above the object). All but one were fixed, each with a
+test that fails on the tree before it (the one left was in F50: a frame with a discrete
+`pointer-events` transition, fixed in 0.6.1), and the checkers' own Chrome scripts were then run
+again on the result. Every props case they built prints or withholds as documented. The worker's
+matcher agrees with Chrome on all 7141 manifest variants at 60 URLs, the ten site cases bridge the
+running collector, and of the 878 rows where the site check had lost one, 56 remain, all of one
+stated limit: an include glob that names a scheme is not tried as a path (`*://*app*`). Every picker
+case picks what plain Chrome's hit test finds, save the stated limits (a closed shadow root, handled
+since 0.6.1, and a frame past the 2,000th), and a move over a frame costs 13.9 ms at 100 000
 elements, down from 17.4, with a page's own restyle while picking as fast as without.
 
 `npm test` passes 529 tests in 12 files, every one of the 28 goldens byte for byte. A real side
@@ -1744,9 +1752,10 @@ panel was used once, headless, for UX5; headed Chrome and the real Alt+Shift+C c
   the hover from menus drawn over a frame, and a cross site frame tells the parent nothing when the
   pointer enters it, so a shield switched off at that moment comes too late. The cost: page scripts
   can see the sheet in `adoptedStyleSheets` while picking, a frame whose own CSS beats it keeps a
-  shield, under which a menu still loses its hover, and while the pointer is over a frame each move
-  restyles the page once (28 ms at 100 000 elements), so that the browser, rather than a model of
-  clipping and stacking written by hand, says what is drawn there.
+  shield (since 0.6.1 only an inline `!important`, a layered `!important` or one of more than eight
+  ids does), under which a menu still loses its hover, and while the pointer is over a frame each
+  move restyles the page once (28 ms at 100 000 elements), so that the browser, rather than a model
+  of clipping and stacking written by hand, says what is drawn there.
 * **Passwords withheld by value.** Withholding every string and number prop of a component that
   renders a secret field hid the titles, totals and steps of every login and checkout form, and
   still printed a password handed to a component that renders no field. Matching the live values of
@@ -1756,7 +1765,8 @@ panel was used once, headless, for UX5; headed Chrome and the real Alt+Shift+C c
 * **The tooltip's click through, with its 500 ms wait.** The tooltip can be hovered and read
   (UX13), so it covers the row above, and a click there must still reach that row while a double
   click selects a word. Half a second is the default double click time on macOS and Windows. The
-  cost: a row picked through its tooltip changes half a second after the click, and F41.
+  cost: a row picked through its tooltip changes half a second after the click, and F41. (Since
+  0.6.1 the wait grows to the user's slowest double click seen in the panel, up to one second.)
 * **No probe at all on a site the matches leave out, and probing only on a matched site's other
   paths.** A page that answers the probe gets a bridge and can put lines of its own in the log, so a
   site the user kept the collector off gets nothing injected. On a declared site, a single page app
@@ -1764,50 +1774,460 @@ panel was used once, headless, for UX5; headed Chrome and the real Alt+Shift+C c
   path a page can answer the probe and learn the extension is installed (F32), and on a site left
   out a collector still running from before the matches were narrowed is not read.
 
+### The table, for 0.6.1
+
+What was asked: every row of the table at the end as 0.6.0 left it (F10 and F20 to F59), in nine
+areas (the URL scan, the word lists, the panel, the live chips, the wrappers, the natives, the
+picker, the overlay, the build), and CI on the Node lines still supported. Line references point at
+the 0.6.1 tree.
+
+How it was checked. Each area was fixed in its own copy of 0.6.0, each fix with a test that fails on
+the tree before it, and checked in headless Chrome for Testing 156.0.8078.4 with the real unpacked
+extension; the nine were then merged (`eec92cf`). Six checkers took the merged tree apart by area,
+in Chrome and in Node, each asked whether its fixes held, whether the claims made for them were
+true, and whether anything that worked in 0.6.0 had broken. They found 34 problems (7 medium, 27
+low), 23 of them marked regressions against 0.6.0: 21 in code, plus the docs, which had not been
+brought up to date yet, and the version, which still said 0.6.0. A second round took every finding
+in code under the same rule for tests, and reverted one fix (F50e) whose side effect was worse than
+the shift it removed. A final check of that tree (`d5b082e`) in the same six areas found 24 problems
+(4 high, 2 medium, 18 low), 17 of them regressions against 0.6.0 that the rounds had brought in. The
+four high ones: picking a link whose `href` is a megabyte `data:` URL froze the page for 0.7 s, keys
+with a `u` or `b` prefix (`{u'token': …}`) printed again, a trim of a long ring in quadratic time
+froze a page for 1 to 11 s at its next console call, and file opens blocked on a volume that stopped
+answering used up Chrome's file threads across the whole browser. A third round fixed 19 of them
+with small changes, each with a test that fails on the tree before it, left two documented with
+their measured cost (F68, and the shadow walk in F48), and answered the three about the disk check
+by taking it back to 0.6.0's behaviour (F31, F45). It also fixed F67, found while these docs were
+checked against the code. A confirmation run reran every reproduction script of both checks on that
+tree (`c72b712`): of 65 findings, 46 were gone, 17 were the documented limits, and 2 could not run
+(the disk check's, whose code was taken out). It found 6 new problems in the third round's small
+changes (1 medium, 5 low, 4 of them regressions against 0.6.0). Three more rounds followed, each
+checked in Chrome by rerunning the scripts of the check before it, and each fix again with a test
+that fails on the tree before it. The fourth round fixed the six (`3878b9f`). A check of that tree
+found 9 low problems, 8 of them distinct; the fifth round fixed six, widened one fix and documented
+the last (`a811414`). Rerunning those scripts showed that the fifth round's survey change brought
+back the third round's cost on pages of many `content-visibility: auto` frames (high) and that a
+card's digits run together in a sentence printed again (low). The sixth round fixed both
+(`27c09c6`), and a last rerun of those two checkers' scripts confirmed both fixes and found nothing
+high: three low edges of the sixth round's own (the cost of its card search, in F48, and two survey
+edges, in F50) and a cost 0.6.0 already had (F71). The loop stopped there (see Judgment calls).
+
+`npm test` passes 648 tests in 12 files on Node 22.21.1 and 24.10.0 (529 in 0.6.0), with every one
+of the 28 goldens byte for byte; seven goldens gained F56's two lines.
+
+**Claims the checkers proved false.** Each was a claim made for a fix of the first round, or a row
+or document of 0.6.0, and each is now true or withdrawn.
+
+* F36's row said the overlay was drawn under a fullscreen element. It was drawn above it, inert, so
+  every press reached the page. The first fix then reloaded an `<object>` on every arm, moved
+  `:last-child` layouts, fired `slotchange`, had no box in a component with no default slot, and its
+  "armed before or after" failed for the body. All five were fixed (below).
+* F51's first fix said a root attached after the arm is found within a quarter second. Its walk went
+  from the start of the page, so a toast appended last to a page of 30 000 elements was missed, and
+  walking every fifteenth frame cost 2 to 20 times what 0.6.0 spent. Replaced (below).
+* F50e's first fix put the picker's host after `body`, which took `:last-child` from `body` itself.
+  Reverted. F50f's first fix held discrete transitions for the whole arm, which cut the page's own
+  fade of a frame short, so its `transitionend` never ran. Now held only at the picker's moments.
+* F31 and F45's first fix called a file it could not read missing, had no time limit (Copy stayed on
+  Copying), and listed a folder once per missing item (5,272 ms for 20 in 10,000 files). Fixed in
+  the second round, and then taken back with the rest of the disk check (below).
+* F46's first fix said a page cannot hold back the bridge's counts. That holds only on a declared
+  start, and one lost signal froze the chips where no read could correct them. Fixed, and the late
+  start case is stated (F32).
+* F48's first fix said shadow roots are searched at any depth. It looked into no nested root once
+  the light DOM held 512 hosts, and its edit rule withheld numbers and month labels one character
+  from a short secret. Fixed.
+* F20 and F40's first fix took 823 ms in Chrome for a megabyte page URL, counted any quoted word
+  before a colon as a JSON key, and screened text it joined across an apostrophe more weakly than
+  the parts. Fixed. F40's row was itself wrong: request and page URLs do carry a raw `&` in JSON.
+* F52's first fix measured its cost on first names only, and stripped `armstrong@`, `jschmidt@`,
+  `pgsql@` and `httpd@`. Fixed with letter groups.
+* F54's first fix said the build finds every dynamic import. A comment ended by U+2028 or a lone CR,
+  or an HTML like comment in a content script, hid one; `#import` was read as one; and Node 24
+  passed phase imports Chrome refuses. Fixed. Its time limit on the import check treated a symptom:
+  `spawnSync` input stalls on macOS (7 of 2,880 children). Fixed by taking input from files.
+* F59's first fix killed only the `git` or `gh` it started, not their children. Fixed, on CI.
+* F39's kept row said a page listener added before the arm on a tab with no gate still has its
+  press's default action cancelled. A listener that calls `stopImmediatePropagation` keeps the press
+  from the picker, and a link is followed. Documented; not fixable for such tabs.
+* F37's first picker fix reached into closed roots but lost the component and handlers 0.6.0 gave
+  through the host, and wrote its marker inside the closed tree. Fixed: the host is marked and read.
+* `docs/ARCHITECTURE.md` said a wrapper's `toString` reads as the native's (F34 says otherwise), and
+  that giving an `<object>`'s fallback the pointer back slowed every restyle by a quarter, which did
+  not reproduce. Both corrected.
+
+**Claims the final check proved false.** Each was made for a fix of the second round, and each is
+now true or withdrawn.
+
+* F50f's hold was said to come only at the picker's own moments, so that the page hears no
+  transition of `pointer-events`. It also came when the sheet went back after the page dropped it,
+  which fired `transitionrun`, `transitionstart` and `transitioncancel` on every frame in that tree:
+  a page that reset its own lists every animation frame heard 363 events in a second, against 6 in
+  0.6.0. The sheet now goes back with nothing held. Its open item said only that every survey reads
+  the first 100 frames; a frame past them was not held at the arm, where a press right after it went
+  into the frame in 2 of 3 tries. Every frame found and drawn, up to 2,000, is now asked, and one
+  not drawn is asked once it is (rounds four to six, below).
+* F51's walk was said to cost within 1.4 times 0.6.0. That held for quiet pages. On a page that
+  changes its light DOM, every known shadow root was queried at every look until the next walk, 10
+  to 13 times 0.6.0 with closed roots, and the walk was gated by frames, so 120 Hz doubled it. Now
+  only the roots that held a popover or a dialog are queried, and the walk runs at most once a
+  second by the clock. Such a page still costs about three times 0.6.0 with closed roots (F69).
+* F36's overlay was said to keep presses and clicks from the page inside a fullscreen element, and
+  to work in a fullscreen component's shadow root. A misclick inside a fullscreen element nested in
+  a link, a label or a form's button followed the link, toggled the box or submitted the form, which
+  0.6.0 did not do. A component whose own CSS says `* { pointer-events: none }` left the host drawn
+  while every press went through (0.6.0 could not be used there either). Clicks on the host are
+  now cancelled as well as stopped, and its inline style sets `pointer-events`, `visibility` and
+  `opacity`.
+* F46 was said to tell a change it could not tell with the next entry, and every read was said to
+  set the chips right. A ring filled during a stack overflow never told again while it stayed full,
+  and on a late start a page that sent the change event itself could make the bridge drop the
+  panel's port, after which no read moved the chips. Both fixed.
+* F48's shadow walk was called bounded. It is bounded in roots, in the elements asked for roots and
+  in the controls read, not in the elements a root's selector looks at: 512 roots of 2,000 elements
+  took 58.9 ms a pick. Now said so (F48).
+* F54 was said to check every dynamic import, and phase imports to fail the build on every Node. A
+  match that started at an earlier `import` hid a real `import()`, and a static phase import in a
+  module nothing imports built clean on Node 24. Both fixed.
+* F59 was said to leave a call that Ctrl+C left running to finish or reach its limit on its own. It
+  ran on with nothing to enforce the limit. Fixed: only CI starts a call in a group of its own.
+* The build was said to remove its temporary folder when each check ends. A build stopped by a
+  signal left it behind, and a temp directory it could not use crashed the build with a stack. Both
+  fixed; what a stopped build still leaves is F70.
+* F31 and F45's disk check was said to hold back a deletion in folders of 200 to 2,000 files. That
+  held only with the head start the test harness gave. Withdrawn with the disk check.
+
+**What the confirmation run and the reruns found.** Each is about a fix of the third, fourth or
+fifth round, and each is now fixed or written down.
+
+* F48's card rule was said to withhold a card number one digit away however it is grouped. It did
+  only when the prop was grouped as the field: `4111111111111111` beside a field holding `4111 1111
+  1111 1111` printed whole (medium; 0.6.0 printed it too). The fourth round held each grouped
+  number's digits beside the held values, which took two of the 64 places a pick keeps for them (a
+  passphrase after 32 grouped numbers printed), read every string prop twice (18 ms a pick for a
+  megabyte prop of digits), and found a four digit PIN in the joined digits of a reference number.
+  The fifth works the digits out once a pick, for held numbers of 12 digits or more only, and
+  compares them with props of 64 characters or fewer that hold nothing else, which let the digits
+  run together in a sentence print again. The sixth looks for those digits in every prop as written
+  as well, without the cap or the PIN problem. Its rerun found the sentence, JSON, URL and over 64
+  character cases withheld again, as in the fourth round, and the cost of searching each prop twice,
+  once for each held number as written and once for its digits: with 63 held card numbers and twelve
+  1 MB props that hold none of them, a pick takes 511 to 581 ms against 245 to 282 ms in 0.6.0, and
+  with one held card 7.0 to 7.9 ms against 3.1 to 3.5 (F48).
+* The ring's one pass cut copied the whole ring onto itself on every push that ran out of stack at
+  its first look: a sweep to a ring of about 132,000 entries took 39.3 s, against 33.3 s in 0.6.0.
+  It now copies only after it cut something: 33.3 to 35.5 s, against 32.9 to 33.7 s in 0.6.0.
+* W1-3's wider decode had its cost written down only for a value with no colon (`it%27s`, not
+  decoded again). It decoded every value with `%27` or `%5C` and a colon, so a picked link of a
+  megabyte of `q=it%27s:1&` took 158 to 172 ms against 64 to 75 ms in 0.6.0. The fourth round
+  decoded only where a decode can make a key, which printed three shapes the third round hid (a raw
+  `"token"%3A…`, an encoded URL with credentials before `@`, an escaped `{`); the fifth decodes
+  those too. The same pick now takes 98 to 122 ms, and the three shapes and a fuzz of 400,000 values
+  are masked exactly as the third round masked them.
+* The survey of every frame cost 1.0 to 1.2 ms on 2,000 plain iframes, but on frames in
+  `content-visibility: auto` sections reading each frame's style lays it out: on 1,000 such frames
+  each arm took 37 to 51 ms (0.6.0: 8 to 10) and the first scroll after it froze the page for 0.34
+  to 0.36 s. The fourth round passed over every frame not drawn, which left a frame shown while
+  armed unheld until the next survey. The fifth asked hidden frames again and called
+  `checkVisibility()` with no options on frames in skipped content, which lays them out too: 33 to
+  43 ms an arm and 0.34 s at the first scroll again. The sixth passes over every frame not drawn and
+  asks those again before each change of the sheet, once drawn. In Chrome a frame first drawn while
+  armed, shown from `display: none` or `content-visibility: hidden` or scrolled into view in a
+  `content-visibility: auto` section, now gives the page no transition event (the fourth round: 9 on
+  three moves and 3 at an Escape), and on 1,000 and 2,000 such frames an arm takes 10.3 to 10.7 and
+  18.6 to 19.6 ms and the first scroll after it holds the page 48.5 to 55.3 and 87 to 94 ms at most,
+  as in the fourth round and 0.6.0 (the fifth: 34 to 42 and 99 to 113 ms, 0.33 and 1.1 to 1.2 s).
+  What it leaves is in F50.
+* The release check's process groups were to start only on CI, but `CI=false` and `CI=0` counted as
+  CI, so on a local run with either, Ctrl+C left a hung git or gh call running with no limit. Only
+  `CI=true`, `CI=1` or `GITHUB_ACTIONS=true` count now.
+* W5-1's guard test, which fails when the panel leaves file opens waiting, could not see opens made
+  when a panel loads, and then not one that waits for the page to be visible. It now reopens panels
+  with the panel's own `fetch` in reach and a document that is visible, and fails with 1,800 opens
+  counted when every item is opened at load.
+
+**The URL scan and the word lists.**
+
+* F20, F40, F55. The JSON rule the picker used for a link's query is now the one shared rule, in
+  both copies of the SECRET URLS block, read in one pass (`shared/prompt-template.js:1854`
+  `splitJson`, `:1920` `jsonSpans`). A key counts only where JSON puts one, quoted raw, escaped, as
+  `"` or `'`, or percent encoded once or more, with one or two of the letters `u`, `b` and `r`
+  allowed before its quote, as Python writes a dict (`:1366`, `:1365`), and a URL with more than 500
+  distinct keys in all is hidden from its first bracket (`:1380`). A parameter's value is decoded
+  once more when it holds an encoded apostrophe or backslash and a colon, and something a decode
+  could make more of (a `{` or `,` a key can follow, a raw double quote, a letter or digit written
+  as an escape, or an `@` with slashes) (`:1580` `nestedUrl`), so single quoted keys that show only
+  once decoded are hidden. A pair with an empty name is screened. A `data:` URL's content is hidden
+  after its comma when a link in it carries credentials or a secret parameter, or JSON in it names a
+  secret key, and a path parameter there (`;jsessionid=`) counts by its name, read once on the
+  content decoded as far as it goes (`:1777` `dataContent`, `:1804` `pathSecretIn`). Text a URL is
+  read on across is screened on its own as well (`:2235`). The scheme of an absolute URL is found by
+  its `://` (`:2014`): a megabyte of dotted names in a message takes about 3 ms where it took 21 to
+  72. A megabyte page URL takes about 25 ms in Node and under 100 ms from click to clipboard in
+  Chrome, where the first round took 823 ms, and picking a link whose `href` is a megabyte `data:`
+  URL holds the page for 100 to 117 ms, where the second round took 650 to 717 ms. In the first
+  round's 30 000 line fuzz of console text the printed secrets fell from 14,352 to 37 of 26,238.
+  What is left is F60, and what the scan costs is F68.
+* F43. `nonce` is a secret word in all three copies (`shared/prompt-template.js:1284`,
+  `content/collector-main.js:300`, `content/picker.js:124`), which covers `payment_method_nonce` and
+  WordPress's `_wpnonce`.
+* F52, partial. A URL's user name with no password goes when it has five consonants in a row,
+  counting common letter groups (`sch`, `ght`, `str`, `sql`, `http`, `ck`, `ng` and 15 more) as one
+  (`shared/prompt-template.js:1349`, `:1396`). It strips about 44, 64 and 78 percent of random
+  tokens of 8, 12 and 16 small letters. What is left is in the table.
+* F56. A list prints the log's zone and day above the first item whenever no Captured line comes
+  before the first log line, the page toggle on or off (`shared/prompt-template.js:443`
+  `clockNotice`).
+
+**The panel.**
+
+* F31, F45, tried and taken back. Where Chrome let the extension open file URLs, the second round
+  had the panel ask the disk before Chrome's records. The final check found that opens blocked on a
+  volume that stopped answering used up Chrome's file threads across the whole browser, and two
+  smaller faults (F31). The third round took the panel back to Chrome's records alone, with 0.6.0's
+  code there byte for byte (`sidepanel/panel.js:2920` `checkFiles`): it opens no file URL and lists
+  no folder. A copy whose ticked screenshot's path is a FIFO never opens it, and a copy with 20
+  unticked items and one ticked waits on nothing; both take under 75 ms, as in 0.6.0.
+  What a safe disk check would need is in the F31 row.
+* F41, partial. The click wait on a row tooltip grows to the slowest double click the panel has
+  seen, with a fifth to spare, up to one second (`sidepanel/panel.js:850` `learnClickTime`, `:832`).
+* F44. Checked again with a real side panel: `chrome.sidePanel.open`, `chrome.windows.update` with
+  `focused` and `window.focus()`, called in the task that carried the drag's activation, left the
+  keyboard with the page. Kept.
+* F57. On a tab the panel may not capture, a request to hide the banner puts the restriction back
+  (`sidepanel/panel.js:283` `showBanner`), so a copy no longer takes it away.
+* F58. Copy gives the keyboard back: to Copy, to the tick of an item whose missing file holds it
+  back, or to Copy again once the sheet is empty, also after Cmd or Ctrl+Enter in the field
+  (`sidepanel/panel.js:2661` `focusAfterCopy`).
+
+**The collector and its bridge.**
+
+* F46. While the panel is open and shown it holds a `cdr:counts` port to the bridge of the tab in
+  view (`sidepanel/panel.js:2247` `watchCounts`, `content/collector-bridge.js:223`). The bridge asks
+  the collector to watch, posts the two counts when they change, at most every 250 ms (`:183`),
+  setting that gap before it asks (`:288` `countsTick`), and again at every read and Clear (`:250`
+  `recount`). A change event that comes while no port is open is acted on when the bridge's timer
+  fires (`:309`), and a bridge that stops watching closes every port it still holds (`:264`
+  `unwatchCounts`), so a page that floods that event on a late start can no longer make it drop the
+  panel's port: the chips followed the log in 8 of 8 runs, where the second round froze in 2 of 3.
+  The collector says a ring grew only with 1,600 calls of stack to spare and marks it told after the
+  event has gone (`content/collector-main.js:4253` `roomToTell`, `:4277` `countsChanged`). A change
+  it could not tell is owed (`:197`) and told with the next entry, also one into a full ring. In the
+  checker's case (warnings logged on the way back from a stack overflow) the chips showed 35 with no
+  read, where the first round showed 0 even after one. The probe costs about 13 µs; 20,000 console
+  lines in 2 s cost 163 to 251 ms in console calls (0.6.0: 266). A ring left long by pushes that ran
+  out of stack is cut back to 30 in one pass by the next push (`:224` `push`), a fault older than
+  this round: the console call after about 66,000 extra entries takes 0.8 ms, where the second
+  round's cut took 11 s.
+* F10, partial. A failed XHR is also settled a task later from its `load`, `error`, `timeout` or
+  `abort` event, one timer per request (`content/collector-main.js:2107`, `:2081`). A page whose
+  listener stops `readystatechange` and `loadend` had a 500, a refused connection and a timeout
+  recorded, where 0.6.0 recorded none.
+* F35, partial. After a late start `Error` is taken from the native zone.js kept, as `setTimeout`
+  and `addEventListener` are (`content/collector-main.js:359` `beforeZone`, `:378`, `:1915`). With
+  zone.js 0.15's error plugin, 200 requests made 200 calls of the page's `String.prototype.split`
+  and recorded no caller; now none, and the caller is named.
+* F48, partial. A prop one edit away from a secret control's value is withheld when that value reads
+  as a passphrase or a seed (`content/collector-main.js:2759` `editedFrom`, `:2796` `seedLike`), as
+  a number of 12 digits or more, such as a card number, now does (`:2771`), and such a number in a
+  prop that holds nothing else counts by its digits, however the field and the prop group it
+  (`:2495` `cardDigits`), and its digits run together count in any prop (`:2717` `holdsSecret`).
+  Open shadow roots are searched depth first, up to 512 among the first 100,000 elements (`:2644`
+  `shadowValues`, `:2670`, `:2466`). A password field in a form's root inside an app shell's root,
+  followed by 600 icons with roots of their own, is now found. A pick on 300,000 plain elements
+  takes 16.1 to 17.1 ms (0.6.0: 13.0), and on 60,000 with 202 roots 5.3 to 5.4 ms (0.6.0: 2.7). The
+  walk is bounded in roots, not in the elements inside them, and what that costs is in the F48 row.
+* F30, F32, F33, F34, F42, F47, F49. Checked again in Chrome, kept, with what was measured now in
+  each row of the table.
+
+**The picker.**
+
+* F39, partial. `content/press-gate.js`, declared first in the bridge's entry at document_start,
+  listens on the window for the 17 event types the picker keeps (`content/press-gate.js:42`) and,
+  once the picker has been armed in the page, hands each to it; the picker acts on them while it is
+  armed, through the tail and while the Enter that picked is held (`content/picker.js:3814`, `:3727`
+  `route`). Each event is handled once (`:2317` `seen`). During two picks the page had heard 14
+  events; now none.
+* F38, partial. The transient activation of every press and key the picker keeps is spent at once
+  with `showPicker()` on a button input in no document (`content/picker.js:2303` `spend`). Sticky
+  activation stays.
+* F37, the picker's half. The pick, the frames' sheet, the top layer check and the focus walks go
+  into closed shadow roots through `chrome.dom.openOrClosedShadowRoot` (`content/picker.js:2375`,
+  `:2394`). The selector joins the paths with ` >>> `, the outermost closed root's host is marked
+  and read, and the prompt names the component nearest that host and says so (`:1201` `reachOf`,
+  `:1228` `throughHost`, `shared/prompt-template.js:765`). An arm on 20 000 elements with 60 roots
+  takes 21 to 45 ms against 6 to 22 ms.
+* F50, four of seven edges. A popover or dialog in a known shadow root raises the host on its
+  `toggle` or `close` (`content/picker.js:2406` `addRoot`). The Enter that picked is held until it
+  is let go (`:3485` `holdEnter`): held for three seconds it had sent the form 62 times, now none.
+  The sheet's selector has the specificity of eight ids (`:978`), so an `!important` id rule no
+  longer gets a frame a shield. A frame's discrete `pointer-events` transition is held back only at
+  three moments: the sheet's first adoption into a tree in an arm, its lift for the hit test over a
+  frame and its return, and its removal at the end (`:2576` `holding`, `:988`). A sheet the page
+  dropped goes back with nothing held, before anything restyles (`:3026` `keepPassing`): a page that
+  reset its list in every animation frame for a second heard 6 transition events, as in 0.6.0 (the
+  second round: 363). Whether a frame has such a transition is asked of every frame found and drawn,
+  up to 2,000, until one has, and of a frame not drawn at the survey before the first change of the
+  sheet after it is drawn (`:3079` `surveyFrames`, `:2507` `drawnSince`, `:992`). Such a frame is
+  picked where it is drawn, at 8.5 to 8.7 ms a lift against 4.5 to 4.9 ms. On a page with none, a
+  survey of 2,000 plain iframes takes 1.0 to 1.2 ms, where the second round's took 0.3 ms, and one
+  of 100 frames or fewer costs what it did. The `space-y` shift (F50e) stays, after the fix for it
+  was reverted.
+
+**The overlay.**
+
+* F36, partial. With no modal open the host goes inside the element shown fullscreen
+  (`content/overlay.js:491` `fullscreenHolder`, `:200` `mount`), into its shadow root when it has
+  one, and never into an element of the types in `NO_HOST` or outside the HTML namespace (`:55`):
+  across three arms a fullscreen PDF in an `<object>` was requested once. As a last child it
+  measures its siblings and flags a crop that may be off (`:241` `childBoxes`, `:256`). It stops
+  hover and wheel events at itself inside the element (`:858` `swallowInFullscreen`), is raised on
+  `fullscreenchange` (`:771`), and an element that gave it no box is tried again. A click, a double
+  click and a middle click on it are cancelled as well as stopped (`:844` `cancel`), so a misclick
+  or a tap inside a fullscreen element nested in a link, a label or a form's button no longer
+  follows the link, toggles the box or submits the form, as the second round's did. Its inline style
+  sets `pointer-events`, `visibility` and `opacity` (`:60` `build`), so a component's own
+  `* { pointer-events: none }` no longer lets presses through it. A drag over a fullscreen `div`
+  selected, armed before or after.
+* F37, the overlay's half. The focus walk and the hit test ask Chrome for a closed root at every
+  host, and the walk asks each custom element once an arm (`content/overlay.js:445` `shadowOf`,
+  `:460` `closedRootOf`). A modal dialog in a closed root on a custom element, or on a `div` that
+  holds the focus, got the host, and a drag no longer closed it. On disarm the overlay lets go of
+  every node it held (`:1136` `stop`); a removed component is now collected.
+* F51. The walk takes half its 20 000 element budget from each end of the page
+  (`content/overlay.js:317` `collectRoots`) and runs at a look only when a `MutationObserver` saw a
+  change, at most once a second by the clock, whatever the frame rate (`:407` `watchChanges`,
+  `:48`). A look queries the document and only the roots that held a popover or a dialog at the last
+  walk (`:387` `holdsLayer`, `:517` `queryAll`). Over 3 s armed on a quiet page, 6,000 open roots
+  cost 7 to 8 ms against 45 to 47 in 0.6.0, and 51 000 plain elements 14 ms against 12 to 14, with
+  no look over 1.1 ms. On a page that changes every frame, 6,000 open roots cost 22 to 24 ms against
+  45 to 48, and 6,000 closed roots 23 to 24 against 6.5 to 6.7 (F69); the longest stretch there is
+  one walk, 5.8 to 6.8 ms.
+
+**Tooling and CI.**
+
+* F54. V8 says which `import` followed by `(` is an import: the file parses as it is and not once
+  that `import` is spelled `class ` (`tools/build.mjs:442` `inCode`, `:463`). The pattern is tried
+  at every `import` in the file (`:414` `starts`), so a match that starts at an earlier one can no
+  longer hide a real `import()`. Comments end at any line terminator (`:377`, `:378`), and phase
+  imports fail the build on Node 22 and 24 (`:398`, `:468`, `:585`, `:632`), also in a module
+  nothing imports (`:537` `linkMain`). On the checker's 63 shapes that parse, the build agrees with
+  Chrome 156 on both. The search takes 0.9 ms on the shipped scripts; what it costs on hostile input
+  is in F66.
+* The build's children take input from files in a temporary folder, never a pipe, and each is killed
+  after 120 s (`tools/build.mjs:701` `runNode`, `:734`, `:649`). `node --check` runs only for a
+  module V8 refused (`:784`), so a clean build starts one child instead of four, in 0.13 s instead
+  of 0.18 to 0.19 s. A temporary folder that cannot be made or written fails the build with one line
+  per check and no stack (`:679` `inScratch`). Each build first removes the folders, more than an
+  hour old, of builds a signal stopped (`:657` `sweepScratch`), which costs 8 to 10 ms with 21,365
+  entries in the temp directory. What a stopped build still leaves is F70.
+* F59. On CI, and never on Windows, each `git` and `gh` call leads its own process group and is
+  killed with everything it started after 60 s (`tools/release-check.mjs:147` `run`, `:140`,
+  `:126`). A local run keeps the call in the terminal's group, so Ctrl+C stops it, as in 0.6.0. A
+  failed or hung call prints its message alone (`:144` `CallFailed`), any other error keeps its type
+  and stack, and a `manifest.json` or `package.json` that is not valid JSON fails as a `SyntaxError`
+  that names the file.
+* F67. The release check takes only exit 1 from `git rev-parse -q --verify` to mean no tag, and
+  fails on any other (`tools/release-check.mjs:178` `tagCommitOf`). Before, outside a repository
+  (exit 128) with `GITHUB_SHA` set as on a runner, a run from `main` decided to tag and release
+  (`publish=true`), and a pull request's check passed. Older than the 0.6.1 rounds.
+* F53, TR11. The owner set the repository's description and homepage.
+* CI tests Node 22 and 24 (`.github/workflows/ci.yml:25`), `package.json` asks for Node 22 or newer,
+  the version check and the release run on Node 24, and every job has `timeout-minutes` (15 and 15
+  in `ci.yml:19`, `:46`, 20 in `release.yml:45`).
+
+**Judgment calls.**
+
+* **The press gate is not injected into tabs already open.** Injecting it at install would touch
+  every tab the user has open, and would still come after the listeners those pages added. The cost:
+  on such a tab F39 stays as it was until the tab is reloaded.
+* **The picker's host stays on `body`.** No place under the html element leaves every structural
+  pseudo class of `body` unchanged, and after `body` broke rules that styled `body` itself. The cost
+  is F50e's shift on a page that spaces `body`'s children by margin.
+* **A `MutationObserver` rather than a live element count gates the overlay's walk.** The count is
+  cheaper but sees no change in a shadow root or to `popover`. The cost: a page that changes every
+  frame pays for one batch of records per walk, at most one walk a second, up to 24 ms over 3 s on
+  6,000 roots, about three times 0.6.0 with closed roots (F69).
+* **F31 and F45 are left to Chrome's records.** Asking the disk answers what the records cannot, but
+  a safe version needs new mechanisms: a shared mark on folders that stopped answering, a cap on
+  outstanding opens, and disk asks that outlive the copy's wait (F31). The cost: a screenshot
+  deleted within about ten seconds of Chrome's last look is still copied, as in 0.6.0.
+* **The shadow walk is bounded in roots, not in elements.** A shared element budget would cap a
+  pick's cost, but one root of 10,000 elements or more, such as a data grid, would use it up, and a
+  password field in any root after it would print again. The cost: about 60 ns a pick for each
+  element inside the roots looked into, 58.9 ms for 512 roots of 2,000 elements (F48).
+* **The release check's calls get process groups only on CI.** A call in a group of its own is out
+  of the terminal's reach, so on a local run Ctrl+C would stop the script and leave a hung call
+  running with nothing to enforce its limit. The cost: on a local run, what a call that ran out of
+  time started keeps running, as in 0.6.0 (F70).
+* **The check loop stopped after the sixth round.** Each round fixed what the check before it found,
+  and each fix opened smaller edges of its own (the fourth round's card digits took places a pick
+  keeps for values; the fifth round's survey filter laid out what it meant to skip; the sixth
+  round's card search reads each prop twice). After the fifth round, only a high finding was to be
+  fixed and the rest written down. The sixth round fixed the one high finding, and broke that rule
+  for the card regression: a card's digits in a sentence printed where the fourth round withheld
+  them, and the fix was one line. The last rerun found nothing high, and three losses against an
+  earlier round, all low and written down rather than fixed: beside a grouped field, part of a card
+  number or its digits with one character changed print where only the fourth round withheld them
+  (F48, as in 0.6.0); the card search doubles a pick's cost against 0.6.0 on pages of megabyte props
+  beside many card fields (F48); and a frame put back after a move is held only from the next
+  survey, where the fifth round held it (F50). Checking a fix takes a rerun of an hour or more in
+  Chrome, and every round so far opened edges that only such a rerun found. The cost: the low edges
+  in the F48, F50 and F71 rows stay, each with what it costs.
+
 ## Found while implementing, not fixed
 
-F21 and F24 to F29 were fixed for 0.6.0, as the previous subsection says: F21 at
-`content/collector-main.js:502`, F24 at `shared/prompt-template.js:1314`, F25 at
-`shared/prompt-template.js:1761`, F26 at `content/picker.js:1664`, F27 at
-`sidepanel/panel.js:3242`, F28 at `background.js:905` and F29 at `background.js:321`. F10, F20
-and F30 remain in part. The rows after F30 are the limits that remain after the 0.6.0 round, from
-what the fix rounds left not fixed or partial and from the limits they stated. Each says whether
-it is older than the round.
+F21 and F24 to F29 were fixed for 0.6.0, at the lines of that tree the subsection for 0.6.0 gives.
+For 0.6.1 these were fixed, and their rows are gone: F20, F40 and F55 at
+`shared/prompt-template.js:1854` (`splitJson`), `:1920` (`jsonSpans`) and `:2014` (`SCHEME`); F43 at
+`shared/prompt-template.js:1284`, with its copies at `content/collector-main.js:300` and
+`content/picker.js:124`; F46 at `content/collector-bridge.js:223` (`watchCounts`), `:250`
+(`recount`) and `:288` (`countsTick`), `content/collector-main.js:4277` (`countsChanged`) and
+`sidepanel/panel.js:2247` (`watchCounts`); F51 at `content/overlay.js:317` (`collectRoots`) and
+`:407` (`watchChanges`); F53 by the owner, who set the repository's description and homepage; F54 at
+`tools/build.mjs:442` (`inCode`) and `:414` (`starts`); F56 at `shared/prompt-template.js:443`
+(`clockNotice`); F57 at `sidepanel/panel.js:283` (`showBanner`); F58 at `sidepanel/panel.js:2661`
+(`focusAfterCopy`); F59 at `tools/release-check.mjs:147` (`run`); and F67, found while these docs
+were checked against the code, at `tools/release-check.mjs:178` (`tagCommitOf`). F10, F35, F36, F37,
+F38, F39, F41, F48, F50 and F52 were fixed in part, and their rows keep only what remains. F31 and
+F45 were tried and taken back, and their rows say what a safe version needs. F30, F32, F33, F34,
+F42, F44, F47 and F49 were checked again and kept, with what was measured. F60 to F66 and F68 to F71
+are new: what the 0.6.1 rounds found and left, each with what it costs. Each row says whether it is
+older than the round that found it.
 
 | Id | Where | What | Fix |
 | :--- | :--- | :--- | :--- |
-| F10 | `content/collector-main.js:2072` | A page listener added before the first `open()` that stops `readystatechange` as well as `loadend` still hides a failed request until the object is opened again. Since 0.6.0 stopping `loadend` or `timeout` alone does not: the collector also settles a failed request from its `readystatechange` to DONE, and labels a status 0 end that lasted the timeout as a timeout. Low; also at `a0c9335`. | Not worth a heuristic. |
-| F20 | `shared/prompt-template.js:1417` | Shapes the URL scan still does not read: JSON whose keys are written with escapes or single quotes, JSON inside a `data:` URL's content, a `data:` URL that says `;base64` while holding text, and unencoded JSON with a raw `&` (F40). Since 0.6.0 JSON in a parameter, raw or encoded, and links in percent encoded `data:` content are screened. Low. | M |
-| F30 | `content/collector-main.js:633` | `serialize()` no longer uses `JSON.stringify` (0.6.0). What remains is the list of an object's keys, which V8 collects whole before handing out the first: about 100 ms for an object of a million keys, in the page's thread. Low; also at `a0c9335`, slower there. | Not fixable from a script: for-in, `Object.keys` and `Reflect.ownKeys` all collect the whole list. |
-| F31 | `sidepanel/panel.js:2742` | Chrome looks at the disk at most once every ten seconds, for all downloads together, so a screenshot deleted within about ten seconds of its last look is still copied. A copy whose page read beats Chrome's answer also names the file, and then says so on the receipt. Low; also at `a0c9335`, where nothing was checked after startup. | Not fixable: no API makes Chrome look sooner. |
-| F32 | `content/collector-main.js:116`, `content/collector-bridge.js:70` | A page script written against this extension can tell it is installed, by the probe event a running collector answers. It can open a channel of its own and read its log, or push the live bridge's channel out with eight of them. When the extension starts on a tab already open, it can overhear the bridge's channel and answer in the collector's place, and a collector started late takes the page's builtins as they are then. On a declared site's undeclared path it can answer the worker's probe and get a bridge. None of this puts into a prompt more than logging made up lines would. Low; new with CO14 and improvement 9. | Not fixable for code in the page's world: the guard needs a signal both copies of the collector can see there, which the page sees too, and a tab already open has no path between the worlds that a page listener cannot hear. The bridge on undeclared paths is kept on purpose (judgment calls). |
-| F33 | `content/collector-main.js:151` | A page can change what its own log says about its start. Once its script runs it can cancel the event the collector sends as it starts, which adds a false late caveat; on a late start into a page still loading it can stop that event or make `document.readyState` lie, which hides the caveat. Another extension whose document_start script makes `dispatchEvent` cancel every event makes a declared collector's log read as partial. Low; new. | Not worth it: it changes only what a page's own log says about itself, not what the log holds, and the event is the one path from the worker's world to the collector. |
-| F34 | `content/collector-main.js:956` | A wrapper's `toString` reads `function () { [native code] }`, as V8 writes it for any callable proxy, where the native's reads `function fetch() { [native code] }`. A script looking for wrappers in general can tell. Low; new with CO14, which replaced named wrappers whose source printed. | Not worth it: answering it would mean replacing `Function.prototype.toString`, which every page uses. |
-| F35 | `content/collector-main.js:1845` | On a late start, `setTimeout` and `addEventListener` are taken from the natives zone.js keeps under its own names, so recording a request adds no task to an Angular zone. Anything else that replaced them before the start, fake timers for one, is used as it is, and the collector's timer and listeners go through it. zone.js's error plugin, which replaces `window.Error`, was not measured. Low; new with improvement 9. | Not fixable from the page's world: after the page has run, an untouched copy can only come from a new realm (an iframe), which would change the page. |
-| F36 | `content/overlay.js:139` | Region cannot be used while an element of the page is fullscreen: the overlay is drawn under it and a drag reaches the page, whether Region was armed before or after. Low; CW3's fullscreen half, also at `a0c9335`, first observed in this round. | Not fixable: Chrome draws a popover outside the fullscreen element under it, even one shown later, and inside the element is no place for it when that element is a video, whose children are never drawn. Screen works. |
-| F37 | `content/overlay.js:156`, `content/picker.js:2582` | Closed shadow roots. A modal dialog in one cannot be found, so the overlay is inert under it and a drag can close the dialog. A frame in one keeps the pointer while picking, so a press goes into the frame and nothing is picked. A pick inside one yields its host (PI7). Low; also at `a0c9335`. | Not fixable: a closed root answers null to `shadowRoot`, so the walk, the focus walk and the hit test stop at its host, and the extension cannot put a node inside it, the one place the overlay would not be inert. |
-| F38 | `content/picker.js:2148` | A pick gives the page transient user activation: for about five seconds it may open a popup or start playback as if clicked, and it can see the activation in `navigator.userActivation`. It never hears the press. Low; also at `a0c9335`. | Not fixable: Chrome grants it as it dispatches the press, before any listener runs, and nothing withdraws it; spending it (`window.open`, `requestFullscreen`) would change the page. |
-| F39 | `content/picker.js:3046` | A page capture listener on `window` added before picking started hears the presses that make the pick, every press of a double click included. Their default actions are still cancelled, and no listener below the window hears them. Low; also at `a0c9335`. | Not fixable: listeners on one target run in the order they were added, across worlds, and the picker can only add its own when it arms. |
-| F40 | `shared/prompt-template.js:1417` | In console text, unencoded JSON in a URL value with a raw `&` inside an earlier value leaks a secret key after it, because `maskParams` splits the query at that `&`. Chrome percent encodes quotes in the URLs it records, so request and page URLs never carry it, and the picker screens it (`content/picker.js:1330`). Low; also at `a0c9335`. | S: move the picker's `splitJson` into the shared SECRET URLS block, in both copies at once. |
-| F41 | `sidepanel/panel.js:799` | With a system double click time slower than half a second, a double click on a row tooltip slower than that picks the row it covers instead of selecting a word, and its second press lands on whatever the closed tooltip covered. Low; new with UX13. | Not worth it: a longer wait slows every click through the tooltip, and every dismiss, by as much. |
-| F42 | `content/collector-main.js:1610` | After a late start on a page where core-js forced its own Promise, each failed or answered fetch calls the page's replaced `then` once. A collector declared at document_start settles through the engine's own `then` and costs such a page nothing. Low; new with improvement 9. | Not fixable from the page's world, as F35: after a late start the `then` on the prototype is whatever the page left there. |
-| F43 | `shared/prompt-template.js:1259` | `payment_method_nonce` and other one time payment nonces are not secret names, so a prop or a parameter holding one prints. Low; also at `a0c9335`. | S, left for a change to the word list, which has to land in all three copies at once. |
-| F44 | `sidepanel/panel.js:1205` | After a Region drag the panel puts the caret in the field, but the page keeps the keyboard, so typed characters go into the page's focused input until the user clicks the panel. The panel says so under the field. Medium (UX5); also at `a0c9335`, unsaid. | Not fixable from the panel: nothing it can call takes the keyboard, and blurring the page's element on arm would change the page. |
-| F45 | `sidepanel/panel.js:2513` | A screenshot whose download record Chrome has erased (the download list was cleared) cannot be asked about, so the copy goes ahead and the receipt names the item as not checked. Low; also at `a0c9335`, unsaid. | Not fixable: no extension API tells whether such a file exists. |
-| F46 | `sidepanel/panel.js:2153` | The console and network chips are read again on focus, when the panel is shown and when the pointer comes back, so they stay a snapshot while the panel is left alone. Low (RO11). | M: the collector would push its counts to the panel. |
-| F47 | `content/collector-main.js:1119` | A fetch the page's CSP blocks is reported by the browser and in the site's CSP reports with the collector as its source, now named `punch-list`. The prompt says the page's policy blocked it and keeps the page's caller. Low (M4). | Not fixable: any wrapper is the top frame when it calls the native, and deferring the call would change when every request starts. |
-| F48 | `content/collector-main.js:2481` | Props are withheld when they hold the value of a secret control in the document and, in a component that renders a password, code or card control, when a string has a secret's shape (8 to 256 characters with no whitespace holding a letter and a digit, or beside a code or card control three digits or more). A value no control holds and of another shape still prints (a passphrase with spaces, a password of letters only or under eight characters), as does any such value handed to a component that renders no such control, and a seed of that kind the user changed in the middle rather than typed onto. In a component the shape rule applies to, an ordinary code of that shape is withheld, such as a coupon code or an order number. A field inside a shadow root is found only when its host element says it takes a secret, and one in a frame not at all. Low; each printed at `a0c9335` too. | Not worth it: the rule knows a secret by the control that holds it, and looking further costs every pick more. |
-| F49 | `content/collector-main.js:1671` | After a late start, a fetch promise that is not a plain engine promise (one the page decorated with an `abort` method, a Bluebird promise, a thenable) is handed back as the page's own object and watched on a side chain. Any observer marks a promise as handled, so a rejection the page leaves unhandled no longer fires the page's own unhandled rejection report, and the prompt has no `[unhandled]` line for it, though the failed request is still recorded. Low; new. | Not worth it: handing back a new promise made the page's own calls on it throw (`p.abort`, Bluebird's `.tap`), and rethrowing on the side chain gave two spurious page errors on a page that handles its own rejection. |
-| F50 | `content/picker.js:2454` | Picker timing edges. A press in the same animation frame as a page's own assignment of `adoptedStyleSheets`, with no pointer move since, can reach a frame. A popover or dialog in a shadow root hidden and shown again within a quarter second can cover the highlight. Enter held past the tail repeats to the page. A hover menu over a frame whose own CSS beats the sheet loses its hover to that frame's shield. On a page that spaces `body`'s children by margin (`space-y`), the page shifts by 8 px while armed, which is undone before the element is read and photographed. A frame with a discrete `pointer-events` transition (`transition: all .3s allow-discrete`) keeps `none` for half the transition once the sheet is lifted, so the element under it is picked, and the page hears four transition events on each move over it. The fallback content of an `<object>` shows no hover while picking. Low; new with this round, the space-y shift as in 0.5.0, the transition as in the round before (last check, C3). | Not worth it: the sheet comes back on the next frame and at every press, shadow roots are surveyed every 15 frames, repeats after the tail are the user's own, moving the host out of `body` would change where it lives on every page, a transition is the page's own and cutting it would change the page, and giving fallback content the pointer back took the page's own `none` from it and slowed every restyle by a quarter. |
-| F51 | `content/overlay.js:186` | The overlay finds open shadow roots when it is placed, so one attached afterwards is seen only at the next placement, and a modal or popover in it can cover the overlay until then. Pressing the shortcut again places it on top. Low; also at `a0c9335`. | Not worth it: the walk takes about 8 ms on a page of 24 000 elements, too much for every frame. |
-| F52 | `shared/prompt-template.js:1314` | A URL's user name with no password that reads as words is kept, so a short token of small letters with no digit (`https://xkcdqwertyzpqlm@host`) prints. Low; the price of F24's fix, which kept `git@` and e-mail addresses. | Not worth it: telling such a token from `administrator` needs a dictionary. |
-| F53 | GitHub repository settings | The repository's description and homepage still name the old project (TR11). Low. | An owner action: `gh repo edit` with the manifest's description and the new homepage. |
-| F54 | `tools/build.mjs:370` | The build reads a method definition whose parameters hold `(` or a line break, a comment between `.` and `import`, and `import(` inside a string as dynamic imports. Low; new with the import check. | Not worth it: each fails the build loudly and never lets a broken import pass. |
-| F55 | `shared/prompt-template.js:1785` | A megabyte of console text made of distinct dotted keys (`t.o.k.e.n.`…) took 103 ms to screen in the second fix round, just over the 100 ms the rounds held hostile input to. Not measured since. Low. | S if it matters. |
-| F56 | `shared/prompt-template.js:2417` | With the page toggle on, a list gives the log's zone only on the page section's Items captured line, after the items. Low. | S |
-| F57 | `sidepanel/panel.js:2414` | Copy takes the banner down when it starts, so on a restricted tab the restriction banner stays away after the copy until the next tab event. Low; older than this round. | S |
-| F58 | `sidepanel/panel.js:2494` | After a copy held back by a missing file, the disabled Copy button loses focus to the document body. Low; older than this round. | S |
-| F59 | `tools/release-check.mjs:122` | Its `git` and `gh` calls have no timeout, so a hung one holds the release workflow until GitHub's own job limit. Low. | S |
+| F10 | `content/collector-main.js:2107` (`backstop`), `:2081` | A page listener added before the first `open()` that stops every event a failed request ends with (the `readystatechange` to DONE, then `load`, `error` or `timeout`, then `loadend`) still hides it until the object is opened again. Stopping `loadend` or `timeout` alone has not hidden one since 0.6.0, and stopping `readystatechange` and `loadend` together has not since 0.6.1: the collector settles a failed request a task later from whichever of those events reaches it first, with one timer per request, and labels a status 0 end that lasted the timeout as a timeout. Low; also at `a0c9335`. | Not fixable short of replacing the `XMLHttpRequest` constructor. Listeners on one target run in the order they were added, whatever their capture flag (Chrome for Testing 156), so only the constructor comes earlier, and a Proxy of it would print `function () { [native code] }` (F34), and `XMLHttpRequest.prototype.constructor` would no longer be `XMLHttpRequest` unless the collector rewrote the native prototype, on every page. |
+| F30 | `content/collector-main.js:703` (`walk`) | `serialize()` no longer uses `JSON.stringify` (0.6.0). What remains is the list of an object's keys, which V8 collects whole before handing out the first: about 100 ms for an object of a million keys, in the page's thread, and only for an object the page hands to `console.error` or `console.warn`. Low; also at `a0c9335`, slower there. | Not fixable from a script. Measured in Chrome for Testing 156 on an object of a million keys: a for-in that stops at its first key takes 92 ms, `Object.keys` 93, `Reflect.ownKeys` 159, `Object.getOwnPropertyNames` 154, a `JSON.stringify` whose replacer stops at the first key 100, and a for-in over a proxy of the object 193, against under 0.1 ms for a thousand keys. Nothing a script can call hands out a key before the whole list is built. |
+| F31 | `sidepanel/panel.js:2920` (`checkFiles`) | Chrome looks at the disk at most once every ten seconds, for all downloads together, so a screenshot deleted within about ten seconds of its last look is still copied. A copy whose page read beats Chrome's answer also names the file, and then says so on the receipt. Low; also at `a0c9335`, where nothing was checked after startup. | Not fixable with Chrome's records: no downloads API makes Chrome look sooner. Tried for 0.6.1 and taken back. Where Chrome allows file access (the Allow access to file URLs switch, on for the unpacked extension in Chrome 156), the panel opened the file URL of each screenshot and listed its folder when the file did not open. The checks in Chrome for Testing 156 found three problems. An open on a volume that stops answering stays blocked in one of Chrome's file threads, which Chrome cannot cancel, and the panel opened each such path once per panel page: 60 items took the browser process from 44 to 101 threads, 300 took it to 286, and a sheet of 30 with the panel reopened 9 times reached 288, past which an unrelated file URL did not open within 5 s and downloads stalled across the whole browser. A file that exists but will not open, in a folder Chrome lists as empty (mode 311), was called missing, held Copy back and stayed missing at every later check, though Chrome's record said it existed. And a deletion a second before Copy was still missed in folders of about 2,000 files or more (smaller ones on a slower machine), because the listing did not end within the copy's wait. With 0.6.0's behaviour back, 300 quiet items leave the browser at 40 to 41 threads and 9 reopens at 42 to 45, unrelated file URLs open in about 1 ms, and downloads complete in about 55 ms. A safe version needs: one late open marking its whole folder or volume as not answering, with no more opens there until it returns; a cap on the opens a page leaves outstanding; that state shared by every panel page, in every window and across reopens; an empty listing taken as no answer when Chrome's record says the file exists, with the missing shortcut used only when the record agrees; disk asks that outlive the copy's wait, with a late gone said on the receipt and naming the disk; and `PRIVACY.md` and the README saying that the panel opens its screenshots' file URLs and lists their folder. |
+| F32 | `content/collector-main.js:116` (`PROBE`), `content/collector-bridge.js:60` (`HELLO`) | A page script written against this extension can tell it is installed, by the probe event a running collector answers. It can open a channel of its own and read its log, or push the live bridge's channel out with eight of them, and it can watch the counts on a channel of its own, which say less than the log. When the extension starts on a tab already open, it can overhear the bridge's channel and answer in the collector's place, a collector started late takes the page's builtins as they are then, and a page that heard the bridge's HELLO can send `unwatch` on the bridge's own channel, which holds the live chips back until the panel's next read, though it can no longer make the bridge drop the panel's port. On a declared start it never learns the channel, and cannot hold the counts back. On a declared site's undeclared path it can answer the worker's probe and get a bridge. None of this puts into a prompt more than logging made up lines would. Low; new with CO14 and improvement 9, the `unwatch` with F46. | Not fixable for code in the page's world: the guard needs a signal both copies of the collector can see there, which the page sees too, and a tab already open has no path between the worlds that a page listener cannot hear. Nor would a silent probe hide the extension. In Chrome for Testing 156 a page with the collector running also reads `punch-list://extension/collector-main.js` in the stack of an error thrown through a wrapper (`new XMLHttpRequest().open('GET')`), gets an answer over the picker's protocol, and reads `function () { [native code] }` for `fetch` (F34). The address is the collector's sourceURL, kept for the console cost (judgment calls). The bridge on undeclared paths is kept on purpose (judgment calls). |
+| F33 | `content/collector-main.js:151` (`LATE`) | A page can hide what its own log says about its start. On a late start into a page still loading, a listener it added earlier can stop the event the collector sends as it starts, or it can make `document.readyState` lie, and the late caveat goes. A false caveat needs code that runs before a declared collector, which a page's own script never does: another extension's document_start script in the page's world that cancels that event, or makes `dispatchEvent` cancel every event. An opener cannot plant a listener on a popup's first window either: in Chrome for Testing 156 the page the popup went to had a window of its own, after `window.open()`, `window.open('')` and `window.open('about:blank')`. Low; new with improvement 9. | Not worth it: it changes only what a log says about its own start, not what it holds, and only for code written against this extension or one that breaks `dispatchEvent` for every page. The event is the one path from the worker's world to the collector; any other signal the two worlds share is in the DOM, where every page script and observer would see it. |
+| F34 | `content/collector-main.js:1026` (`wrapNative`) | A wrapper's `toString` reads `function () { [native code] }`, as V8 writes it for any callable proxy, where the native's reads `function fetch() { [native code] }`. A script looking for wrappers in general can tell. Low; new with CO14, which replaced named wrappers whose source printed. | Not worth it: answering it would mean replacing `Function.prototype.toString`, which every page uses. Checked in Chrome for Testing 156: a Proxy with no trap, a Proxy with a trap and a bound function each print `function () { [native code] }`, and only the native prints its name. A replacement of `toString` prints that text for itself unless it lies about itself too, and adds its own frame to the stack of every error it passes on (checked in V8). |
+| F35 | `content/collector-main.js:1915`, `:359` (`beforeZone`) | On a late start, `setTimeout`, `addEventListener` and, since 0.6.1, `Error` are taken from the natives zone.js keeps under its own names, so recording a request adds no task to an Angular zone and runs no `ZoneAwareError`. Anything else that replaced them before the start, fake timers for one, is used as it is, and the collector's timer and listeners go through it. Low; new with improvement 9. | Not fixable from the page's world: after the page has run, an untouched copy can only come from a new realm (an iframe), which would change the page. Another way to wait a task, a `MessageChannel`, is the page's to replace as much, and switching to it would change every page for the sake of a test clock. |
+| F36 | `content/overlay.js:491` (`fullscreenHolder`), `:55` (`NO_HOST`), `:60` (`build`) | Region cannot be used while the element shown fullscreen is one of the types in `NO_HOST` (audio, canvas, embed, fencedframe, frame, iframe, img, input, object, optgroup, option, script, select, style, template, textarea, video) or outside the HTML namespace (svg, math), a bare `<video>` put fullscreen by its own controls, say. The host stays on the body, drawn above the element and inert, so a drag reaches the page. Region works again with no new arm once the page leaves fullscreen, and Screen works. In a fullscreen component's shadow root the component's own rules still reach the host, a `div`: one that hides it (`div { display: none }`) gives it no box, so it goes back on the body, inert there, and an `!important` rule on `pointer-events`, `visibility` or `opacity`, or a `transform`, `filter` or `clip-path` set on every element, still applies to it. Since 0.6.1 any other fullscreen element takes the host, armed before or after; what that costs is F65. Low; CW3's fullscreen half, also at `a0c9335`. | Not fixable from inside the element: such an element draws no children or loads what it holds (Chrome loads an `<object>`'s document again when a child is added), and outside it the host is inert. Not worth it another way: capture listeners on the window could take a drag over a video or a canvas (never a frame, whose presses go to its own document), but that is a second input path for one case. `display` stays out of the host's inline style, since an inline value would override the browser's rule that hides a popover not shown. |
+| F37 | `content/overlay.js:460` (`closedRootOf`), `content/picker.js:1228` (`throughHost`) | Closed shadow roots, what is left. The overlay misses a modal dialog in a closed root on a built in element (a `div`) while nothing in that root has focus, since only the focus walk reaches such a root, and one in a closed root attached during the arm to a custom element its walk has already asked about, until the next arm. The picker reaches every closed root and names the component nearest the outermost closed host (`shared/prompt-template.js:765`); whether that framework rendered the element inside the root cannot be known from the page's world, and the prompt makes no claim either way. Low; also at `a0c9335`. | The old reason was wrong: `chrome.dom.openOrClosedShadowRoot` hands a content script a closed root, with no permission, at about 0.6 µs a call (Chrome for Testing 156). For the overlay's two cases, not worth it: asking every element of the walk cost 15 ms a walk at 24 000 elements, and asking every custom element again at each look would cost that call for each, every quarter second. |
+| F38 | `content/picker.js:2303` (`spend`) | A pick leaves the page with sticky activation (`navigator.userActivation.hasBeenActive`), so a page never clicked reads as clicked once, which some features ask for, such as audio with sound. Since 0.6.1 the transient activation a pick gives is spent at once, so a popup or playback as if clicked no longer follows a pick, and an activation the page had from its own click just before the pick is spent with it. Low; also at `a0c9335`. | Not fixable: sticky activation stays for the life of the page (HTML's user activation model), and `showPicker()` spends only the transient one (checked in Chrome 156). |
+| F39 | `content/press-gate.js:42`, `content/picker.js:3727` (`route`) | On a tab without the press gate, a page capture listener on `window` added before picking started runs before the picker's. Those tabs are one open from before the extension was installed or enabled, a site the narrowed `matches` leave out, and possibly one open across an update or reload of the extension, which keeps the old gate (whether the new picker is handed its events there was not checked). A listener that only listens hears the presses and the keys, whose default actions the picker still cancels. One that calls `stopImmediatePropagation` keeps the press from the picker: nothing is picked and the press does what it would with no picker (a link is followed), and keys stopped that way, Escape, the arrows and Enter among them, never reach the picker. Where the gate loaded with the page, the page hears nothing of a pick, a stopper included. Low; also at `a0c9335`. | Not fixable for those tabs: listeners on one target run in the order they were added, across worlds, and nothing can come before listeners a page already has. Injecting the gate into open tabs at install would touch every tab the user has open, and come after those listeners anyway. |
+| F41 | `sidepanel/panel.js:850` (`learnClickTime`) | The click wait on a row tooltip grows to the slowest double click the browser has counted in the panel, with a fifth to spare, up to one second. With a system double click time slower than half a second, the first slow double click on a tooltip, before the panel has seen one as slow, still picks the row it covers instead of selecting a word, and its second press lands on whatever the closed tooltip covered. So does any double click slower than one second. Low; new with UX13. | Not fixable further: no web API tells the system's double click time, and a wait past one second would read as a lost click. |
+| F42 | `content/collector-main.js:1680` (`intrinsicThen`) | After a late start on a page where core-js forced its own Promise, each failed or answered fetch calls the page's replaced `then` once. A collector declared at document_start settles through the engine's own `then` and costs such a page nothing. Low; new with improvement 9. | Not fixable from the page's world, as F35. Checked with core-js 3.39 forcing its own Promise in Chrome for Testing 156: an `await`, a promise returned from an async function, an async generator's `yield`, `for await`, `Array.fromAsync`, and an `await` on a promise given an own `constructor` (either constructor still in reach) each call the page's `then`. V8 skips it only for a promise whose `constructor` is the engine's own `Promise`, and once core-js has replaced the global and deleted the prototype's `constructor`, no function in reach of `window` has the engine's `Promise.prototype` as its prototype. |
+| F44 | `sidepanel/panel.js:1262` (`focusDescription`) | After a Region drag the panel puts the caret in the field, but the page keeps the keyboard, so typed characters go into the page's focused input until the user clicks the panel. The panel says so under the field. Medium (UX5); also at `a0c9335`, unsaid. | Not fixable from the panel. Checked again in Chrome for Testing 156 with a real side panel. The panel hears the drag's message with the user activation the content script's message carries, and in that same task `chrome.sidePanel.open` and `chrome.windows.update` with `focused` resolved and `window.focus()` ran. After each, the panel still reported `document.hasFocus()` false. Only a click into the panel moved the keyboard. Blurring the page's element on arm would change the page. |
+| F45 | `sidepanel/panel.js:2691` (`writeReceiptNote`) | A screenshot whose download record Chrome has erased (the download list was cleared) cannot be asked about, so the copy goes ahead and the receipt names the item as not checked. Low; also at `a0c9335`, unsaid. | Not fixable with Chrome's records: no other extension API tells whether such a file exists. Tried for 0.6.1 and taken back with F31: file URLs can answer for such a file, but asking through them brought the three problems the F31 row records. A safe version needs the same mechanisms. |
+| F47 | `content/collector-main.js:1189` (`CSP_NOTE`) | A fetch the page's CSP blocks is reported by the browser and in the site's CSP reports with the collector as its source, now named `punch-list`. The prompt says the page's policy blocked it and keeps the page's caller. Low (M4). | Not fixable, checked in Chrome for Testing 156: the report names the script of the topmost frame when the native runs. A wrapper whose trap is a function of its own is named, even when it calls the native from a microtask. A trap that is `Reflect.apply` itself, or a bound copy, names the page's line, and runs nothing that could record the request. A call deferred to run from no frame names no source at all, not the page's, and sends what the page's init holds by then: a POST the page changed to PUT just after calling went out as PUT. |
+| F48 | `content/collector-main.js:2594` (`documentValues`), `:2759` (`editedFrom`), `:2796` (`seedLike`), `:2670` (`shadowTree`) | Props are withheld when they hold the value of a secret control in the document or in its open shadow roots, or that value changed in one place when it reads as a passphrase or a seed (white space, or 12 characters or more, and not a number of fewer than 12 digits), and, in a component that renders a password, code or card control, when a string has a secret's shape. A value no control holds and of another shape still prints (a passphrase with spaces, a password of letters only or under eight characters), as does any such value handed to a component that renders no such control, and a password under 12 characters with no space, seeded and then changed in one character, outside such a component (`Xk9#mQ2p` beside `Xk9#mQ2z`, `hunter3hunt` beside `hunter2hunt`). A card number counts by its digits only in a prop of 64 characters or fewer that holds nothing else, and its digits run together count in any prop. Grouped inside a sentence (`Card 4111-1111-1111-1111 declined` beside a field holding `4111 1111 1111 1111`), in digits other than ASCII, or grouped by commas, it is caught only when grouped as the field groups it, and a prop holding fewer than 12 of its digits prints, as does, beside a field that groups it, its digits run together with one character changed (`45391488X3436467`), both as in 0.6.0. Each held number of 12 digits or more is looked for in every string prop twice, as written and as its digits: with 63 held card numbers and twelve 1 MB props that hold none of them, a pick takes 511 to 581 ms against 245 to 282 ms in 0.6.0, and with one held card 7.0 to 7.9 against 3.1 to 3.5 ms. In a component the shape rule applies to, an ordinary code of that shape is withheld, such as a coupon code or an order number, and anywhere a string that shares three quarters of such a passphrase or seed at its ends is withheld, such as an e-mail address one character from the user's in a field named `email`, or a number of 12 digits or more one digit from the one in such a field. A field in a closed shadow root, in a root past the first 512 in depth first document order, in a root whose host comes after the first 100,000 elements, or in a frame is not found, and a field two shadow roots deep inside what a component renders brings neither the shape rule nor its `value` props. The walk is bounded in roots, in elements asked for a root and in controls read, not in the elements each root's selector looks at, about 60 ns an element: 512 roots of 2,000 elements took 58.9 ms a pick and 300 of 1,000 took 17.9 ms (0.6.0: 0.2 and 0.1 ms, since it looked into no nested root). Low; each printed at `a0c9335` too, and the costs of the walk and of the second search are new with the 0.6.1 rounds. | Not worth it for what remains: a secret is known by the control that holds it or by its shape, and judging every string by shape everywhere would withhold the ids and hashes every page passes. Catching short passwords changed in one character would withhold again what the first round's rule withheld, numbers and month labels one character from a short secret. A frame's fields belong to another document, whose values reach this one's components only through the page's own messages, and a closed shadow root answers the page's world nothing. A shared element budget would cap the walk, but one root of 10,000 elements or more, such as a data grid, would use it up and hide a field in every root after it. The bounds keep a pick at 16.1 to 17.1 ms on 300,000 elements (0.6.0: 13.0). A number held as its bare digits is searched for twice in the same form, which could be skipped (S); for a grouped one the second search is what finds its digits run together. |
+| F49 | `content/collector-main.js:1741` (`watched`) | After a late start, a fetch promise that is not a plain engine promise (one the page decorated with an `abort` method, a Bluebird promise, a thenable) is handed back as the page's own object and watched on a side chain. Any observer marks a promise as handled, so a rejection the page leaves unhandled no longer fires the page's own unhandled rejection report, and the prompt has no `[unhandled]` line for it, though the failed request is still recorded. Low; new with improvement 9. | Not worth it: any reaction marks a promise handled (PerformPromiseThen in ECMAScript), so it cannot be watched without that. Handing back a new promise made the page's own calls on it throw (`p.abort`, Bluebird's `.tap`), and a side chain that rethrows reports a rejection the page handles. Checked in Chrome for Testing 156 with the collector started after load, on a page whose fetch decorates its promise: an unhandled failed fetch fired `unhandledrejection` without the collector and none with it, and was logged; a rethrowing side chain fired one for a rejection the page caught. |
+| F50 | `content/picker.js:978` (`PASS_SELECTOR`), `:2576` (`holding`), `:3079` (`surveyFrames`), `:2507` (`drawnSince`), `:3257` (`mount`) | Picker edges that remain. A press in the same animation frame as a page's own assignment of `adoptedStyleSheets`, with no pointer move since, can reach a frame. When the page's new sheet list is restyled before the sheet goes back (it reads a style or forces layout right after setting the list, or sets it in an animation frame callback added after the picker's), a frame with a discrete `pointer-events` transition runs it and the page hears it, as in 0.6.0. A frame whose own `pointer-events` is an inline `!important`, an `!important` in a cascade layer of the page's, or one with more than eight ids keeps a shield, under which a hover menu loses its hover. On a page that spaces `body`'s children by margin (`space-y`), the page shifts by the full gap while armed (4 px on a vertically centred test page), which is undone before the element is read and photographed; the fix that moved the host after `body` was reverted. The fallback content of an `<object>` shows no hover while picking. When no frame among the first 2,000 found has a discrete `pointer-events` transition, one beyond them is adopted without a hold: the page hears its transition at the arm, and for half of it the frame takes a press. A frame that gains such a transition after the arm, while none had one, is found by the next survey (within 15 frames) or when the pointer reaches it, and picking that ends before then removes the sheet without a hold. So is a frame not drawn at the survey that the page removes and puts back after a move (in Chrome, 9 transition events on three moves and 3 at an Escape, as in the fourth round; the fifth held it), and an Escape in the same animation frame as the page scrolls such a frame into view gives the page 3 events, as in 0.6.0, since the frame is drawn only after the sheet is gone. A frame drawn before the arm and then hidden with `content-visibility: hidden` gives the page 2 events at the arm, as in 0.6.0, and 1 when the page shows it while armed, since its transition runs as it is drawn with the sheet in place (0.6.0: 13). A frame drawn before the arm and then scrolled into skipped content takes a press made right after the page scrolls it back, as in 0.6.0. A page that puts back a stale copy of its sheet list holding the picker's emptied sheet can make the next arm add the rule without a hold. Asking every frame costs a page of 2,000 plain iframes 1.0 to 1.2 ms a survey, about four times a second, where the second round's survey took 0.3 ms (at the arm 3.8 to 6 ms against 2.6 to 2.8), and once such a frame is found every lift pays one more restyle (5.4 to 7 ms against 3.2 to 3.7 ms on that page). While 1,999 frames sit in skipped content or with `display: none`, asking those again costs each move over a frame about 0.5 ms (3.8 to 3.9 ms against 3.3 to 3.5 in the fourth round and 0.6.0). Fixed in 0.6.1: a popover in a shadow root hidden and shown again, Enter held past the tail, an `!important` id rule on a frame, and a discrete transition, also on a frame past the first 100 and on one not drawn at the arm and shown or scrolled into view while armed. Low; the `space-y` shift as in 0.5.0, the rest new with the 0.6.0 round. | Not worth it. No event or observer reports an assignment of `adoptedStyleSheets`, so the sheet goes back on the next frame and at every press. Nothing in the page's origin beats an inline `!important` or one in an earlier layer, only the worker can insert a user origin sheet, asynchronously, while the hit test lifts the sheet in the middle of a move, and a layer of the sheet's own made every lift six times slower. After `body` the host took `:last-child` from `body` itself, and no place under the html element leaves `body`'s structural pseudo classes unchanged. The only CSS that gives the fallback the pointer back cuts off a `none` the page set above the object (checked in Chrome 156); an earlier note that it slowed every restyle by a quarter did not reproduce. The 2,000 is the bound the picker already keeps on the frames it boxes (`FRAME_BOXES`, `:992`). S for a frame put back: keep a frame that is not connected in the list until the next survey. A frame drawn with no such transition is dropped from it, since asking it again at every change of the sheet would read the style of every frame drawn since the survey, the cost the fourth round took out. |
+| F52 | `shared/prompt-template.js:1396` (`isCredentials`), `:1349` (`CONSONANT_GROUPS`) | A URL's user name with no password that reads as words is kept, so a short token of small letters with no digit and no five consonants in a row, counting common letter groups as one (`https://abcdefghij@host`), prints. The rule strips about 44, 64 and 78 percent of random tokens of 8, 12 and 16 small letters. Of 138 common service and admin accounts only `smmsp` loses its name, as do about 0.2 percent of first name plus surname forms (`ernstsmith@`) and 0.06 percent of first name plus initial ones. Low; the price of F24's fix, which kept `git@` and e-mail addresses. | Not worth more: a table of the 145 letter pairs English rarely writes catches 73% at eight letters but strips 11% of user names made of an initial and a first name, telling the rest from `administrator` needs a dictionary, and a passphrase of real words (`correct-horse-battery-staple@`) cannot be caught even with one. |
+| F60 | `shared/prompt-template.js:1366` (`QUOTED_KEY`), `:2158` (`jsonUrlEnd`), `:1804` (`pathSecretIn`) | Shapes the URL scan still does not read: keys quoted with `&quot;` or another HTML entity in a logged URL, keys written with `\/` as PHP's `json_encode` writes them, escaped keys two levels deep that also use `\u` escapes, a key whose two quotes are different characters, JSON in a path segment, JSON arrays of name and value pairs, unquoted JavaScript keys, JSON that closes on a later console line, links or JSON in base64 `data:` content, which is never decoded, and a key with a `u`, `b` or `r` before its quote in an attribute that is not a URL (`data-config="{u'token': …}"`). In a `data:` URL's content, a path parameter whose name holds a comma or a percent escape (`;base64,token=`) is not read, nor one after an encoded quote or space (`%22`, `%20`) in the link's path, both of which the second round hid. In console text, a value in quotes with no JSON around it (`?q="abc"&token=…`) ends the URL at its quote, so a secret parameter after it prints. Each of these prints in 0.6.0 too. Low; older than this round. | S for the quoted value, if it matters: read on past `="…"` when a `&` or `;` follows its closing quote, as past JSON. Each other shape is a rule of its own, for a log that shows it. |
+| F61 | `content/collector-main.js:1380` (`VENDOR_FRAME`) | With the collector declared, zone.js wraps the collector's wrapper, so on a page that loads zone.js from a file whose path does not contain `zone.js` (`zone.umd.js`, or Angular's polyfills bundle) the first two caller frames of a failed request are zone.js's own (`proto.<computed> [as open]`), and the page's frame is the third of the three kept. Not measured behind a request library. Low; new. | S for the file names (`zone.umd.js`, `zone.min.js`); frames bundled into a polyfills file would need names. |
+| F62 | `content/collector-bridge.js:250` (`recount`), `sidepanel/panel.js:2297` (`countsFollowed`), `content/collector-main.js:197` (`owed`) | The live chips can stand still until the panel's next read: when the bridge's listener takes the collector's event but cannot act on it (not seen in Chrome), on a page that only ever logs within 1,600 calls of its stack limit, during a stack overflow until the page logs again from a shallower frame, into any ring, and on a late start after a page sends `unwatch` (F32). While a change is owed and a panel watches, each console call into a full ring repeats the stack check until the event goes out, about 25 µs a call: 20,000 calls near the stack limit took 2.2 s against 1.7 s in the second round. With no panel open nothing changes. The path for a hidden panel was not tested, since headless Chrome keeps `visibilityState` at visible. Low; new with F46. | Not worth more: the collector sends its event only with 1,600 calls of stack to spare, every read and Clear sets the chips right, and a channel a page knows the name of cannot be kept from it. |
+| F63 | `tools/chrome-shim.js`, `tools/panel-stage.html` | The stage models no port: its panel shim has no `tabs.connect` and the demo tab's shim no `runtime.onConnect`, so on the stage the console and network chips stay a snapshot, read on focus as before. Low; new with F46. | S: a pair of port fakes in the two shims. |
+| F64 | `content/overlay.js:317` (`collectRoots`), `:407` (`watchChanges`), `:517` (`queryAll`) | The overlay's walk for shadow roots misses a component in the middle of a page of more than 20,000 elements, which is never walked, and a shadow root attached to an element already in the page (a component defined after the arm, or `attachShadow` on an existing element), which changes no child list and waits for a walk something else causes, the next placement or the shortcut. A known root that gets its first popover or dialog after a walk is queried from the next walk on, within a second and a look (1.25 s at 60 Hz), and a popover in it, or in a root a later walk finds, can cover the overlay until then. Pressing the shortcut again puts the overlay on top. Low; the root on an existing element as in 0.6.0. | Not worth it: no mutation record reports `attachShadow`, so only a walk finds such a root, and walking all of a larger page at every look would cost what the budget is there to avoid (about 1.4 ms over 20,000 elements). |
+| F65 | `content/overlay.js:241` (`childBoxes`), `:844` (`cancel`), `sidepanel/panel.js:617` (`MOVED_UNDER_OVERLAY`) | In a fullscreen element with no shadow root the host is the last child, so that element's `:last-child`, `:nth-last-child`, `:last-of-type`, `:only-child` and `:empty` rules see one more child while Region is armed: on a slide laid out with Tailwind's `space-y` the cards moved up 20 px, and the screenshot, taken once the host is gone, was 20 px off what was selected. The capture is flagged when a direct child moved or resized; a change deeper inside the last child that does not move it is not caught. Page code can also see the host there (a `MutationObserver` on the element, a capture `toggle` listener). Clicks on the host are cancelled as well as stopped: the page's capture listeners still hear a click first and then find it cancelled (`defaultPrevented` true), and a middle click (`auxclick`) no longer reaches its bubble listeners. Low; new with F36. | Not fixable: no position among the children is invisible to selectors, and first would trip `:first-child`, the sibling combinators and every `:nth-child` instead. The check costs one forced layout per placement, 0.03 to 0.3 ms. |
+| F66 | `tools/build.mjs:428` (`lineOf`), `:442` (`inCode`), `:414` (`starts`) | Line numbers in the build's messages count line feeds only, so after a lone carriage return, U+2028 or U+2029 they differ from V8's. A file under `content/` that a module also imports is parsed only as a module, so `await / import('./x.js') /g` reads as a regular expression to the build and as a division and an import to Chrome's classic injection; no shipped file is both. The search for `import(` tries its pattern at every `import` in a file, 0.9 ms on the shipped scripts but quadratic on hostile input: one line of 20,000 keywords that each match takes 0.7 to 1.8 s, and 20,000 `import` each followed by a comment opener on one line 3 to 6 s. HTML like comments are taken between `import` and its parenthesis anywhere on a line, though a classic script allows `-->` only at a line start; that only adds a place V8 then rules out. Low; older than this round, the search's cost new with it. | S for the line numbers. The second is not worth it while no shipped file is both, nor the search's cost, which only a file written to slow the build reaches; every place found costs one V8 parse of its file, as every real `import()` already did. |
+| F68 | `shared/prompt-template.js:1854` (`splitJson`), `:2235` (`JOIN_CHANGES`), `:1804` (`pathSecretIn`) | What the URL scan costs. Of the checker's 38 megabyte shapes, each tried in a message, a request URL and the page URL, all 114 are under 150 ms and 45 are over twice 0.6.0; the slowest, a message of URLs each followed by a quote and a brace, takes 120 to 143 ms (0.6.0: 44 to 47). The collector clips console text at 6,000 characters and request URLs at 600, so only the page URL and a picked element's attributes can hold a megabyte. In the page URL every shape is under 60 ms; over twice 0.6.0 there are alternating quotes (27 ms against 11), backslash runs before a quote (26 to 27 against 10), single quoted JSON with encoded quotes (28 to 30 against 3), encoded single quoted keys with a raw `&` (18 against 6) and `data:` content encoded four times (14 against 4). In a picked link every shape is under 50 ms: a plain megabyte query 41 to 48 ms, `data:` shapes 12 to 24 ms (0.6.0: 1 to 3), layered `%25` escapes after JSON 40 ms (0.6.0: 8). In Chrome, picking a link whose `href` is a megabyte `data:` URL holds the page for 100 to 117 ms, and 583 to 683 ms with five such attributes, where 0.6.0, which did not read such content, took 17 ms; 0.6.0 holds the page 117 to 133 ms (683 to 700 with five) for a plain megabyte query. A megabyte request URL of `it%27s` values costs 29 ms (0.6.0: 20). Low; new with the 0.6.1 rounds. | Not worth it while every shape stays under 150 ms: the layered decode in `splitJson` and the second reading of text a URL is read on across keep these shapes over twice 0.6.0, and both are part of the fixes that hide keys 0.6.0 printed (F20, F40). |
+| F69 | `content/overlay.js:317` (`collectRoots`), `:48` (`ROOT_WALK_MS`) | On a page that changes its tree all the time and has many closed shadow roots, the armed overlay costs about three times 0.6.0: over 3 s, 11 to 12 ms against 4 with 2,000 closed roots, and 23 to 24 against 6.5 to 6.7 with 6,000. That is the walk itself, 6 to 7 ms on 6,000 roots once a second, which 0.6.0 never paid: it walked only when placing the overlay and never saw a closed root. Busy pages with open roots cost about half what they did in 0.6.0, and quiet pages at or below it. At 120 Hz (derived, not measured, since headless Chrome stays at 60 frames a second) the walk still lands in an 8.3 ms frame once a second. Low; new with F37 and F51. | Not worth it: the walk is what finds a popover or a dialog in a closed root (F37), and it runs at most once a second. Walking only the roots that changed would need a further observer, which this round did not add. |
+| F70 | `tools/build.mjs:657` (`sweepScratch`), `tools/release-check.mjs:140` (`GROUP`) | What a stopped run leaves behind. When the build alone is killed (not its process group) while a child is stuck, that child keeps running with no limit. A build stopped by a signal leaves its temporary folder, a copy of every shipped script (about 0.8 MB), until a build at least an hour later removes it. On a local release check, a `git` or `gh` call that runs out of time is stopped, but what it started keeps running, as in 0.6.0. Low; the release check's as in 0.6.0, the rest new with the build's temporary folders. | Not worth it: a process that is killed runs none of its own code, so only a later build can remove its folder, and only after an hour, since a running build uses each of its folders for one child, within that child's time limit. A group per call on a local run takes the call out of the terminal's reach, so Ctrl+C would leave it running with no limit, as the second round's did (F59). The sweep costs 8 to 10 ms a build with 21,365 entries in the temp directory. |
+| F71 | `content/picker.js:2459` (`frameAt`), `:992` (`FRAME_BOXES`) | `frameAt()` reads the box of every frame found before the one under the pointer, and in Chrome the box of a frame that is not drawn is not cheap to read: the first such reads after a hit test lay out skipped `content-visibility: auto` content. With 1,999 frames in skipped content found before the one under the pointer, the first move over it after an arm takes 0.81 s in 0.6.0 and 0.95 s in 0.6.1, and each later move 53 to 58 ms (39 to 57 ms behind 1,999 frames with `display: none`); the page alone takes 0.70 to 0.75 s for the first 1,999 such reads and 47 to 49 ms after that. With the frame under the pointer found first, a move over it takes 3.8 to 3.9 ms. The comment on `FRAME_BOXES` held for drawn frames only, and now says so. Low; also in 0.6.0, found by the last rerun of the 0.6.1 rounds. | S: pass over a frame that `checkVisibility({ contentVisibilityAuto: true })` says is not drawn, which cannot be under the pointer, before reading its box (0.3 to 0.5 ms for 2,000 frames in Chrome). Left for a later round, since the loop stopped at the sixth (see Judgment calls). |
 
 The stage (`tools/panel-stage.html`) cannot model an arm that lands out of order because of the
 stage's own artificial delay; the real extension landed 75 of 75 back to back injections in order.

@@ -28,11 +28,19 @@ installed or enabled, it starts instead when the side panel first shows that tab
 It keeps the newest 30 entries of each kind. The record lives in that page's memory and goes
 when the page is closed or reloaded. The extension reads it only from the side panel, to show
 its counts and to build the prompt when you copy, together with the page's address, title,
-window size and pixel ratio. The README shows how to keep the collector to the sites you name,
+window size and pixel ratio. While the side panel is open and shown on a tab, the extension's
+script in that page also sends the panel the two counts whenever they change, and nothing else
+from the record. The README shows how to keep the collector to the sites you name,
 in tabs that were already open as well as in new ones. On a site you leave out, the extension
 puts nothing in the page to collect, not even a check for a collector already there. On a site
 you keep, a page at a path you leave out gets that check, so a collector already running there
 (a single page app that moved from a page you kept) is still read.
+
+Beside the collector, a second small script listens on the page for presses and keys, so that
+the element picker hears them before the page's own scripts do. It does nothing with them unless
+you are picking an element or have just picked one: it reads, keeps and sends nothing. It runs
+wherever the collector is set to run, in pages loaded since the extension was installed or
+enabled.
 
 **When you capture something** with Region, Element or Screen, the extension takes:
 
@@ -85,7 +93,7 @@ Chrome offers no setting to turn it on there.
 
 | Permission | What it is used for |
 | :--- | :--- |
-| Access to all sites (`<all_urls>`) | Taking the screenshot (`captureVisibleTab` requires it), putting the capture overlay and the element picker on the page, reading the tab's address, and running the collector |
+| Access to all sites (`<all_urls>`) | Taking the screenshot (`captureVisibleTab` requires it), putting the capture overlay and the element picker on the page, reading the tab's address, and running the collector and the picker's press listener |
 | `scripting` | Putting the capture overlay and the element picker on the page when you press Region or Element, and starting the collector on a tab that was already open when the extension was installed or enabled, only where the collector is set to run |
 | `downloads` | Saving each screenshot to your Downloads folder, reading back where it was saved, checking that it is still there, and deleting the screenshot of an item that was never copied |
 | `storage` | Keeping the sheet and your settings between panel sessions |
