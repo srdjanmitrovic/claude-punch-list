@@ -39,6 +39,22 @@ const MARK_STEP = 0.02; // how far an arrow key moves a point, as a share of the
 // newest captures, this many at most and about this many bytes together.
 const FULL_KEEP_COUNT = 10;
 const FULL_KEEP_BYTES = 100 * 1024 * 1024;
+// A whole page capture (the Page mode, see capturePage). PAGE_MAX_HEIGHT is
+// the tallest stitched PNG it makes, in device pixels: about five screens at
+// 2x. A longer page stops there at full resolution, and the item says so.
+// Claude reads an image at most 2576 px on its long edge, so a taller one
+// reaches it scaled down; raise this for a longer overview, lower it for
+// legible text.
+const PAGE_MAX_HEIGHT = 10000;
+const PAGE_MAX_AREA = 2 ** 26; // and never more pixels than this, whatever the width
+const PAGE_MAX_SCREENS = 100; // a safety stop for a view only a few pixels tall
+const PAGE_THUMB_MAX_HEIGHT = 1600; // its thumbnail: cdrThumbs is rewritten on every change
+const PAGE_PACE_MS = 520; // captureVisibleTab allows two calls a second per extension
+// How long one call into the page may take. A step answers in about a second
+// at most (two frames, the image wait, two frames), so a page silent for this
+// long is not painting or has gone; its own lease (4 s) puts it back.
+const PAGE_CALL_MS = 5000;
+const PAGE_SCRIPT = 'content/page-shot.js';
 const UNDO_MS = 6000; // how long a discard can be taken back before its files go
 const REMOVED_TTL_MS = 10 * 60 * 1000; // how long the sheet remembers what left it, see state.removed
 const REMOVED_MAX = 200;
@@ -107,7 +123,7 @@ const INTENT_UI = {
 
 // Terse, like a viewfinder readout rather than a sentence. 'other' is any
 // mode this build does not know, read from a sheet a newer build stored.
-const MODE_LABEL = { region: 'REGION', element: 'ELEMENT', visible: 'SCREEN', other: 'CAPTURE' };
+const MODE_LABEL = { region: 'REGION', element: 'ELEMENT', visible: 'SCREEN', page: 'PAGE', other: 'CAPTURE' };
 
 const el = {
   statusDot: document.getElementById('status-dot'),
@@ -120,9 +136,13 @@ const el = {
   modeRegion: document.getElementById('mode-region'),
   modeElement: document.getElementById('mode-element'),
   modeVisible: document.getElementById('mode-visible'),
+  modePage: document.getElementById('mode-page'),
+  modePageLabel: document.getElementById('mode-page-label'),
+  modePageCount: document.getElementById('mode-page-count'),
 
   preview: document.getElementById('preview'),
   previewEmpty: document.getElementById('preview-empty'),
+  previewScroll: document.getElementById('preview-scroll'),
   previewImg: document.getElementById('preview-img'),
   previewClear: document.getElementById('preview-clear'),
   previewMeta: document.getElementById('preview-meta'),
@@ -186,7 +206,7 @@ const el = {
 /**
  * @typedef {Object} Item
  * @property {string}  id
- * @property {'region'|'element'|'visible'|'other'} mode
+ * @property {'region'|'element'|'visible'|'page'|'other'} mode
  * @property {number}  width        Captured size, in device pixels.
  * @property {number}  height
  * @property {string}  url          Page the item was captured on.
@@ -250,6 +270,17 @@ const el = {
  *                                  again starts from instead. Not stored.
  * @property {{ downloadId: number|null }|null=} markSave  A marked copy on its
  *                                  way to disk. Copy waits for it. Not stored.
+ * @property {Stitched=} stitched   How a page item (mode 'page') was put
+ *                                  together, which the prompt says. Stored.
+ */
+
+/**
+ * @typedef {Object} Stitched
+ * @property {number} screens    How many screenshots it was put together from.
+ * @property {number} cssWidth   What it shows of the page, in CSS pixels.
+ * @property {number} cssHeight
+ * @property {true=}  cut        The page went on below what it shows
+ *                               (PAGE_MAX_HEIGHT). Present only when true.
  */
 
 /**
@@ -283,7 +314,11 @@ const state = {
   cancelledArmIds: new Set(), // arms this panel cancelled or replaced, whose late cdr:armed is ignored
   cancels: new Map(), // tabId -> a disarm on its way there, so a capture on that tab can wait
   resolving: 0, // bumped by each resolveTab(), so an older one that answers late gives way
-  capturing: false, // a Screen capture in flight, so a second click cannot start another
+  capturing: false, // a Screen or Page capture in flight, so a second click cannot start another
+  // The whole page capture in progress, see capturePage: { tabId, tab,
+  // cancelled, reason, screens, expected, composing, stopped, stop }. Null
+  // while none runs.
+  pageShot: null,
   reads: 0, // bumped by each refreshContext(), so an older read that answers late leaves the chips alone
   countsRead: 0, // the read the chips show
   /** @type {Item[]} */
@@ -569,6 +604,9 @@ async function resolveTab() {
     // so a Screen on coming back waits for the overlay to go.
     if (stale != null) sendDisarm(stale);
   }
+  // A page shot photographs whatever tab is in view, so it ends with the
+  // switch, and the page it scrolled is put back.
+  if (state.pageShot && state.pageShot.tabId !== (tab?.id ?? null)) stopPageShot('tab');
 
   if (!tab) {
     el.targetUrl.textContent = 'No active tab';
@@ -661,13 +699,15 @@ async function resolveTab() {
 /**
  * The capture buttons can be pressed unless the tab in view may not be
  * captured, or a markup has taken their row's place (see showMarking). A
- * tab change while marking leaves them off.
+ * tab change while marking leaves them off. While a page shot runs, Page is
+ * its Stop and the other three wait.
  */
 function applyModesDisabled() {
   const disabled = Boolean(state.restriction) || Boolean(state.markup);
-  el.modeRegion.disabled = disabled;
-  el.modeElement.disabled = disabled;
-  el.modeVisible.disabled = disabled;
+  el.modeRegion.disabled = disabled || Boolean(state.pageShot);
+  el.modeElement.disabled = disabled || Boolean(state.pageShot);
+  el.modeVisible.disabled = disabled || Boolean(state.pageShot);
+  el.modePage.disabled = disabled;
 }
 
 // --------------------------------------------------------------- capture --
@@ -815,6 +855,9 @@ async function makeThumb(source, maxHeight = THUMB_MAX_HEIGHT) {
  */
 function thumbMaxHeight(mode) {
   switch (mode) {
+    // A whole page is many screens tall, and shown in a frame that scrolls.
+    case 'page':
+      return PAGE_THUMB_MAX_HEIGHT;
     default:
       return THUMB_MAX_HEIGHT;
   }
@@ -845,6 +888,19 @@ function renderFrame() {
   // news replaces: why this item holds Copy back, and what lifts it.
   el.itemMissing.hidden = !item?.missing;
   updateMarkUp();
+
+  // A whole page is shown at the frame's width in a wrapper that scrolls,
+  // which takes focus so the arrow keys scroll it too.
+  const tall = item?.mode === 'page';
+  el.preview.classList.toggle('tall', tall);
+  if (tall) {
+    el.previewScroll.setAttribute('tabindex', '0');
+    el.previewScroll.setAttribute('aria-label', 'Whole page screenshot. Scroll to see all of it.');
+  } else {
+    el.previewScroll.removeAttribute('tabindex');
+    el.previewScroll.removeAttribute('aria-label');
+  }
+  el.previewScroll.hidden = !item;
 
   if (!item) {
     el.previewImg.hidden = true;
@@ -893,7 +949,9 @@ function statusOf(item) {
   if (item.missing) return ' · FILE MISSING';
   if (!item.path || item.markSave) return ' · SAVING';
   if (markingUp(item)) return ' · MARKING';
-  return item.marked ? ' · MARKED' : '';
+  if (item.marked) return ' · MARKED';
+  // A whole page that went on below what it shows (PAGE_MAX_HEIGHT).
+  return item.stitched?.cut ? ' · CUT SHORT' : '';
 }
 
 /**
@@ -901,7 +959,9 @@ function statusOf(item) {
  * nothing. The sentence itself rides along, cut short.
  */
 function describeRow(item, index) {
-  const head = `Item ${index + 1}, ${MODE_LABEL[item.mode].toLowerCase()}${item.marked ? ', marked' : ''}`;
+  const head =
+    `Item ${index + 1}, ${MODE_LABEL[item.mode].toLowerCase()}` +
+    `${item.marked ? ', marked' : ''}${item.stitched?.cut ? ', cut short' : ''}`;
   if (item.missing) return `${head}, file missing`;
   const words = item.description.trim();
   if (!words) return `${head}, no description yet`;
@@ -1617,9 +1677,12 @@ function focusDescription() {
  * file would come back after a restart as a description of nothing.
  */
 async function addItem(capture) {
+  // The tab the capture was taken on: the one in view, unless the capture
+  // took long enough to bring its own (a whole page, see capturePage).
+  const tab = capture.tab || state.tab;
   // The shortcut can arm an incognito tab without the panel, and its drag
   // still arrives here. Nothing from that window is written anywhere.
-  if (state.tab?.incognito) {
+  if (tab?.incognito) {
     showBanner(INCOGNITO_RESTRICTION, 'error', 'page');
     return;
   }
@@ -1630,14 +1693,16 @@ async function addItem(capture) {
     mode: capture.mode,
     width: capture.width,
     height: capture.height,
-    url: state.tab?.url || '',
-    title: state.tab?.title || '',
-    tabId: state.tab?.id ?? null,
+    url: tab?.url || '',
+    title: tab?.title || '',
+    tabId: tab?.id ?? null,
     intent: state.intent,
     description: '',
     included: true,
     // An element payload only belongs to the capture it was picked with.
     element: capture.mode === 'element' ? capture.element || null : null,
+    // And how a whole page was put together, to a page.
+    ...(capture.mode === 'page' && capture.stitched ? { stitched: capture.stitched } : {}),
     capturedAt,
     // A capture goes to the end of the sheet, in every panel and after a
     // reopen, which sort by place. Its time puts it there, unless that is at
@@ -2298,6 +2363,39 @@ const OVERLAY_TOO_BUSY =
 const ARMED_DURING_SCREEN =
   'A capture mode was armed while this screenshot waited, so its overlay may show in it.';
 
+/**
+ * Clear the tab in view for a screenshot of it, which Screen and Page both
+ * take. An armed overlay is drawn on the page itself. Photographing it would
+ * bake the dim layer and the hint into the image and leave the overlay live,
+ * so it is cancelled first and the capture waits for the page to repaint.
+ *
+ * Says what the capture should carry: OVERLAY_TOO_BUSY when the wait ran
+ * out, and whether a mode was armed on the tab while it waited.
+ *
+ * @returns {Promise<{ notice: string|null, armedSince: boolean }>}
+ */
+async function clearForShot() {
+  if (armedHere()) cancelArmed();
+  // This cancel, or one sent for this tab a moment before the click: Esc,
+  // or the disarm sent on leaving it. Bounded, like every wait on the page,
+  // and said out loud when it runs out: a page too busy to take the overlay
+  // down still gets photographed, since that page is often the bug, but
+  // nobody should find the dim layer later without having been told.
+  let notice = null;
+  let reply = null;
+  const pending = state.cancels.get(state.tab?.id);
+  if (pending) {
+    reply = await withTimeout(pending, ARM_TIMEOUT_MS).catch(() => {
+      notice = OVERLAY_TOO_BUSY;
+      return null;
+    });
+  }
+  // A mode armed on this tab while the capture waited: Region or Element
+  // clicked, or the shortcut, which the worker reports before this panel has
+  // heard of it.
+  return { notice, armedSince: Boolean(reply?.superseded) || armedHere() };
+}
+
 async function captureVisible() {
   // One capture in flight at a time. This covers the capture itself, which
   // can take a while on a busy page; the second click of a double click is
@@ -2308,28 +2406,9 @@ async function captureVisible() {
   updateMarkUp();
   try {
     showBanner(null);
-    // An armed overlay is drawn on the page itself. Photographing it would bake
-    // the dim layer and the hint into the image and leave the overlay live, so
-    // it is cancelled first and the capture waits for the page to repaint.
-    if (armedHere()) cancelArmed();
-    // This cancel, or one sent for this tab a moment before the click: Esc,
-    // or the disarm sent on leaving it. Bounded, like every wait on the page,
-    // and said out loud when it runs out: a page too busy to take the overlay
-    // down still gets photographed, since that page is often the bug, but
-    // nobody should find the dim layer later without having been told.
-    let notice = null;
-    let reply = null;
-    const pending = state.cancels.get(state.tab?.id);
-    if (pending) {
-      reply = await withTimeout(pending, ARM_TIMEOUT_MS).catch(() => {
-        notice = OVERLAY_TOO_BUSY;
-        return null;
-      });
-    }
-    // A mode armed on this tab while Screen waited: Region or Element clicked,
-    // or the shortcut, which the worker reports before this panel has heard of
-    // it. Photographed with a notice; see ARMED_DURING_SCREEN.
-    let armedSince = Boolean(reply?.superseded) || armedHere();
+    // A mode armed while Screen waited is photographed with a notice; see
+    // ARMED_DURING_SCREEN.
+    let { notice, armedSince } = await clearForShot();
     const { dataUrl, takenAt } = await captureViewport();
     // Asked again once the pixels are in. captureViewport waits out Chrome's
     // capture quota, up to 1.2 s, and a mode armed during that wait may be in
@@ -2349,6 +2428,527 @@ async function captureVisible() {
     showBanner(error?.message || 'Screenshot failed.', 'error');
   } finally {
     state.capturing = false;
+    updateMarkUp();
+  }
+}
+
+// ------------------------------------------------------------ whole page --
+
+const PAGE_PROGRESS = 'Capturing the whole page by scrolling it. Press Esc or Stop to cancel.';
+const PAGE_COMPOSING = 'Putting the page together.';
+const PAGE_ARMED_FIRST = 'A capture mode was armed, so the page capture did not start.';
+const PAGE_ZOOMED = 'Zoom back out to capture the whole page: a pinch zoomed page cannot be scrolled through.';
+const PAGE_REFUSED = 'This page could not be scrolled through for a whole page capture.';
+const PAGE_TOO_LARGE = 'The whole page was too large to put together, so nothing was filed.';
+const PAGE_GREW =
+  'The page changed height or moved while it was captured, so a seam in this screenshot may not line up.';
+const PAGE_ONE_SCREEN = 'Nothing on this page scrolls, so this is the visible screen.';
+const PAGE_LOCKED = 'The page has locked its scrolling, as an open dialog or menu does, so this is the visible screen.';
+const PAGE_INNER =
+  'The page scrolls inside one area, so only that area is shown in full, and what is beside it is from the first screen.';
+const PAGE_CANCELLED = 'Page capture cancelled. Nothing was filed.';
+
+/**
+ * Why a page shot stopped before its end, by the reason stopPageShot was
+ * given or the page reported, and said in the banner. 'user' (Stop or Esc)
+ * is the user's own doing and only announced (PAGE_CANCELLED). None files
+ * anything.
+ */
+const PAGE_STOPPED = {
+  input: 'You scrolled, pressed a key or clicked on the page, so the page capture stopped. Nothing was filed.',
+  tab: 'The tab changed, so the page capture stopped. Nothing was filed.',
+  resized: 'The tab changed size, so the page capture stopped. Nothing was filed.',
+  armed: 'A capture mode was armed, so the page capture stopped. Nothing was filed.',
+  left: 'The tab left or reloaded the page, so the page capture stopped. Nothing was filed.',
+  gone: 'The page went away or stopped answering, so the page capture stopped. Nothing was filed.',
+};
+
+/**
+ * PAGE_STOPPED's reason for a step that answered without going on: the user
+ * touched the page; the page was left, which its controller saw (pagehide)
+ * or which a new document without one shows; or it stopped for itself (its
+ * lease ran out, a step threw).
+ */
+function pageStopReason(reply) {
+  if (reply?.stopped === 'user') return 'input';
+  if (reply?.stopped === 'pagehide' || reply?.missing) return 'left';
+  return 'gone';
+}
+
+/**
+ * What a page item cut short says: that the page went on past what a capture
+ * covers (PAGE_MAX_HEIGHT, PAGE_MAX_AREA or PAGE_MAX_SCREENS), or, when it
+ * stopped scrolling before its end, that it did.
+ */
+function pageCutNotice(cssHeight, stuck) {
+  const why = stuck ? 'The page would not scroll any further' : 'The page is longer than a whole page capture covers';
+  return `${why}, so this shows its first ${cssHeight} CSS pixels.`;
+}
+
+/**
+ * Call the page shot controller in the tab's isolated world (see
+ * content/page-shot.js), as handKeyToPage calls into the overlay. Chrome
+ * serialises the function and its arguments, and awaits what it returns. A
+ * document without the controller, one loaded since the file was injected,
+ * answers { missing: true }.
+ */
+async function callPage(tabId, name, args = []) {
+  const [injected] = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: (method, params) => {
+      const shot = window.__cdrPageShot;
+      return shot ? shot[method](...params) : { missing: true };
+    },
+    args: [name, args],
+  });
+  return injected?.result;
+}
+
+/**
+ * The Page button while a page shot runs: lit like an armed mode, so the
+ * frame's marching ants run too, labelled Stop, with a count of the screens
+ * taken in place of its icon (panel.css hides the icon). The count is drawn,
+ * not announced: the banner said once what is going on, and a screen reader
+ * is not interrupted every half second.
+ */
+function renderPageButton() {
+  const shot = state.pageShot;
+  const running = Boolean(shot);
+  el.modePage.classList.toggle('armed', running);
+  el.modePage.setAttribute('aria-pressed', String(running));
+  if (running) el.modePage.setAttribute('aria-label', 'Stop the page capture');
+  else el.modePage.removeAttribute('aria-label');
+  el.modePageLabel.textContent = running ? 'Stop' : 'Page';
+  el.modePageCount.textContent = running ? `${shot.screens}/${Math.max(shot.expected, shot.screens)}` : '';
+  el.modePageCount.hidden = !running;
+}
+
+/**
+ * End the page shot in progress, for `reason` (a key of PAGE_STOPPED, or
+ * 'user' for Stop and Esc). The page is told at once, without waiting for a
+ * step still in flight, and capturePage files nothing and says why once its
+ * loop sees it. The lease in the page is the backstop for a call that never
+ * arrives.
+ */
+function stopPageShot(reason) {
+  const shot = state.pageShot;
+  if (!shot || shot.cancelled) return;
+  // Once every screenshot is in and the page is back, only the user's own
+  // Stop or Esc throws the result away: a tab switch or an arm then has
+  // nothing left to spoil.
+  if (shot.composing && reason !== 'user') return;
+  shot.cancelled = true;
+  shot.reason = reason;
+  shot.stop();
+  callPage(shot.tabId, 'end').catch(() => {});
+}
+
+/**
+ * What `call` (a call into the page, or a screenshot) comes to, or null as
+ * soon as the run is stopped: the loop never waits on a call in flight once
+ * stopPageShot has told the page to end. A call into the page that has not
+ * answered in PAGE_CALL_MS stops the run as gone, rather than leave Page
+ * reading Stop for a page that never answers.
+ */
+async function untilStopped(shot, call, { bounded = true } = {}) {
+  try {
+    return await Promise.race([bounded ? withTimeout(call, PAGE_CALL_MS) : call, shot.stopped]);
+  } catch (error) {
+    if (error !== TIMED_OUT) throw error;
+    stopPageShot('gone');
+    return null;
+  }
+}
+
+/**
+ * Say why a page shot stopped, once its loop has given the page back. A
+ * second cancel finds the status region holding the line already, hence
+ * announceAnew.
+ */
+function sayPageStopped(shot) {
+  if (shot.reason === 'user' || !PAGE_STOPPED[shot.reason]) {
+    showBanner(null);
+    announceAnew(PAGE_CANCELLED);
+    return;
+  }
+  showBanner(PAGE_STOPPED[shot.reason]);
+}
+
+/**
+ * Where each screenshot of a whole page goes in the stitched image. Pure, so
+ * the arithmetic is tested on its own (test/capture.test.mjs).
+ *
+ * Each frame is placed by the scroll offset the page actually reached, which
+ * the page reports for each step, not the one asked for: the last screen is
+ * clamped to the end of the page, overlaps the one before it, and is drawn
+ * over it. Everything here is in device pixels, `base` of them to a CSS
+ * pixel, read off the screenshot's width as cropCapture does, so browser
+ * zoom and a device pixel ratio that is not a whole number come out right.
+ * Each frame is drawn ceil(height × base) rows tall (as many as the
+ * screenshot has) at round(top × base), and the page steps one CSS pixel
+ * short of a screen (content/page-shot.js), so no row is left between two
+ * frames however the rounding falls. The image ends at the lowest row drawn.
+ *
+ * The document's scrollbar is cut away by drawing only its client width.
+ * For an inner scroller, the first frame is drawn whole, then its strip
+ * below the scroller, moved down by how much further the scroller reached,
+ * then each frame's scroller rect at its own offset. Beside the scroller,
+ * below the first screen, no frame has anything, and `fill` says to paint
+ * the page's background there.
+ *
+ * The image is at most maxHeight rows tall and maxArea pixels in all. A page
+ * longer than that is cut there, at full resolution, and `cut` says so, as
+ * it does when the frames stopped before the end of the page.
+ *
+ * @param {{ scroller: 'document'|'inner', rect: { x: number, y: number, width: number, height: number },
+ *   client: { width: number, height: number }, frames: Array<{ top: number }>,
+ *   frame: { width: number, height: number }, base: number, scrollHeight: number,
+ *   maxHeight: number, maxArea: number }} input
+ *   rect is the part of the view the scroller shows and client the
+ *   document's client size, both in CSS pixels, as begin() reported them;
+ *   frame is the size of every screenshot; scrollHeight is the scroller's at
+ *   the last step.
+ * @returns {{ width: number, height: number, fill: boolean, cut: boolean, cssWidth: number, cssHeight: number,
+ *   draws: Array<{ frame: number, sx: number, sy: number, sw: number, sh: number, dx: number, dy: number }> }}
+ *   draws in order, each frame's together and the frames in turn.
+ */
+function pagePlan({ scroller, rect, client, frames, frame, base, scrollHeight, maxHeight, maxArea }) {
+  const inner = scroller === 'inner';
+  const width = Math.min(frame.width, Math.round(client.width * base));
+  const limit = Math.max(1, Math.min(maxHeight, Math.floor(maxArea / Math.max(1, width))));
+  const reached = frames[frames.length - 1].top + rect.height;
+  const extra = inner ? Math.max(0, reached - rect.height) : 0;
+  const box = {
+    x: Math.round(rect.x * base),
+    y: Math.round(rect.y * base),
+    width: Math.ceil(rect.width * base),
+    height: Math.ceil(rect.height * base),
+  };
+  const placed = [];
+  const add = (index, sx, sy, sw, sh, dx, dy) => {
+    const w = Math.min(sw, frame.width - sx, width - dx);
+    const h = Math.min(sh, frame.height - sy);
+    if (w > 0 && h > 0) placed.push({ frame: index, sx, sy, sw: w, sh: h, dx, dy });
+  };
+  frames.forEach((shot, index) => {
+    if (!inner) {
+      add(index, 0, 0, width, box.height, 0, Math.round(shot.top * base));
+      return;
+    }
+    if (index === 0) {
+      const below = Math.round((rect.y + rect.height) * base);
+      add(0, 0, 0, width, below, 0, 0);
+      add(0, 0, below, width, Math.round(client.height * base) - below, 0, Math.round((rect.y + rect.height + extra) * base));
+    }
+    add(index, box.x, box.y, box.width, box.height, box.x, Math.round((rect.y + shot.top) * base));
+  });
+  // As tall as the lowest row drawn, which no rounding can leave empty, and
+  // then held to the limit.
+  const full = Math.max(1, ...placed.map((draw) => draw.dy + draw.sh));
+  const height = Math.min(full, limit);
+  const draws = placed
+    .map((draw) => ({ ...draw, sh: Math.min(draw.sh, height - draw.dy) }))
+    .filter((draw) => draw.sh > 0);
+  return {
+    width,
+    height,
+    draws,
+    fill: inner,
+    cut: reached < scrollHeight - 1 || full > limit,
+    cssWidth: Math.round(client.width),
+    cssHeight: Math.round(height / base),
+  };
+}
+
+/** The size of a screenshot, decoded once and let go. */
+async function bitmapSize(blob) {
+  const bitmap = await createImageBitmap(blob);
+  const size = { width: bitmap.width, height: bitmap.height };
+  bitmap.close();
+  return size;
+}
+
+/**
+ * Scroll the tab through and take a screenshot of each screen, then give the
+ * page back. Null when it did not start or stopped before the end, having
+ * said why; otherwise what composePage needs, and whether the page moved
+ * under it or stopped scrolling before its end, for the notices.
+ *
+ * Chrome takes at most two screenshots a second per extension, so each
+ * waits until PAGE_PACE_MS have passed since the one before, while the page
+ * scrolls and paints in that time. captureViewport's quota retry stays, for
+ * another window's panel capturing at the same moment. Each screenshot is
+ * kept as a PNG Blob until all are in; they are decoded one at a time later.
+ *
+ * end() is called in finally, whatever happened, and the run stops on its
+ * own: when the page reports it was stopped (the user touched it, it went
+ * away, the lease ran out), by a step or by what end() answers, when the tab
+ * changed size, when the page would not scroll further, at the end of the
+ * page, and at PAGE_MAX_HEIGHT.
+ */
+async function scrollAndShoot(shot) {
+  const { tabId } = shot;
+  const notices = [];
+  const { notice, armedSince } = await clearForShot();
+  // Unlike Screen, which photographs what is there, Page would scroll the
+  // page out from under the overlay the user just armed.
+  if (armedSince) {
+    showBanner(PAGE_ARMED_FIRST);
+    return null;
+  }
+  if (notice) notices.push(notice);
+  if (shot.cancelled) {
+    sayPageStopped(shot);
+    return null;
+  }
+  showBanner(PAGE_PROGRESS);
+
+  let injected = false;
+  let begun = null;
+  let ended = null; // what end() answered, or null when it did not
+  let last = null;
+  let moved = false;
+  let stuck = false; // the page stopped scrolling before its end
+  let size = null;
+  let limit = Infinity; // how far down the frames may reach, in CSS pixels
+  const frames = [];
+  try {
+    // Counted as injected from the moment it is asked for: a call that
+    // timed out may still land, and end() on a page with no run does nothing.
+    injected = true;
+    await untilStopped(shot, chrome.scripting.executeScript({ target: { tabId }, files: [PAGE_SCRIPT] }));
+    // A stop from here on is said below, once the page has had its end().
+    if (!shot.cancelled) begun = await untilStopped(shot, callPage(tabId, 'begin'));
+    if (!shot.cancelled && !begun?.ok) throw new Error(begun?.reason === 'zoom' ? PAGE_ZOOMED : PAGE_REFUSED);
+    shot.expected = begun?.screens || 1;
+    renderPageButton();
+    let gate = null;
+    for (let index = 0; index < PAGE_MAX_SCREENS && !shot.cancelled; index += 1) {
+      const reply = await untilStopped(shot, callPage(tabId, 'step', [index]));
+      if (shot.cancelled) break;
+      if (!reply?.active) {
+        stopPageShot(pageStopReason(reply));
+        break;
+      }
+      // A window resized, the panel opened beside the tab, or a browser
+      // zoom: the frames would not line up.
+      if (reply.viewport.width !== begun.viewport.width || reply.viewport.height !== begun.viewport.height) {
+        stopPageShot('resized');
+        break;
+      }
+      // The page moved or changed height since the last screenshot: while it
+      // was taken, or during this step, as when a script takes a header out
+      // of the flow once the page is scrolled and what is below moves up.
+      if (
+        last &&
+        (reply.before.top !== last.top ||
+          reply.before.scrollHeight !== last.scrollHeight ||
+          reply.scrollHeight !== last.scrollHeight)
+      ) {
+        moved = true;
+      }
+      await gate;
+      if (shot.cancelled) break;
+      // Not bounded: captureViewport has its own end, its quota retries.
+      const taken = await untilStopped(shot, captureViewport(), { bounded: false });
+      if (shot.cancelled) break;
+      const { dataUrl, takenAt } = taken;
+      gate = new Promise((resolve) => setTimeout(resolve, PAGE_PACE_MS));
+      // captureVisibleTab photographs whatever tab is in view by then.
+      const [inView] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (shot.cancelled) break;
+      if (inView?.id !== tabId) {
+        stopPageShot('tab');
+        break;
+      }
+      const blob = await blobOf(dataUrl);
+      if (!size) {
+        size = await bitmapSize(blob);
+        const base = size.width / begun.viewport.width;
+        // The tab's height and the screenshot's disagree, as cropCapture
+        // checks: an infobar or the panel came or went since begin().
+        if (Math.abs(size.height / begun.viewport.height - base) > base * 0.03) {
+          stopPageShot('resized');
+          break;
+        }
+        const width = Math.min(size.width, Math.round(begun.client.width * base));
+        limit = Math.min(PAGE_MAX_HEIGHT, Math.floor(PAGE_MAX_AREA / Math.max(1, width))) / base;
+      }
+      frames.push({ blob, top: reply.top, takenAt });
+      last = reply;
+      shot.screens = frames.length;
+      // The count's estimate, which grows with the page: a screen, then a
+      // step (a CSS pixel short of one) for each further screen it reaches.
+      const span = Math.min(reply.scrollHeight, limit - begun.rect.y) - begun.rect.height;
+      shot.expected = Math.max(
+        frames.length + (reply.atEnd ? 0 : 1),
+        1 + Math.ceil(Math.max(0, span) / Math.max(1, begun.rect.height - 1))
+      );
+      renderPageButton();
+      if (reply.atEnd) break;
+      // A page that would not scroll further, though it says there is more.
+      if (frames.length > 1 && reply.top <= frames[frames.length - 2].top) {
+        stuck = true;
+        break;
+      }
+      if (begun.rect.y + reply.top + begun.rect.height >= limit) break;
+    }
+  } finally {
+    // The page is put back whatever happened: the end, a stop, a screenshot
+    // that failed, a throw. Sent again after a stop, whose end() may have
+    // reached the page before a call still in flight. Awaited, so the page is
+    // back before the frames are composed, but bounded like every call.
+    if (injected) ended = await withTimeout(callPage(tabId, 'end'), PAGE_CALL_MS).catch(() => null);
+  }
+  // A run the page ended by itself after the last step answered: the user
+  // scrolled or clicked as the page reached its end, the tab left the page,
+  // or the lease ran out. The next step would have said so for any other
+  // screenshot, but this one may show the page already put back, drawn at
+  // the bottom of the image, so it is filed no more than any other stop.
+  if (!shot.cancelled && (ended?.missing || ended?.stopped)) {
+    shot.cancelled = true;
+    shot.reason = pageStopReason(ended);
+  }
+  if (shot.cancelled) {
+    sayPageStopped(shot);
+    return null;
+  }
+  return { begun, frames, last, moved, size, stuck, notices };
+}
+
+/**
+ * Put the screenshots of a page together into one PNG and its thumbnail.
+ * Each is decoded only for its own draws and let go, so at most one is held
+ * beside the canvas, which itself goes as soon as the PNG and the thumbnail
+ * are made from it. A screenshot of another size than the first (the tab
+ * moved to another display) stops it.
+ */
+async function composePage({ begun, frames, last, size }) {
+  const base = size.width / begun.viewport.width;
+  const plan = pagePlan({
+    scroller: begun.scroller,
+    rect: begun.rect,
+    client: begun.client,
+    frames,
+    frame: size,
+    base,
+    scrollHeight: last.scrollHeight,
+    maxHeight: PAGE_MAX_HEIGHT,
+    maxArea: PAGE_MAX_AREA,
+  });
+  const canvas = document.createElement('canvas');
+  canvas.width = plan.width;
+  canvas.height = plan.height;
+  try {
+    const context = canvas.getContext('2d');
+    if (plan.fill) {
+      context.fillStyle = begun.background || '#ffffff';
+      context.fillRect(0, 0, plan.width, plan.height);
+    }
+    for (let index = 0; index < frames.length; index += 1) {
+      const draws = plan.draws.filter((draw) => draw.frame === index);
+      if (draws.length) {
+        const bitmap = await createImageBitmap(frames[index].blob);
+        try {
+          if (bitmap.width !== size.width || bitmap.height !== size.height) throw new Error(PAGE_STOPPED.resized);
+          for (const draw of draws) {
+            context.drawImage(bitmap, draw.sx, draw.sy, draw.sw, draw.sh, draw.dx, draw.dy, draw.sw, draw.sh);
+          }
+        } finally {
+          bitmap.close();
+        }
+      }
+      frames[index].blob = null;
+    }
+    // Past Chrome's canvas limits toBlob hands over null rather than throw.
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/png'));
+    if (!blob) throw new Error(PAGE_TOO_LARGE);
+    const thumb = await makeThumb(canvas, thumbMaxHeight('page'));
+    return { blob, thumb, plan };
+  } finally {
+    canvas.width = 0;
+    canvas.height = 0;
+  }
+}
+
+/**
+ * Page: the whole page, scrolled through and put together into one item,
+ * mode 'page'. A second press, while it runs, is Stop. It cancels an armed
+ * overlay and waits for the page as Screen does, and files nothing if it is
+ * stopped. The item's time is its last screenshot's, so what the scrolling
+ * made the page log sorts to it.
+ */
+async function capturePage() {
+  if (state.pageShot) {
+    stopPageShot('user');
+    return;
+  }
+  // An incognito tab is a restriction too (resolveTab).
+  if (state.restriction || state.capturing || state.markup || !state.tab) return;
+  // The tab as it was when Page was pressed, which the item is filed under:
+  // the page may change its address as it scrolls, and the tab in view may
+  // change while the screenshots are put together.
+  const { id, url, title, incognito } = state.tab;
+  const shot = {
+    tabId: id,
+    tab: { id, url, title, incognito },
+    cancelled: false,
+    reason: null,
+    screens: 0,
+    expected: 1,
+    composing: false,
+  };
+  // Settles with null when the shot is stopped, for untilStopped to race.
+  shot.stopped = new Promise((resolve) => {
+    shot.stop = () => resolve(null);
+  });
+  state.capturing = true;
+  state.pageShot = shot;
+  renderPageButton();
+  applyModesDisabled();
+  updateMarkUp();
+  try {
+    showBanner(null);
+    const taken = await scrollAndShoot(shot);
+    if (!taken) return;
+    shot.composing = true;
+    showBanner(PAGE_COMPOSING);
+    const { blob, thumb, plan } = await composePage(taken);
+    if (shot.cancelled) {
+      sayPageStopped(shot);
+      return;
+    }
+    const { begun, frames } = taken;
+    const notices = [...taken.notices];
+    if (begun.locked) notices.push(PAGE_LOCKED);
+    else if (frames.length === 1 && !plan.cut) notices.push(PAGE_ONE_SCREEN);
+    if (begun.scroller === 'inner') notices.push(PAGE_INNER);
+    if (plan.cut) notices.push(pageCutNotice(plan.cssHeight, taken.stuck));
+    if (taken.moved) notices.push(PAGE_GREW);
+    showBanner(null);
+    addItem({
+      mode: 'page',
+      blob,
+      thumb,
+      width: plan.width,
+      height: plan.height,
+      stitched: {
+        screens: frames.length,
+        cssWidth: plan.cssWidth,
+        cssHeight: plan.cssHeight,
+        ...(plan.cut ? { cut: true } : {}),
+      },
+      notice: notices.join(' ') || null,
+      takenAt: frames[frames.length - 1].takenAt,
+      tab: shot.tab,
+    });
+  } catch (error) {
+    showBanner(error?.message || 'The page capture failed.', 'error');
+  } finally {
+    state.capturing = false;
+    state.pageShot = null;
+    renderPageButton();
+    applyModesDisabled();
     updateMarkUp();
   }
 }
@@ -2715,7 +3315,8 @@ function markingUp(item) {
  * leaves the sheet in another window.
  */
 function holdFull(item, blob) {
-  if (!blob) return;
+  // Never a whole page, which cannot be marked up (markupBlocked).
+  if (!blob || item.mode === 'page') return;
   item.full = blob;
   item.fullReleased = false;
   state.fulls.push(item);
@@ -2756,8 +3357,16 @@ function trimFulls() {
  * capture.
  */
 function markupBlocked(item) {
-  if (item.full) return null;
   const number = state.items.indexOf(item) + 1;
+  // At PAGE_MAX_HEIGHT a stitched page decodes to about 100 MB, and the
+  // markup's canvas needs as much again, so a page is never held for it.
+  if (item.mode === 'page') {
+    return (
+      `Item ${number} cannot be marked up: a whole page screenshot is too large to mark up in the panel. ` +
+      'Capture the part you mean with Region to mark it up.'
+    );
+  }
+  if (item.full) return null;
   if (item.fullReleased) {
     return (
       `Item ${number} can no longer be marked up: the panel keeps the full screenshots of its ` +
@@ -3582,6 +4191,10 @@ function assembleReport(items, read, numbers = items.map((item) => state.items.i
       // The file carries marks the user drew, which the prompt says are not
       // part of the page.
       marked: item.marked || undefined,
+      // How a whole page was put together, which the prompt says, so that a
+      // seam or a header shown once is not read as the page's own bug. Only
+      // a page item has it, so no other item's prompt changes.
+      stitched: item.mode === 'page' ? item.stitched : undefined,
       // Always passed: the template compares each item's page against the one
       // the buffers were read on, and counts pages for the opening line. It
       // prints a URL only when `page` is present, so the toggle still holds.
@@ -4045,7 +4658,7 @@ async function checkFiles(items = state.items) {
 
 // ------------------------------------------------------------ persistence --
 
-const STORED_MODES = ['region', 'element', 'visible'];
+const STORED_MODES = ['region', 'element', 'visible', 'page'];
 const MAX_STORED_ITEMS = 500;
 const MAX_DESCRIPTION = 50000;
 // A place further out than this could not be passed: beyond 2^53 adding one
@@ -4077,6 +4690,8 @@ function storedForm(item) {
     // file, so an item never marked up is stored as before.
     marked: item.marked === true ? true : undefined,
     fileAt: item.fileAt || undefined,
+    // A page item's only, as readItem takes it.
+    stitched: item.mode === 'page' ? item.stitched : undefined,
   };
 }
 
@@ -4233,7 +4848,24 @@ function readItem(raw) {
     marked: raw.marked === true ? true : undefined,
     // Not in the future, where it would outrank every later file of the item.
     fileAt: fileAt != null && fileAt > 0 ? Math.min(fileAt, Date.now()) : undefined,
+    stitched: mode === 'page' ? readStitched(raw.stitched) : undefined,
   };
+}
+
+/**
+ * How a stored page item was put together, only as this build writes it:
+ * whole numbers above 0, at most PAGE_MAX_SCREENS screens and 100 000 CSS
+ * pixels a side, and cut only as true. Anything else is dropped whole,
+ * since the prompt prints these numbers as facts.
+ */
+function readStitched(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const whole = (number, max) => Number.isSafeInteger(number) && number > 0 && number <= max;
+  if (!whole(value.screens, PAGE_MAX_SCREENS)) return undefined;
+  if (!whole(value.cssWidth, 100000) || !whole(value.cssHeight, 100000)) return undefined;
+  const stitched = { screens: value.screens, cssWidth: value.cssWidth, cssHeight: value.cssHeight };
+  if (value.cut === true) stitched.cut = true;
+  return stitched;
 }
 
 /** A stored report, read with readItem, and its list of removals. */
@@ -4331,6 +4963,8 @@ function adoptStored(report, thumbs, { initial = false } = {}) {
       continue;
     }
     if (mine.armedAt == null && theirs.armedAt != null) mine.armedAt = theirs.armedAt;
+    // Set once, at the capture: only ever missing here, never different.
+    if (!mine.stitched && theirs.stitched) mine.stitched = theirs.stitched;
     if (theirs.editedAt > (mine.editedAt || 0)) {
       mine.intent = theirs.intent;
       mine.included = theirs.included;
@@ -4537,6 +5171,9 @@ function handleBroadcast(message) {
   if (message.type === 'cdr:armed') {
     // The echo of an arm this panel has already cancelled; see cancelArmed().
     if (message.armId && state.cancelledArmIds.has(message.armId)) return;
+    // The shortcut arming the tab a page shot is scrolling: the newer action
+    // wins, and the page is put back under its overlay.
+    if (state.pageShot && message.tabId === state.pageShot.tabId) stopPageShot('armed');
     setArmed(
       message.mode,
       message.tabId,
@@ -4650,6 +5287,12 @@ el.modeVisible.addEventListener('click', (event) => {
   // A keyboard press has detail 0 and always counts.
   if (event.detail > 1) return;
   captureVisible();
+});
+// Page, and Stop while it runs. The second click of a double click would
+// stop the capture the first one started.
+el.modePage.addEventListener('click', (event) => {
+  if (event.detail > 1) return;
+  capturePage();
 });
 el.previewClear.addEventListener('click', discardSelected);
 el.discardAll.addEventListener('click', discardAll);
@@ -4921,8 +5564,12 @@ document.addEventListener('pointerover', (event) => {
  *   file would be left in the Downloads folder with nothing pointing at it.
  *   So is a marked copy still on its way: the stored item names the file it
  *   had, which stays, and marks not yet saved are lost with the panel.
+ * - A page shot still scrolling is told to put the page back. The call may
+ *   not get out of a closing page; the lease in page-shot.js is the
+ *   backstop, and puts the page back 4 s after the last call.
  */
 function flushOnClose() {
+  if (state.pageShot) callPage(state.pageShot.tabId, 'end').catch(() => {});
   const trash = state.trash;
   state.trash = null;
   if (trash) {
@@ -4982,6 +5629,12 @@ document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape' && !event.isComposing && state.markup) {
     event.preventDefault();
     escapeMarkup();
+    return;
+  }
+  // Then a page shot that is running, which files nothing, as Stop does.
+  if (event.key === 'Escape' && !event.isComposing && state.pageShot) {
+    event.preventDefault();
+    stopPageShot('user');
     return;
   }
   // Esc cancels an armed mode from here too. Clicking a mode button leaves

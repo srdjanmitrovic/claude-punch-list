@@ -38,6 +38,13 @@
  *                                    user drew on it, which the prompt says
  *                                    are not part of the page. Only true
  *                                    counts.
+ * @property {{ screens: number, cssWidth: number, cssHeight: number, cut?: boolean }=} stitched
+ *                                    The PNG is a whole page, put together
+ *                                    from `screens` screenshots taken while
+ *                                    scrolling it, showing cssWidth by
+ *                                    cssHeight CSS pixels of it; cut, when
+ *                                    the page went on below that. Whole
+ *                                    numbers above 0 only, and cut only true.
  * @property {string=} url            Page the item was captured on. Printed as
  *                                    a path while the report stays on one
  *                                    origin, in full once it spans two.
@@ -234,6 +241,33 @@ const MARKS = {
 };
 
 /**
+ * Said of a whole page screenshot (the panel's Page mode), which is put
+ * together from screenshots taken while the page scrolled: without it, a
+ * header that shows only at the top, or a seam where the page moved between
+ * two screenshots, reads as a defect of the page. One sentence, of numbers
+ * only, so there is nothing in it to mask.
+ *
+ * @param {'one'|'each'} form  a single report, or an item in a list
+ */
+function stitchedNote({ screens, cssWidth, cssHeight, cut }, form) {
+  const subject = form === 'one' ? 'The image is' : 'This screenshot is';
+  // One screenshot is nothing put together: the page fit, or a cap set below
+  // one screen's height (PAGE_MAX_HEIGHT in the panel) cut it.
+  if (screens === 1) {
+    return cut
+      ? `${subject} the top ${cssHeight} CSS pixels of a longer page (${cssWidth} wide), from one screenshot.`
+      : `${subject} the whole page, which fit on one screen (${cssWidth} x ${cssHeight} CSS pixels).`;
+  }
+  const what = cut
+    ? `the top ${cssHeight} CSS pixels of a longer page (${cssWidth} wide)`
+    : `the whole page (${cssWidth} x ${cssHeight} CSS pixels)`;
+  return (
+    `${subject} ${what}, put together from ${screens} screenshots taken while scrolling it, so an ` +
+    'element fixed to the window shows once, and a seam can be off where the page moved between two of them.'
+  );
+}
+
+/**
  * What is said about an item's screenshot beyond reading it, in this order:
  * what the image itself is, then the marks on it. Empty for a plain capture,
  * which prints as it always has.
@@ -242,6 +276,7 @@ const MARKS = {
  */
 function screenshotNotes(item, form) {
   const notes = [];
+  if (item.stitched) notes.push(stitchedNote(item.stitched, form));
   if (item.marked) notes.push(MARKS[form]);
   return notes;
 }
@@ -2820,6 +2855,13 @@ function normalized(report) {
       : undefined;
   const list = (value, each) => (Array.isArray(value) ? value.filter(object).map(each) : []);
   const raw = object(report) ? report : {};
+  // A whole page's numbers, or nothing: each a whole number above 0.
+  const stitched = (value) => {
+    if (!object(value)) return undefined;
+    const whole = (number) => Number.isSafeInteger(number) && number > 0;
+    if (!whole(value.screens) || !whole(value.cssWidth) || !whole(value.cssHeight)) return undefined;
+    return { screens: value.screens, cssWidth: value.cssWidth, cssHeight: value.cssHeight, cut: value.cut === true };
+  };
 
   const element = (value) => {
     if (!object(value)) return null;
@@ -2859,6 +2901,7 @@ function normalized(report) {
       screenshotPath: string(item.screenshotPath),
       // A claim about the file, so only the value the panel sends counts.
       marked: item.marked === true ? true : undefined,
+      stitched: stitched(item.stitched),
       url: address(item.url),
       capturedAt: time(item.capturedAt),
       armedAt: time(item.armedAt),

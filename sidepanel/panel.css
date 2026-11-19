@@ -299,6 +299,31 @@ main {
   object-fit: contain;
 }
 
+/* What holds the image, or the markup's canvas in its place, centred on the
+   frame as they were before it. A whole page (.tall) is shown at the frame's
+   width from its top, and scrolls inside the same 260 px. */
+.frame-scroll {
+  display: grid;
+  place-items: center;
+  width: 100%;
+  min-width: 0;
+}
+
+.frame.tall .frame-scroll {
+  place-items: start center;
+  max-height: 260px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.frame.tall img {
+  max-height: none;
+}
+
+.frame-scroll:focus-visible {
+  outline-offset: -2px;
+}
+
 /* Once there is an image, the frame stops stretching and hugs it. Left to grow,
    it would leave a dead band under the screenshot with the readout floating in
    it, and the crop marks would frame empty space instead of the capture.
@@ -698,7 +723,7 @@ main {
 
 .modes {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(4, 1fr);
   margin-top: 10px;
   border: 1px solid var(--rule);
   background: var(--rule);
@@ -749,6 +774,20 @@ main {
 .mode svg.fill {
   fill: currentColor;
   stroke-width: 0.9;
+}
+
+/* Page while it runs: the count of screens taken, in its icon's place and
+   the icon's height, so the label does not jump. */
+.mode .counter {
+  display: block;
+  height: 16px;
+  font: 500 10px/16px var(--mono);
+  letter-spacing: 0.04em;
+  font-variant-numeric: tabular-nums;
+}
+
+#mode-page.armed svg {
+  display: none;
 }
 
 /* The marking tools, in the same hairline grid as .modes, whose place they

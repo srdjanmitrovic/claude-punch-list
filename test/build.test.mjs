@@ -569,6 +569,9 @@ test('build: what would break in Chrome fails the build', (t) => {
     ['content/overlay.js', (text) => `${text}\n}{\n`, /content\/overlay\.js:\d+ does not parse/],
     ['shared/prompt-template.js', (text) => `${text}\nexport const = ;\n`, /shared\/prompt-template\.js:\d+ does not parse/],
     ['background.js', (text) => text.replaceAll("'content/picker.js'", "'content/pickr.js'"), /background\.js injects "content\/pickr\.js"/],
+    // The panel injects the page shot itself, so a renamed file would only
+    // fail when someone pressed Page.
+    ['sidepanel/panel.js', (text) => text.replaceAll("'content/page-shot.js'", "'content/page-shots.js'"), /sidepanel\/panel\.js injects "content\/page-shots\.js"/],
     ['sidepanel/panel.js', (text) => text.replace("'../shared/prompt-template.js'", "'../shared/prompt-templat.js'"), /sidepanel\/panel\.js imports "\.\.\/shared\/prompt-templat\.js"/],
     ['sidepanel/panel.css', null, /sidepanel\/panel\.html loads "panel\.css"/],
   ];
@@ -1340,6 +1343,51 @@ test('stage: download ids and records survive the panel frame reloading', async 
 
   // The stage hands the shim the store this test hands it.
   assert.match(read('tools/panel-stage.html'), /window\.__stage = \{[^}]*\bdownloads,/);
+});
+
+// Full page (0.7.0). The panel calls into the tab itself, for the page shot
+// and for the keys an armed mode takes. The shim had no chrome.scripting, so
+// neither ran on the stage: Page failed at once, and keys were not handed on.
+test('stage: the shim runs the panel\'s executeScript calls in the demo tab', async () => {
+  const injected = [];
+  const ran = [];
+  const stage = {
+    storage: {},
+    downloads: { records: {}, nextId: 1 },
+    inject: async (file) => injected.push(file),
+    run: async (source, args) => {
+      ran.push(args);
+      return { source, sum: args[0] + args[1], at: new Date(0) };
+    },
+  };
+  const window = { parent: { __stage: stage } };
+  class XMLHttpRequest {
+    open() {}
+    send() {
+      this.status = 404;
+    }
+  }
+  vm.runInNewContext(read('tools/chrome-shim.js'), {
+    window,
+    document: { baseURI: 'http://localhost:8000/sidepanel/' },
+    XMLHttpRequest,
+    URL,
+    setTimeout,
+    clearTimeout,
+  });
+  const { scripting } = window.chrome;
+  const filed = await scripting.executeScript({ target: { tabId: 1 }, files: ['content/page-shot.js'] });
+  assert.equal(filed.length, 1);
+  assert.equal(filed[0].result, undefined);
+  assert.deepEqual(injected, ['page-shot.js']);
+  const args = [2, 3];
+  const [{ result }] = await scripting.executeScript({ target: { tabId: 1 }, func: (a, b) => a + b, args });
+  assert.equal(result.source, '(a, b) => a + b');
+  assert.equal(result.sum, 5);
+  assert.equal(result.at, '1970-01-01T00:00:00.000Z', 'the result is serialised, as Chrome does');
+  assert.notEqual(ran[0], args, 'the arguments are a copy');
+  const stageSource = read('tools/panel-stage.html');
+  assert.match(stageSource, /window\.__stage = \{[\s\S]*?\n {10}inject,\n {10}run\(source, args\) \{/);
 });
 
 // Found while regenerating the README media for 0.6.0: the picker and the

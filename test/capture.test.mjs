@@ -2656,3 +2656,135 @@ test('panel: a collector found running after an extension reload is no late star
   await panel.flush();
   assert.equal(panel.element('collector-warning').hidden, true);
 });
+
+// ------------------------------------------------------------- page plan --
+
+/** pagePlan, lifted out of panel.js as written. It is pure. */
+function pagePlan(input) {
+  const start = PANEL.search(/^function pagePlan\(/m);
+  assert.ok(start !== -1, 'panel.js has lost pagePlan()');
+  const source = PANEL.slice(start, PANEL.indexOf('\n}\n', start) + 3);
+  return new Function(`${source}return pagePlan;`)()(input);
+}
+
+/** A page plan's draws as [frame, sx, sy, sw, sh, dx, dy]. */
+const placed = (plan) => plan.draws.map(({ frame, sx, sy, sw, sh, dx, dy }) => [frame, sx, sy, sw, sh, dx, dy]);
+
+const DOCUMENT = {
+  scroller: 'document',
+  rect: { x: 0, y: 0, width: 985, height: 800 },
+  client: { width: 985, height: 800 },
+  maxHeight: 10000,
+  maxArea: 2 ** 26,
+};
+
+// The document at 2x: each screen at the offset the page reached, the last
+// one clamped to the end of the page and drawn over the one before it, and
+// the 15 px scrollbar (30 device pixels) cut off every frame.
+test('page plan: the document is drawn screen by screen at the offsets reached, without its scrollbar', () => {
+  const plan = pagePlan({
+    ...DOCUMENT,
+    frames: [{ top: 0 }, { top: 800 }, { top: 1200 }],
+    frame: { width: 2000, height: 1600 },
+    base: 2,
+    scrollHeight: 2000,
+  });
+  assert.equal(plan.width, 1970);
+  assert.equal(plan.height, 4000);
+  assert.deepEqual(placed(plan), [
+    [0, 0, 0, 1970, 1600, 0, 0],
+    [1, 0, 0, 1970, 1600, 0, 1600],
+    [2, 0, 0, 1970, 1600, 0, 2400],
+  ]);
+  assert.equal(plan.fill, false);
+  assert.equal(plan.cut, false);
+  assert.deepEqual([plan.cssWidth, plan.cssHeight], [985, 2000]);
+});
+
+// At 1.5x a view of 733 CSS pixels is 1099.5 device pixels. Rounded the same
+// way at both ends, a frame could stop a row short of the next one: drawn
+// ceil(height × base) tall at round(top × base), no row is left out.
+test('page plan: a device pixel ratio that is not whole leaves no row between two frames', () => {
+  for (const base of [1.25, 1.5, 1.75, 2.625]) {
+    const height = 733;
+    const tops = [0, 732, 1464, 2196]; // a CSS pixel short of a screen each step
+    const plan = pagePlan({
+      ...DOCUMENT,
+      rect: { x: 0, y: 0, width: 1000, height },
+      client: { width: 1000, height },
+      frames: tops.map((top) => ({ top })),
+      frame: { width: Math.round(1000 * base), height: Math.round(height * base) },
+      base,
+      scrollHeight: 2929,
+    });
+    for (let i = 1; i < plan.draws.length; i += 1) {
+      const before = plan.draws[i - 1];
+      assert.ok(plan.draws[i].dy <= before.dy + before.sh, `a gap above frame ${i} at ${base}x`);
+    }
+    const last = plan.draws.at(-1);
+    assert.equal(last.dy + last.sh, plan.height, `the image ends at the last row drawn at ${base}x`);
+  }
+});
+
+test('page plan: a page longer than the cap is cut there at full resolution, and says so', () => {
+  const frames = [0, 800, 1600, 2400, 3200, 4000, 4800].map((top) => ({ top }));
+  const plan = pagePlan({ ...DOCUMENT, frames, frame: { width: 2000, height: 1600 }, base: 2, scrollHeight: 30000 });
+  assert.equal(plan.height, 10000);
+  assert.equal(plan.cut, true);
+  assert.equal(plan.cssHeight, 5000);
+  const last = plan.draws.at(-1);
+  assert.deepEqual([last.dy, last.sh], [9600, 400], 'the last frame is cut at the cap, not scaled');
+  // The same page with the frames reaching the end is not cut.
+  const whole = pagePlan({ ...DOCUMENT, frames: frames.slice(0, 3), frame: { width: 2000, height: 1600 }, base: 2, scrollHeight: 2400 });
+  assert.equal(whole.cut, false);
+  // Frames that stopped before the end of the page (the page would not
+  // scroll further) are cut too, whatever the height.
+  const stopped = pagePlan({ ...DOCUMENT, frames: frames.slice(0, 2), frame: { width: 2000, height: 1600 }, base: 2, scrollHeight: 2400 });
+  assert.equal(stopped.cut, true);
+});
+
+test('page plan: a very wide page is held to the area limit as well as the height', () => {
+  const plan = pagePlan({
+    ...DOCUMENT,
+    rect: { x: 0, y: 0, width: 8000, height: 1000 },
+    client: { width: 8000, height: 1000 },
+    frames: [{ top: 0 }, { top: 1000 }],
+    frame: { width: 8000, height: 1000 },
+    base: 1,
+    scrollHeight: 2000,
+    maxArea: 8000 * 1500,
+  });
+  assert.equal(plan.height, 1500);
+  assert.equal(plan.cut, true);
+});
+
+// An inner scroller in an app layout: a header above it and a status strip
+// below, at 2x. The first screen is drawn whole, the strip below the pane is
+// moved down by the 1400 CSS pixels the pane reached beyond its first
+// screen, and each frame's pane rect goes at its own offset. Beside the pane
+// nothing has a frame, so the background fills it.
+test('page plan: an inner scroller is laid out in the first screen, its strip below moved down', () => {
+  const plan = pagePlan({
+    scroller: 'inner',
+    rect: { x: 200, y: 60, width: 780, height: 700 },
+    client: { width: 1000, height: 800 },
+    frames: [{ top: 0 }, { top: 700 }, { top: 1400 }],
+    frame: { width: 2000, height: 1600 },
+    base: 2,
+    scrollHeight: 2100,
+    maxHeight: 10000,
+    maxArea: 2 ** 26,
+  });
+  assert.equal(plan.width, 2000);
+  assert.equal(plan.height, (800 + 1400) * 2);
+  assert.equal(plan.fill, true);
+  assert.deepEqual(placed(plan), [
+    [0, 0, 0, 2000, 1520, 0, 0],
+    [0, 0, 1520, 2000, 80, 0, 4320],
+    [0, 400, 120, 1560, 1400, 400, 120],
+    [1, 400, 120, 1560, 1400, 400, 1520],
+    [2, 400, 120, 1560, 1400, 400, 2920],
+  ]);
+  assert.equal(plan.cut, false);
+  assert.deepEqual([plan.cssWidth, plan.cssHeight], [1000, 2200]);
+});

@@ -1113,6 +1113,74 @@ test('prompt: only an item marked as exactly true says its marks are the user\'s
   assert.equal(buildPrompt(one).match(/magenta/g).length, 1);
 });
 
+// Full page (0.7.0). What the image is comes before what is drawn on it: a
+// page item that was also marked prints the stitched sentence, then the
+// marks, after the screenshot line in both layouts. Nothing in the panel
+// marks up a page item today, so this is the order the two are kept in.
+test('prompt: a whole page that carries marks says how it was put together before whose the marks are', () => {
+  const one = EXTRA['full-page']();
+  one.items[0].marked = true;
+  const single = buildPrompt(one);
+  assert.match(
+    single,
+    /It shows the problem as rendered\. The image is the whole page \(1265 x 2840 CSS pixels\), put together from 4 screenshots taken while scrolling it, [^\n]*between two of them\. The magenta marks on it were drawn by the user/
+  );
+  const list = EXTRA['full-page-list']();
+  list.items[1].marked = true;
+  const listed = buildPrompt(list);
+  const at = (text) => listed.indexOf(text);
+  assert.ok(at('_page.png') > 0);
+  assert.ok(at('_page.png') < at('This screenshot is the top 5000 CSS pixels of a longer page (1265 wide)'));
+  assert.ok(
+    at('This screenshot is the top 5000 CSS pixels') < at('The magenta marks on this screenshot'),
+    'the marks came first'
+  );
+});
+
+// Only the numbers the panel writes are printed: anything else in stitched
+// prints the item as a plain screenshot, and an item without a screenshot
+// says nothing of one.
+test('prompt: a stitched value that is not whole numbers above 0 is not said', () => {
+  const bare = EXTRA['full-page']();
+  delete bare.items[0].stitched;
+  const plain = buildPrompt(bare);
+  for (const stitched of [
+    'yes',
+    [],
+    { screens: 4, cssWidth: 1265 },
+    { screens: 0, cssWidth: 1265, cssHeight: 2840 },
+    { screens: 4.5, cssWidth: 1265, cssHeight: 2840 },
+    { screens: '4', cssWidth: 1265, cssHeight: 2840 },
+    { screens: 4, cssWidth: -1, cssHeight: 2840 },
+    { screens: 4, cssWidth: 1265, cssHeight: Infinity },
+  ]) {
+    const report = EXTRA['full-page']();
+    report.items[0].stitched = stitched;
+    assert.equal(buildPrompt(report), plain, `stitched: ${JSON.stringify(stitched)}`);
+  }
+  const cut = EXTRA['full-page']();
+  cut.items[0].stitched.cut = 'yes';
+  assert.equal(buildPrompt(cut), buildPrompt(EXTRA['full-page']()), 'cut only as true');
+  const single = EXTRA['full-page']();
+  single.items[0].stitched = { screens: 1, cssWidth: 1265, cssHeight: 700 };
+  assert.match(buildPrompt(single), /The image is the whole page, which fit on one screen \(1265 x 700 CSS pixels\)\./);
+  // A cap set below one screen's height cuts the first screenshot itself:
+  // nothing was put together, and "1 screenshots" was neither true nor English.
+  single.items[0].stitched = { screens: 1, cssWidth: 1265, cssHeight: 500, cut: true };
+  const capped = buildPrompt(single);
+  assert.match(capped, /The image is the top 500 CSS pixels of a longer page \(1265 wide\), from one screenshot\./);
+  assert.ok(!capped.includes('put together'));
+  const cappedList = EXTRA['full-page-list']();
+  cappedList.items[1].stitched = { screens: 1, cssWidth: 1265, cssHeight: 500, cut: true };
+  assert.match(
+    buildPrompt(cappedList),
+    /This screenshot is the top 500 CSS pixels of a longer page \(1265 wide\), from one screenshot\./
+  );
+  const unsaved = EXTRA['full-page-list']();
+  delete unsaved.items[1].screenshotPath;
+  assert.ok(!buildPrompt(unsaved).includes('scrolling it'), 'said of an item with no screenshot');
+});
+
 // V5: an item captured before a late start recorded no load (the panel
 // leaves item.armedAt unset when the collector came after the capture), and
 // was cautioned as captured before a reload that never happened.

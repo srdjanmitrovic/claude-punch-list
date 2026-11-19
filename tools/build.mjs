@@ -865,14 +865,15 @@ export function validate(entries) {
     if (!names.has(path)) problems.push(`manifest references "${path}", which is not in the build`);
   }
 
-  // The worker injects the capture scripts by path, which nothing checks until
-  // a mode button is pressed.
-  const worker = byName.get(manifest.background?.service_worker);
-  if (worker) {
-    for (const [, path] of worker.data.toString('utf8').matchAll(/['"](content\/[\w.-]+\.js)['"]/g)) {
-      if (!names.has(path)) problems.push(`${worker.name} injects "${path}", which is not in the build`);
+  // The worker injects the capture scripts by path, and the panel the page
+  // shot's, which nothing checks until a mode button is pressed.
+  const injects = (entry) => {
+    for (const [, path] of entry.data.toString('utf8').matchAll(/['"](content\/[\w.-]+\.js)['"]/g)) {
+      if (!names.has(path)) problems.push(`${entry.name} injects "${path}", which is not in the build`);
     }
-  }
+  };
+  const worker = byName.get(manifest.background?.service_worker);
+  if (worker) injects(worker);
 
   // The panel's stylesheet, scripts and images, and which scripts are modules.
   const modules = [];
@@ -886,7 +887,9 @@ export function validate(entries) {
       if (!names.has(path)) problems.push(`${panelPath} loads "${ref}", which is not in the build`);
     }
     for (const src of moduleScripts(html)) {
-      modules.push(posix.normalize(posix.join(posix.dirname(panelPath), src)));
+      const path = posix.normalize(posix.join(posix.dirname(panelPath), src));
+      modules.push(path);
+      if (byName.has(path)) injects(byName.get(path));
     }
   }
 

@@ -526,7 +526,7 @@ export function loadPanel({
   if (!SOURCE.includes(IMPORT)) throw new Error('panel.js no longer imports the template as expected');
   const source = `'use strict';${SOURCE.replace(IMPORT, 'const { buildPrompt } = __panelImports;')}`;
   const internals = vm.runInContext(
-    `${source}\n;({ state, ready, captureVisible, resolveTab, handleBroadcast })`,
+    `${source}\n;({ state, ready, captureVisible, capturePage, resolveTab, handleBroadcast })`,
     context,
     { filename: 'sidepanel/panel.js' }
   );

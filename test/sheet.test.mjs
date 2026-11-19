@@ -16,6 +16,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { loadPanel } from './support/panel-realm.mjs';
+import { makePage, reachPage } from './support/page-realm.mjs';
 
 const DIR = '/Users/you/Downloads/claude-punch-list/';
 const UNDO_MS = 6000;
@@ -609,6 +610,72 @@ test('sheet: stored values that are not what this build writes are not taken on'
   const now = a.R('Date').now();
   assert.equal(a.R('readItem')(storedItem('ahead', { fileAt: now + DAY })).fileAt, now);
   assert.equal(a.R('readItem')(storedItem('stamped', { fileAt: now - 5 })).fileAt, now - 5);
+  // Full page (0.7.0): how a page was put together, only on a page item and
+  // only as whole numbers in range, since the prompt prints them as facts.
+  const page = (stitched) => a.R('readItem')(storedItem('page', { mode: 'page', stitched })).stitched;
+  const whole = { screens: 4, cssWidth: 1265, cssHeight: 2840 };
+  assert.deepEqual({ ...page(whole) }, whole);
+  assert.deepEqual({ ...page({ ...whole, cut: true }) }, { ...whole, cut: true });
+  assert.deepEqual({ ...page({ ...whole, cut: 'yes', extra: 'x' }) }, whole, 'cut only as true, and nothing else kept');
+  for (const stitched of [
+    'yes',
+    [4, 1265, 2840],
+    null,
+    { ...whole, screens: 0 },
+    { ...whole, screens: 101 },
+    { ...whole, screens: 2.5 },
+    { ...whole, screens: '4' },
+    { ...whole, cssWidth: -1 },
+    { ...whole, cssHeight: 100001 },
+    { screens: 4, cssWidth: 1265 },
+  ]) {
+    assert.equal(page(stitched), undefined, JSON.stringify(stitched));
+  }
+  assert.equal(a.R('readItem')(storedItem('screen', { stitched: whole })).stitched, undefined, 'a screen item is not a page');
+  assert.equal(a.R('readItem')(storedItem('page', { mode: 'page' })).mode, 'page');
+});
+
+// Full page (0.7.0). A page item is one file like any other, named for its
+// mode, and is stored with how it was put together, which another window
+// reads back for its prompt.
+test('sheet: a page item is saved as _page.png, stored with how it was put together, and read back elsewhere', async () => {
+  const { storage, downloads, panels: [a, b] } = await world({ panels: 2 });
+  const page = makePage({ clock: a.clock, viewport: { width: 1280, height: 720 }, scrollbar: 0, height: 2000 });
+  reachPage(a.chrome, page);
+  a.click('mode-page');
+  await a.clock.advance(10000);
+  await settle(a, b);
+  assert.match(downloads.calls.download.at(-1), /^claude-punch-list\/\d{4}-\d\d-\d\d_\d\d-\d\d-\d\d_page\.png$/);
+  const [stored] = storedItems(storage);
+  assert.equal(stored.mode, 'page');
+  assert.deepEqual({ ...stored.stitched }, { screens: 3, cssWidth: 1280, cssHeight: 2000 });
+  const [item] = items(a);
+  assert.match(storage.data.get('cdrThumbs').items[item.id], /^data:image\/webp;base64,/, 'its thumbnail was not stored');
+  const [there] = items(b);
+  assert.equal(there.mode, 'page');
+  assert.deepEqual({ ...there.stitched }, { screens: 3, cssWidth: 1280, cssHeight: 2000 });
+  assert.equal(b.element('preview-meta').textContent, 'PAGE · PNG 1280×2000');
+  // A screen item stores none.
+  await capture(a);
+  await settle(a, b);
+  assert.equal(storedItems(storage).at(-1).stitched, undefined);
+});
+
+// A window that read the sheet from an older build's write has no stitched
+// numbers for a page item; the next write that carries them fills them in.
+test('sheet: how a page was put together is taken from another window when this one has none', async () => {
+  const { panels: [a] } = await world({
+    seed: ({ storage, time }) => {
+      storage.data.set('cdrReport', { items: [storedItem('p', { mode: 'page' })], updatedAt: time.now, writer: 'x' });
+    },
+  });
+  assert.equal(items(a)[0].stitched, undefined);
+  const stitched = { screens: 2, cssWidth: 1265, cssHeight: 1400 };
+  a.R('adoptStored')({ items: [storedItem('p', { mode: 'page', stitched })], writer: 'x' }, null);
+  assert.deepEqual({ ...items(a)[0].stitched }, stitched);
+  // And never replaced once there.
+  a.R('adoptStored')({ items: [storedItem('p', { mode: 'page', stitched: { ...stitched, screens: 9 } })], writer: 'x' }, null);
+  assert.equal(items(a)[0].stitched.screens, 2);
 });
 
 // SP6. The page toggle could not keep the host out of the prompt.

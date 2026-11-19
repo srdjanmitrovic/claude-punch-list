@@ -9,7 +9,9 @@ kind. It has no server, no account, no analytics and no telemetry, and it loads 
 anywhere. What it collects goes to three places on your own machine: your Downloads folder,
 the extension's local storage in Chrome, and, when you ask for it, your clipboard. Where that
 text goes after you paste it is up to you. While the side panel is open, it also holds the full
-screenshots of its newest captures in its own memory, so that you can mark them up.
+screenshots of its newest captures in its own memory, so that you can mark them up. The one thing
+it makes a page do that you did not is scroll it, when you use Page, and the page responds to that
+as it would to you (see below).
 
 Punch List for Claude Code is an independent project. It is not affiliated with, endorsed by
 or sponsored by Anthropic. Claude and Claude Code are products of Anthropic.
@@ -43,14 +45,23 @@ you are picking an element or have just picked one: it reads, keeps and sends no
 wherever the collector is set to run, in pages loaded since the extension was installed or
 enabled.
 
-**When you capture something** with Region, Element or Screen, the extension takes:
+**When you capture something** with Region, Element, Screen or Page, the extension takes:
 
-* a screenshot of the visible part of the tab, cropped to what you framed;
+* a screenshot of the visible part of the tab, cropped to what you framed, or with Page, of the
+  whole page, scrolled through and put together;
 * the page's address and title, and the size of the window;
 * with Element, the element you clicked: a selector that finds it again, its markup and
   attributes, some of its computed styles, its visible text, and, on a React or Vue page, the
   name of the component that rendered it, that component's props, and the names and first
   statements of the event handlers bound to it.
+
+**When you use Page**, the extension scrolls the page you are on from the top down, one screen at
+a time, and hides what is fixed to the window between screenshots, then puts both back as they
+were. The page cannot tell this from you scrolling it. It loads what it loads on a scroll, such as
+images further down or the next part of an endless feed, and its own analytics may record how far
+down the page was scrolled, as if you had scrolled it yourself. The extension still sends nothing:
+whatever the page fetches, it fetches from its own servers, as it would for you. Failed requests
+among those land in the console and network record like any others.
 
 **What you type**: the sentence you write for each item, and whether it is a bug or a
 suggestion.
@@ -73,6 +84,7 @@ does not, among them free text, the page title and the screenshot itself.
 | :--- | :--- | :--- |
 | Screenshots, as PNG files | `claude-punch-list` in your Downloads folder | A screenshot whose item you copied stays until you delete it, because the prompt names it by path. One whose item was never copied is deleted by the extension when you discard the item (once the six seconds in which the discard can be undone have run out) or when a sheet left untouched for a week is dropped. When you mark an item up, a copy with your marks drawn in is saved next to its screenshot, and once the item names the copy the screenshot it replaced is deleted, unless a prompt you are copying by hand names it. |
 | The full screenshots of the panel's newest captures, kept so that they can be marked up | The side panel's memory. Chrome may page a large one out to a temporary file in your Chrome profile while the panel holds it. | Never written to storage. Each goes when the panel closes, when its item is copied or its discard is final, or when it is no longer among the panel's 10 newest captures (about 100 MB together at most). |
+| The screenshots of a whole page while Page takes them | The side panel's memory. Chrome may page them out to a temporary file in your Chrome profile while the panel holds them. | Until they are put together into the one PNG file, a few seconds; never written to storage. |
 | The sheet: each item's sentence, thumbnail, screenshot path, page address and title, and element details | `chrome.storage.local`, in your Chrome profile, readable only by the extension's own pages | Until you copy the items or discard them. A sheet left untouched for a week is dropped the next time the panel opens, with its screenshots, unless a panel in another window is showing it. |
 | Your settings: which kinds of evidence to attach, bug or suggestion | `chrome.storage.local` | Until you uninstall the extension. |
 | The console and network record | The memory of the page it was collected on | Until that page is closed or reloaded. |
@@ -100,7 +112,7 @@ Chrome offers no setting to turn it on there.
 | Permission | What it is used for |
 | :--- | :--- |
 | Access to all sites (`<all_urls>`) | Taking the screenshot (`captureVisibleTab` requires it), putting the capture overlay and the element picker on the page, reading the tab's address, and running the collector and the picker's press listener |
-| `scripting` | Putting the capture overlay and the element picker on the page when you press Region or Element, and starting the collector on a tab that was already open when the extension was installed or enabled, only where the collector is set to run |
+| `scripting` | Putting the capture overlay and the element picker on the page when you press Region or Element, scrolling the page and hiding the elements fixed to the window while a whole page capture (Page) runs, which makes the page load what it loads on a scroll and record the scroll as yours, and starting the collector on a tab that was already open when the extension was installed or enabled, only where the collector is set to run |
 | `downloads` | Saving each screenshot to your Downloads folder, and a marked copy of one when you mark it up, reading back where it was saved, checking that it is still there, and deleting the screenshot of an item that was never copied, or one that a marked copy has replaced |
 | `storage` | Keeping the sheet and your settings between panel sessions |
 | `sidePanel` | The panel itself |

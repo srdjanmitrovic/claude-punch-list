@@ -18,8 +18,11 @@
 
       Without a screenshot provider, captures are a grey placeholder. A driver
       such as Playwright can supply one by exposing window.__pwCapture on this
-      page, returning a PNG data URL of the #demo frame. The panel follows the
-      system colour scheme, as it does in Chrome; a driver can emulate either.
+      page, returning a PNG data URL of the #demo frame. The placeholder does
+      not follow scrolling, so a whole page capture (Page) on a stage without
+      a provider is the same grey screen stitched together: it shows the
+      flow, not the pixels. The panel follows the system colour scheme, as it
+      does in Chrome; a driver can emulate either.
 
       ?save=2500 makes every save take that many milliseconds, which is how to
       see the SAVING state and the slow download banner.
@@ -236,6 +239,14 @@
             const win = demoWindow();
             win.__cdrRegionOverlay?.stop();
             win.__cdrElementPicker?.stop();
+          },
+
+          // The panel's chrome.scripting.executeScript (chrome-shim.js): a
+          // file from content/, or a function's source rebuilt in the demo
+          // tab, where `window` is the tab's, and called with its arguments.
+          inject,
+          run(source, args) {
+            return demoWindow().Function(`return (${source})`)()(...args);
           },
 
           // chrome.tabs.sendMessage, delivered to whatever the bridge registered.

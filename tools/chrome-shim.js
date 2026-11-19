@@ -8,9 +8,10 @@
  * The shim keeps the real message protocol and answers it the way the worker
  * and content scripts would: cdr:arm injects the real overlay or picker into
  * the demo tab, cdr:get-context reaches the real collector through the real
- * bridge, captureVisibleTab asks the stage for a screenshot of the demo tab.
- * Only chrome.* itself is faked, so what the stage renders is the actual panel
- * doing its actual work.
+ * bridge, captureVisibleTab asks the stage for a screenshot of the demo tab,
+ * and scripting.executeScript runs the panel's own calls (the page shot, the
+ * keys handed to an armed mode) in the demo tab. Only chrome.* itself is
+ * faked, so what the stage renders is the actual panel doing its actual work.
  *
  * Storage writes fire storage.onChanged for the writer, as Chrome does. There
  * is only one panel on a stage, so a test that wants to play a second window's
@@ -126,6 +127,25 @@
       },
       onActivated: { addListener() {} },
       onUpdated: { addListener() {} },
+    },
+
+    // The panel's own calls into the tab: the page shot (capturePage) and the
+    // keys it hands an armed mode (handKeyToPage). A file is injected into
+    // the demo tab as the stage injects the capture scripts. A function is
+    // rebuilt in the demo tab from its source, as Chrome serialises it, and
+    // called with a copy of its arguments; what it returns, awaited, comes
+    // back a copy too, as the one frame's result. There is no isolated world
+    // on the stage, so it runs beside the page's own code.
+    scripting: {
+      async executeScript({ files, func, args = [] } = {}) {
+        if (!stage) throw new Error('Cannot access contents of the page.');
+        const copy = (value) => (value === undefined ? undefined : JSON.parse(JSON.stringify(value)));
+        if (files) {
+          for (const file of files) await stage.inject(file.replace(/^content\//, ''));
+          return [{ result: undefined }];
+        }
+        return [{ result: copy(await stage.run(String(func), copy(args))) }];
+      },
     },
 
     downloads: {

@@ -10,6 +10,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { defaultWorker, loadPanel } from './support/panel-realm.mjs';
+import { panelAndPage } from './support/page-realm.mjs';
 
 const TAB = 7;
 const fromTab = { tab: { id: TAB } };
@@ -180,4 +181,82 @@ test('panel: Screen says nothing when the overlay came down in time', async () =
   assert.equal(panel.internals.state.items.length, 1);
   assert.equal(panel.banner(), null);
   assert.deepEqual(panel.lit(), []);
+});
+
+// ------------------------------------------------------------- full page --
+
+const SLOW_PHOTO = { id: 'photo', tag: 'img', rect: { x: 0, y: 900, width: 600, height: 200 }, complete: false };
+
+// Page clears the page the way Screen does (clearForShot), and then waits for
+// it: an overlay left on the page would be scrolled and photographed on every
+// screen.
+test('panel: Page cancels an armed mode and waits for the overlay to go before it scrolls', async () => {
+  const disarm = held();
+  const { panel, calls } = await panelAndPage({
+    page: { height: 2000 },
+    panel: { worker: worker({ 'cdr:disarm': () => disarm.promise }) },
+  });
+  panel.click('mode-region');
+  await panel.flush();
+  panel.click('mode-page');
+  await panel.flush();
+  assert.deepEqual(panel.lit(), [], 'the arm stayed lit');
+  assert.ok(panel.sent.some((message) => message.type === 'cdr:disarm'));
+  await panel.clock.advance(1000);
+  assert.deepEqual(calls, [], 'the page was touched before the overlay went');
+  disarm.release({ ok: true, superseded: false });
+  await panel.clock.advance(8000);
+  assert.deepEqual(calls.slice(0, 2), ['inject', 'begin']);
+  assert.equal(panel.internals.state.items.at(-1)?.mode, 'page');
+  assert.equal(panel.banner(), null);
+});
+
+// Unlike Screen, which photographs the page as it is, Page would scroll the
+// page out from under an overlay the user has just armed.
+test('panel: Page does not start when a mode was armed on the tab while it waited', async () => {
+  const { panel, calls } = await panelAndPage({
+    page: { height: 2000 },
+    panel: { worker: worker({ 'cdr:disarm': () => ({ ok: true, superseded: true }) }) },
+  });
+  panel.click('mode-region');
+  await panel.flush();
+  panel.click('mode-page');
+  await panel.clock.advance(3000);
+  assert.deepEqual(calls, []);
+  assert.equal(panel.internals.state.items.length, 0);
+  assert.equal(panel.banner(), 'A capture mode was armed, so the page capture did not start.');
+  assert.equal(panel.internals.state.pageShot, null);
+  assert.equal(panel.internals.state.capturing, false);
+});
+
+test('panel: the second click of a double click on Page does not stop what the first started', async () => {
+  const { panel } = await panelAndPage({ page: { height: 2000 } });
+  panel.click('mode-page', { detail: 1 });
+  panel.click('mode-page', { detail: 2 });
+  await panel.clock.advance(8000);
+  assert.equal(panel.internals.state.items.at(-1)?.mode, 'page');
+});
+
+// Closing the panel cannot wait for anything, so the page is told at once;
+// the lease in the page is there for a call that never leaves.
+test('panel: closing the panel during a page shot tells the page to put itself back', async () => {
+  const { panel, page, calls } = await panelAndPage({ page: { height: 4000, elements: [SLOW_PHOTO] } });
+  page.root.scrollTop = 120;
+  panel.click('mode-page');
+  await panel.clock.advance(300);
+  assert.equal(await page.call('isActive'), true);
+  panel.windowEvent('pagehide');
+  await panel.flush();
+  assert.equal(calls.at(-1), 'end');
+  assert.equal(await page.call('isActive'), false);
+  assert.equal(page.root.scrollTop, 120);
+});
+
+test('panel: Screen waits while a page shot runs', async () => {
+  const { panel } = await panelAndPage({ page: { height: 4000, elements: [SLOW_PHOTO] } });
+  panel.click('mode-page');
+  await panel.clock.advance(300);
+  await panel.internals.captureVisible();
+  await panel.clock.advance(400);
+  assert.equal(panel.internals.state.items.length, 0, 'Screen filed a capture in the middle of the page shot');
 });

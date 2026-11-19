@@ -98,28 +98,39 @@ still supported. They live in `test/`:
   listeners, a top layer, a fullscreen element and shadow roots (closed ones behind a stand in for
   `chrome.dom.openOrClosedShadowRoot`) and a clock that each frame moves on by one frame of a
   display at 60 Hz or another rate, and lays nothing out (how the overlay looks was checked in
-  Chrome), runs the crop lifted out of `sidepanel/panel.js` against a canvas that records what it
-  draws, and holds the worker and the panel to who may ask for what: a content script cannot arm,
+  Chrome), runs the crop and the whole page plan (`pagePlan`) lifted out of `sidepanel/panel.js`,
+  the crop against a canvas that records what it draws, and holds the worker and the panel to who
+  may ask for what: a content script cannot arm,
   disarm or start a collector, closing the panel disarms the tab it held, and a tab with no
   collector gets one only where the manifest declares one.
+* `test/page-shot.test.mjs` runs `content/page-shot.js` in a `node:vm` realm against a model of a
+  host page (`test/support/page-realm.mjs`): inline styles with their priorities, computed
+  positions, boxes that move as the page scrolls, inner scrollers, open and closed shadow roots,
+  images that load when the test says so, and scroll snapping and smooth scrolling as Chrome was
+  seen to handle them, each noted at the top of that file. It holds the script to putting the page
+  back on every path, and then runs it with the real panel on one clock: the pacing, the lease
+  against the quota retries, Stop, Esc and every other way a run ends, and the image the panel
+  puts together.
 * `test/worker.test.mjs` runs `background.js` in a `node:vm` realm against a model of the pages
   it injects into (`test/support/worker-realm.mjs`), and holds the worker to its ordering rules:
   an arm against the disarm that cancels it and against an older arm, a capture message against
   the arm after it, and a probe against the change it asks about.
 * `test/panel.test.mjs` runs `sidepanel/panel.js` against a stub of the DOM
   (`test/support/panel-realm.mjs`), with each test playing the worker, and checks which mode is
-  lit and what a Screen capture says when replies and broadcasts arrive in an unlucky order.
+  lit and what a Screen or Page capture says when replies and broadcasts arrive in an unlucky
+  order.
 * `test/panel-ui.test.mjs` runs the panel in the same realm, with `panel.html` and `panel.css`
   read as text, and checks what it says and where the keyboard goes: the live regions, the line
   under Copy, the shortcut Chrome has bound, the contrast of muted text in both themes, the row
   tooltip, the chips and the port that keeps them current, where focus goes after a copy, the
-  keys handed on to the page while a mode is armed, and the keys and drags that move a row (rows
-  are laid out with `panel.layOutRows()`, and `makeDataTransfer()` stands in for Chrome's).
+  keys handed on to the page while a mode is armed, the Page button and the Esc order while a
+  whole page is taken, and the keys and drags that move a row (rows are laid out with
+  `panel.layOutRows()`, and `makeDataTransfer()` stands in for Chrome's).
 * `test/sheet.test.mjs` runs one panel realm per window over one shared storage and one downloads
   list, as the side panels of two windows share them in Chrome, and checks what survives two
-  windows writing at once, the order of the sheet across windows, reopens and undo, which files a
-  discard, a copy or the weekly expiry deletes, and what the panel says about a file it cannot
-  find.
+  windows writing at once, the order of the sheet across windows, reopens and undo, what a whole
+  page item stores and what is refused of it on reading, which files a discard, a copy or the
+  weekly expiry deletes, and what the panel says about a file it cannot find.
 * `test/static.test.mjs` checks what would otherwise only fail in Chrome: every file the manifest,
   the worker and the panel name exists, every file parses, the re-injected capture scripts
   declare nothing at the top level, the copies of the secret name blocks agree, and `PRIVACY.md`
@@ -193,6 +204,19 @@ reading a single file, and breaking them tends to fail silently rather than loud
   another scheme or names another file.
 * `content/overlay.js`, `content/picker.js` and `content/stop.js` are re-injected in full on
   every use. They must not declare anything at the top level with `const`, `let` or `class`.
+* `content/page-shot.js` is the one script that changes a host page on purpose: for Page it
+  scrolls the page, turns scroll snapping off, makes sticky elements relative and hides the
+  elements fixed to the window. The panel injects it itself, not the worker, again for every
+  capture, so it keeps to the rule above. It runs in the isolated world, so the collector's rules
+  do not bind it, but the same care does. Set a style only through `setStyle`, which keeps the
+  page's own value and priority, and put it back only where the value is still the script's own.
+  Every way a run ends must put back every style and the scroll position (the document's, or the
+  inner element's it scrolled): `end()`, which the panel calls in a `finally`; the 4 s lease;
+  `pagehide`; and the user's own wheel, touch, key or press on the page. A document the page has
+  locked is not scrolled at all. A run the page ended by itself files nothing, which the panel
+  learns from the next step or, after the last screenshot, from what `end()` answers. A handler
+  the page can reach must not throw. `test/page-shot.test.mjs` holds it to each of these, and
+  anything new it changes on the page needs its restore test there first.
 * What counts as a secret is written down three times, between `SECRET NAMES BEGIN` and
   `SECRET NAMES END` in `content/collector-main.js`, `content/picker.js` and
   `shared/prompt-template.js`, because two of those are injected into the page and cannot import
@@ -343,8 +367,8 @@ test of the tool, and the output is exactly the context a maintainer wants.
 
 ## Scope
 
-Some things are intentionally out of scope for now: a full page scroll and stitch capture, any
-server component, and telemetry of any kind. Nothing in this extension should ever make a
+Some things are intentionally out of scope for now: any server component, and telemetry of any
+kind. Nothing in this extension should ever make a
 network request. The React and Vue fixtures under `tools/` load a framework from a CDN, which is
 the one exception and only because they are test pages that never ship. If you have an idea that
 needs one, open an issue first so we can talk about it before you spend time on it.

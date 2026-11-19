@@ -54,6 +54,14 @@ test('static: every script the worker injects exists', () => {
   for (const path of injected) assert.ok(exists(path), `background.js injects ${path}, which does not exist`);
 });
 
+// The panel injects the page shot's script itself (capturePage), by the same
+// kind of path, which nothing else asks for until Page is pressed.
+test('static: every script the panel injects exists', () => {
+  const injected = [...read('sidepanel/panel.js').matchAll(/['"](content\/[\w.-]+\.js)['"]/g)].map((m) => m[1]);
+  assert.ok(injected.includes('content/page-shot.js'));
+  for (const path of injected) assert.ok(exists(path), `sidepanel/panel.js injects ${path}, which does not exist`);
+});
+
 test('static: every file panel.html loads exists', () => {
   const html = read(manifest.side_panel.default_path);
   const base = dirname(manifest.side_panel.default_path);
@@ -171,11 +179,12 @@ test('static: the picker masks what it sends, and nothing rewrites the secret wo
 });
 
 // Chrome runs these again, in the same world, every time a capture mode is
-// armed. A top level const, let or class from the first run is still declared
-// when the second arrives, and the second run throws before doing anything.
-// Two copies in one script fail to compile for exactly the same reason.
+// armed (the page shot's, every time Page is pressed). A top level const, let
+// or class from the first run is still declared when the second arrives, and
+// the second run throws before doing anything. Two copies in one script fail
+// to compile for exactly the same reason.
 test('static: re-injected capture scripts declare nothing a second run would redeclare', () => {
-  for (const file of ['content/overlay.js', 'content/picker.js']) {
+  for (const file of ['content/overlay.js', 'content/picker.js', 'content/page-shot.js']) {
     const source = read(file);
     assert.doesNotThrow(
       () => new vm.Script(`${source}\n;\n${source}`, { filename: file }),

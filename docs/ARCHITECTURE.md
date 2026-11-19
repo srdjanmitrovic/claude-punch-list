@@ -21,6 +21,9 @@ sidepanel/panel.js ......... orchestrates everything. Captures the tab, crops
    |                         map of which tab is currently armed.
    |
    +-- content/overlay.js .. drag a rectangle (injected on demand)
+   +-- content/page-shot.js  ISOLATED world, injected by the panel itself for
+   |                         Page. Scrolls the page between screenshots, hides
+   |                         what is fixed to the window, then puts it back.
    +-- content/press-gate.js ISOLATED world, always on. Hands the picker
    |                         the presses and keys first, while it picks.
    +-- content/picker.js ... hover and click an element (injected on demand),
@@ -517,6 +520,21 @@ could see.
 | `cdr:clear-context` | panel | bridge | Empty the buffers |
 | port `cdr:counts` | panel | bridge | Opened with `chrome.tabs.connect` to the top frame of the tab in view once a read has found its collector, and closed on a change of tab or page and while the panel is hidden. The bridge posts `cdr:counts` with `{ console, network }` when the two counts change, at most four times a second, and again at every read and Clear, and nothing else. It closes the port itself on the browser's own `pagehide` (see [The collector is split in two](#the-collector-is-split-in-two)) |
 
+Two things go from the panel to the page without a message and without the worker, through
+`chrome.scripting.executeScript` into the tab's isolated world. The keys handed to an armed mode
+(`handKeyToPage`) call the overlay's or the picker's controller. A whole page capture injects
+`content/page-shot.js` as a file, then calls its controller, `window.__cdrPageShot`, with a
+function and serialised arguments, and Chrome hands back what the function returns, awaited:
+
+| Call | Answer |
+| :--- | :--- |
+| `begin()` | `{ ok: true, scroller: 'document' \| 'inner', locked?, rect, client, viewport, scrollHeight, screens, background }`, `locked: true` only for a document the page has locked, which the run leaves as it is; or `{ ok: false, reason: 'zoom' \| 'error' }` with nothing on the page changed |
+| `step(index)` | `{ active: true, top, scrollHeight, atEnd, viewport, before }`, where `top` is where the page actually is and `before` where it was when the step began; or `{ active: false, stopped }`, `stopped` being `'user'`, `'pagehide'`, `'lease'`, `'error'` or `'ended'` |
+| `end()` | `{ restored: true }` when a run was still going; otherwise `{ restored: false, stopped }`, `stopped` being why the page ended it by itself (`'user'`, `'pagehide'`, `'lease'` or `'error'`) or null |
+
+A document loaded since the file was injected has no controller and answers `{ missing: true }`.
+None of this is in `PANEL_MESSAGES`, since the worker never hears it.
+
 Each start of the overlay or the picker names a run. The injection returns it, `cdr:armed` and
 `cdr:check-tab` carry it, and every message from that start carries it, so a late message from
 an earlier run cannot end a newer arm of the same mode. Runs are compared only when both sides
@@ -877,6 +895,159 @@ delta silently widens the selection when a drag leaves the viewport.
 
 Opening the side panel shrinks the tab viewport, which is why the viewport is measured inside
 the content script at capture time rather than assumed.
+
+## Whole page capture
+
+Page (`capturePage` in `sidepanel/panel.js`) scrolls the tab one screen at a time, takes a
+`captureVisibleTab` screenshot of each, and puts them together into one PNG in the panel. The
+page's half is `content/page-shot.js`, which the panel injects and calls itself (see
+[Message protocol](#message-protocol)).
+
+**The loop.** It first clears the tab the way Screen does (`clearForShot`): an armed overlay is
+cancelled and the page given time to repaint, within `ARM_TIMEOUT_MS`. Where a mode was armed on
+the tab while it waited, Page does not start, since it would scroll the page out from under the
+overlay the user just armed. Then it injects the file, calls `begin()`, and for each screen calls
+`step(index)`, waits until `PAGE_PACE_MS` (520 ms) have passed since the previous screenshot, takes
+the next one, checks that the tab in view is still the one it is scrolling, and keeps the PNG as a
+`Blob`. Chrome allows an extension two screenshots a second, and `captureViewport` keeps its quota
+retry for another window's panel capturing at the same moment. The run ends at the end of the
+page, when the frames reach `PAGE_MAX_HEIGHT` device pixels (10,000) or `PAGE_MAX_AREA` pixels in
+all (2^26), after `PAGE_MAX_SCREENS`, or when the page does not scroll any further, which the item
+says rather than that the page was too long. `end()` is called in a `finally`, whatever happened,
+and what it answers is read: no step follows the last screenshot to say the page ended the run by
+itself before it was taken (the user scrolled just as the page reached its end), and by then the
+page is back where it was, which that screenshot would show at the bottom of the image, so such a
+run files nothing either. Every call into the page, and each screenshot, is raced against a
+stop (`untilStopped`), so Stop, Esc and a tab switch end the run in the panel at once rather than
+after a call in flight, and every call into the page is bounded at `PAGE_CALL_MS` (5 s), past which
+the page is taken as gone. Then the frames are put together. Each `Blob` is decoded with
+`createImageBitmap` only for its own draws and closed, so one decoded screenshot is held beside the
+canvas at a time. The canvas is encoded with `toBlob`, where `null`, which Chrome hands over past its
+canvas limits rather than throwing, is an error; the thumbnail is made from the canvas at up to
+1600 pixels tall (`PAGE_THUMB_MAX_HEIGHT`, since `cdrThumbs` is written again on every add and
+remove and reaches every window); and the canvas is released. The item goes through `addItem` like
+any other, with `capture.blob` and `capture.thumb`, as mode `page`, named `_page.png`, with
+`stitched` saying how it was made. Its time is the last screenshot's, so what the scrolling made
+the page log sorts to it.
+
+**Where each screenshot goes** is the pure `pagePlan`, tested on its own in
+`test/capture.test.mjs`. It works in device pixels, `base` to a CSS pixel, read off the screenshot's
+width as `cropCapture` reads it, so browser zoom and a device pixel ratio that is not a whole number
+come out right. Each frame is placed by the offset the page reports it reached, not the one asked
+for, so the last screen, clamped to the end of the page, overlaps the one before and is drawn over
+it. The page steps a CSS pixel short of a screen, and each frame is drawn `ceil(height × base)` rows
+tall at `round(top × base)`, so no row is left between two frames however the rounding falls. The
+document's scrollbar is cut away by drawing only its client width. When an inner element scrolls
+instead, the first screen is drawn whole down to that element's bottom edge, what was below it is
+drawn moved down by how much further the element reached, and each frame's view of the element goes
+at its own offset; beside the element, below the first screen, nothing was photographed, and the
+page's background colour fills it. The image is held to the height and area limits at full
+resolution, and says `cut` when it was, or when the frames stopped before the end of the page.
+
+**What the page script changes.** `begin()` refuses pinch zoom (`visualViewport.scale` not 1),
+because the screenshot is then only part of the layout viewport. It picks what scrolls: the
+document, unless an element whose `overflow-y` is `auto`, `scroll` or `overlay` and which covers at
+least a quarter of the view scrolls further. Candidates come from one walk of at most 20,000
+elements, through open shadow roots and, where `chrome.dom.openOrClosedShadowRoot` exists, closed
+ones; the stage has no `chrome.dom`, and walks open roots only. Unlike the overlay, which asks only
+custom elements, the walk asks every element that can host a root (a custom element, or one of the
+built in elements `attachShadow` accepts, such as `div`), because a widget's loader puts a closed
+root on a plain `div` and a chat button fixed inside it repeated down the stitched page in Chrome
+for Testing 156. Asking took about 15 ms over 20,000 divs there, so each element is asked once a run
+and the answer kept in a `WeakMap`. The document counts only when the user can scroll it: one the
+page has locked (`overflow-y` `hidden` or `clip` on the root, or on the body while the root's is
+`visible`, as an open dialog, a cookie wall or a menu sets) can still be scrolled by a script when
+it is `hidden`, so a run would go through every screen under the lock, loading and logging what the
+user never reached, and with `clip` it would not move at all. Where nothing else qualifies, the run
+is still: it neither scrolls nor touches a style, is the one screen in view as the user sees it,
+and the item says the page locked its scrolling. Otherwise `begin()` records where the page was
+scrolled, turns scroll snapping off on the scroller (mandatory snapping moved a programmatic scroll
+from 600 to 409 in Chrome), and scrolls to the top with `behavior: 'instant'`, because a page's
+`scroll-behavior: smooth` makes a plain `scrollTo` an animation that has not moved yet when the
+screenshot is taken. Each `step()` scrolls, then walks the page again. A sticky element becomes
+`position: relative` with its insets `auto`, so it shows once in its own place and still holds its
+absolutely positioned children. A fixed element that overlaps the scroller and is shorter than 90%
+of it shows on the first screen when its middle is in the upper half, on the last when it is in the
+lower half, and is hidden on every other with both `visibility: hidden` and `opacity: 0`: a
+descendant can set `visibility: visible` and still paint, and nothing undoes an ancestor's opacity.
+A taller one, a sidebar or a backdrop, is left alone and repeats. Then the step waits two animation
+frames (each at most 100 ms, since a tab that is not painting runs none) and for the images in view
+to finish, at most 800 ms, since a lazy image starts loading only once it is scrolled near. Then it
+walks the page once more: a page's scroll handlers run with the frame after a scroll, so a header a
+script fixes once the page is scrolled is fixed only now, and lazy content may have lengthened the
+page, which the bottom bar follows. When that walk changed anything, it waits two more frames.
+
+Every style is set through the CSSOM, `setProperty` with `important`, never the style attribute, so
+a page's CSP does not apply, though a page's `MutationObserver` sees it. For each property the
+page's own value and priority are kept, and put back only where what is there is still the script's
+own value: a value the page wrote during the run (a framework rendering its header again) stays the
+page's. Such a write is hidden again on the next step. An element that had no style attribute is
+left without one, not with an empty one a selector could see.
+
+**How the page is put back.** This is the one script that changes a host page on purpose, so it puts
+the page back by itself as well as when asked. `end()` restores the scroll position and then every
+style. It also runs on its own, and the next step reports why: when no call has come for 4 s (the
+lease, renewed at both ends of each step, so what it covers is the gap between two steps, the
+pacing plus `captureViewport`'s quota retries, 1.8 s at most; the 800 ms image wait falls inside a
+step); on `pagehide`; and on a trusted `wheel`, `touchstart`, `keydown` or `pointerdown` on the
+window, heard in the capture phase and passively (`stopped: 'user'`). A `begin()` puts back a run
+the panel lost track of before it starts another. Every handler the page can reach is wrapped in
+`try`, so nothing throws into page code. The file is injected again for every capture, so, like the
+overlay, it declares nothing at the top level with `const`, `let` or `class` and caches its
+controller on `window`. `test/page-shot.test.mjs` runs it in a `node:vm` realm against a model of a
+page (`test/support/page-realm.mjs`), on its own and with the real panel on one clock.
+
+**When it stops early.** Stop and Esc (after the row tooltip and an open markup, and before an
+armed mode) cancel it, file nothing and only tell a screen reader "Page capture cancelled. Nothing
+was filed." The
+banner says why for the others: input on the page; a switch to another tab, found by `resolveTab`
+or by the tab in view after a screenshot; the tab leaving or reloading the page, which the page's
+own `pagehide` or a document without the controller shows; a viewport of another size than at
+`begin()`, or a screenshot whose height disagrees with its width by more than 3% (as
+`cropCapture` checks); a `cdr:armed` for the tab, the shortcut arming Region over it; and a page
+that stopped answering. Each of the page's own stops (input, `pagehide`, the lease) is heard from
+the next step, or from `end()` after the last screenshot. `tabs.onUpdated` is not used to stop it,
+since Chrome reports `pushState`, `replaceState` and a hash change as `loading` (see
+[Message protocol](#message-protocol)), and an endless feed changes its URL as it scrolls.
+Closing the panel sends `end()` without waiting
+(`flushOnClose`), and the lease is there for a call that never leaves. Once every screenshot is in
+and the page is back, only Stop or Esc throws the result away (`composing`), since a tab switch or
+an arm then has nothing left to spoil, and the item is filed under the tab, address and title the
+run started on, not whatever tab is in view by the time it is added.
+
+**Why not `chrome.debugger`.** The DevTools protocol's `Page.captureScreenshot` with
+`captureBeyondViewport` takes one tall image without scrolling, and it was rejected on two grounds.
+The `debugger` permission cannot be optional, so adding it would disable the extension on update
+until the user accepted "Access the page debugger backend", and while it is attached Chrome shows
+an infobar on every window, which shortens the tab's view and fires a resize. And it draws a
+different page: in a probe of that call in Chrome 157 for the 0.7.0 design, a bar fixed to the
+bottom was drawn once at the bottom of the first screen, over the content, an image with
+`loading="lazy"` further down was never requested and came out blank, an inner scroller showed
+only its first screen, and a virtualised list renders only its visible rows. Scroll and stitch
+costs half a second a screen, visibly moves the page, and can leave a seam where the page moves
+during the capture, but it needs no permission and no infobar, renders what loads on a scroll,
+follows an inner scroller, and runs on the stage.
+
+**What it costs the page.** The page sees real scrolling. Its scroll handlers and
+`IntersectionObserver`s run, lazy images load, an endless feed fetches its next page, analytics
+record the scroll depth, and whatever of that fails lands in the log, sorted to this item.
+PRIVACY.md says so. The collector, in the main world, is not touched.
+
+**Memory.** At the cap on a 2x display a run holds about seven screenshots as PNG `Blob`s, a few MB
+each, and while they are put together a canvas of up to about 100 MB and one decoded screenshot.
+For that reason a page item is never held for marking up (`markupBlocked` says why), which would
+need the decoded page and the markup's canvas as well.
+
+**Not handled.** Only vertical scrolling is captured. An inner scroller under a quarter of the view,
+such as a dialog's body, is not chosen; Region or Element covers it better. A modal that leaves the
+page scrollable has its backdrop repeat on every screen (one that locks the page makes the run
+still). A video or an animation differs from screen to screen, and a page
+that moves between a screenshot and the next step leaves a seam. So does a header a script takes
+out of the flow once the page is scrolled, which moves everything below it up inside the step: in
+Chrome for Testing 156 a 56 px nav cut 56 px out of the page at the first seam, and scroll anchoring
+did not make up for it. The item says so when the page's scroll position changed between a screenshot
+and the next step, or its height changed then or during a step. A feed that grows as it is scrolled
+gets that notice too, though its seams may well line up.
 
 ## Drawing over the page
 
@@ -1311,7 +1482,9 @@ window. Whether an
 item can be marked up is decided in one place, `markupBlocked`, which returns the reason it cannot
 or null. An item that cannot still shows the button, dimmed with `aria-disabled` rather than
 disabled, so that a press can say why: it came from storage, from another window, or was let go
-to keep within the bound. Mark up also waits while a copy or a capture runs, while the item's
+to keep within the bound. A whole page is never held at all (`holdFull` skips mode `page`), since
+at the cap it decodes to about 100 MB and the canvas needs as much again; its reason says to
+capture the part with Region. Mark up also waits while a copy or a capture runs, while the item's
 previous marked copy is being saved, and while its own capture is being decoded.
 
 Opening decodes `item.full` with `createImageBitmap` and puts a canvas in the image's place, sized
@@ -1362,11 +1535,14 @@ still saving is taken back like any save in flight, and the stored item keeps th
 **Keys.** `cdrReport` holds `{ items, removed, updatedAt, writer }`. Each stored item keeps `id`,
 `mode`, `width`, `height`, `url`, `title`, `intent`, `description`, `included`, `element`,
 `capturedAt`, `armedAt`, `rank` (only once it has been moved, see Order below), `editedAt`,
-`wordsAt`, `path` and `downloadId`, and once it has been marked up, `marked` (only as `true`) and
-`fileAt` (`storedForm` in `sidepanel/panel.js`); its tab, its thumbnail, whether its file is
-missing, its clean capture and its marks are not stored. A version without `marked` and `fileAt`
-drops them on its next write: the item goes on naming its marked file and loses its MARKED label
-and the prompt's sentence about the marks.
+`wordsAt`, `path` and `downloadId`, once it has been marked up, `marked` (only as `true`) and
+`fileAt`, and for a whole page (mode `page`), `stitched`: `{ screens, cssWidth, cssHeight }` and
+`cut: true` when the page went on below the image (`storedForm` in `sidepanel/panel.js`); its tab,
+its thumbnail, whether its file is missing, its clean capture and its marks are not stored. A
+version without `marked` and `fileAt` drops them on its next write: the item goes on naming its
+marked file and loses its MARKED label and the prompt's sentence about the marks. A version
+without the `page` mode reads a page item as `other`, shown as CAPTURE, drops `stitched`, and
+still copies the item with its file; the prompt then says nothing of how the image was made.
 `cdrThumbs` holds `{ items, writer }`, the thumbnails by id. `cdrIntent` and `cdrInclude` are
 keys of their own, each written only when that setting changes, and every panel adopts both.
 
@@ -1377,7 +1553,9 @@ items and 50 000 characters per description, paths without control characters or
 (the prompt prints each on a line of its own), an unknown mode shown as `other`, element data only
 for element items, stamps capped at the current time, a rank only as a finite number no further
 than 2^52 from zero (past 2^53 adding one changes nothing, and a capture could no longer land
-after it), `marked` only as `true`, and thumbnails only as base64 WebP, PNG or JPEG data URLs,
+after it), `marked` only as `true`, `stitched` only on a page item and only as whole numbers above
+0 (at most 100 screens and 100,000 CSS pixels a side, `cut` only as `true`), since the prompt
+prints them as facts, and thumbnails only as base64 WebP, PNG or JPEG data URLs,
 since anything else in an
 `img` would be a request to the network. Content scripts can write an extension's local storage
 unless it says otherwise, so the worker restricts `chrome.storage.local` to trusted contexts at
@@ -1390,7 +1568,9 @@ last, and a side holding something newer writes it back. An item marked up carri
 `fileAt`, for its file: `path`, `downloadId` and `marked` go together to the side that marked it
 up last, whose panel has deleted the file before, so a write that crossed the swap cannot store
 the deleted path again. A file taken over this way is checked afresh, as any file this session has
-not asked about. Which window has focus decides nothing.
+not asked about. A page item's `stitched` is set once, at the capture, and never changes, so it
+needs no stamp: a panel takes it from a write only when its own copy of the item has none (one read
+from an older version's write). Which window has focus decides nothing.
 When an item leaves the sheet through a discard or a copy, its id and time go into `removed`,
 kept for ten minutes and capped at 200 entries, so a write that crossed the removal cannot bring
 the item back. An edit made after the removal, an undo included, does bring it back. A removal of
@@ -1502,7 +1682,7 @@ manual copy.
 | Permission | Why it is there |
 | :--- | :--- |
 | `host_permissions: <all_urls>` | Screenshot the tab, inject the overlay and picker, start the collector on a tab open from before (where the `content_scripts` matches cover it), and read `tab.url`. Chrome withholds the URL entirely for any origin this does not cover. |
-| `scripting` | Inject the region overlay and element picker on demand, and the collector into a tab where nothing collects and the `content_scripts` matches would have run it, or a bridge to a collector already running on a site they name |
+| `scripting` | Inject the region overlay and element picker on demand, and the collector into a tab where nothing collects and the `content_scripts` matches would have run it, or a bridge to a collector already running on a site they name. From the panel itself: hand an armed mode the keys pressed in the panel, and for Page inject `content/page-shot.js`, which scrolls the page and hides what is fixed to the window while the capture runs |
 | `downloads` | Save each PNG as it is captured, read back its absolute path, delete it again if the item is discarded or its sheet expires, and learn if it has since gone missing |
 | `storage` | Keep the report (items, descriptions, thumbnails) between panel sessions, plus the toggle settings |
 | `sidePanel` | The panel itself |
@@ -1566,8 +1746,13 @@ to file URLs" hint lives in the missing URL branch rather than in a `file://` br
 `tools/chrome-shim.js` standing in for `chrome.*`. The shim answers the real message protocol
 the way the worker and content scripts would: `cdr:arm` injects the real overlay or picker
 into the demo frame, `cdr:get-context` reaches the real collector through the real bridge,
-and `captureVisibleTab` asks the stage for a screenshot of the demo frame. Everything on
-screen is the actual code; only the platform is faked. What it does not reproduce:
+`captureVisibleTab` asks the stage for a screenshot of the demo frame, and
+`scripting.executeScript` runs the panel's own calls in the demo frame: a file from `content/` is
+added as a script, and a function is rebuilt there from its source and called with a copy of its
+arguments, its answer copied back, as Chrome serialises both. That is how Page scrolls the demo
+page, and how the keys pressed in the panel reach an armed mode there, which they did not before
+0.7.0. Everything on screen is the actual code; only the platform is faked. What it does not
+reproduce:
 
 * **The worker.** The shim answers `cdr:arm`, `cdr:disarm` and `cdr:verify` itself. It mirrors
   the ordering rule, but there is no service worker to be stopped, no keyboard command and no
@@ -1581,9 +1766,10 @@ screen is the actual code; only the platform is faked. What it does not reproduc
   earlier escapes the wrappers. The collector therefore says it started late, and the stage
   drops that flag from its answers, so the late start footnote and its prompt line never show
   there. Every script runs in the page's own JavaScript world, because
-  there is no isolated world here: the bridge, the overlay and the picker share globals and
-  prototypes with the page and with the collector. A picker that read a React fiber off a node
-  by itself would work on the stage and find nothing in Chrome.
+  there is no isolated world here: the bridge, the overlay, the picker and the page shot share
+  globals and prototypes with the page and with the collector. A picker that read a React fiber off
+  a node by itself would work on the stage and find nothing in Chrome. There is no `chrome.dom`
+  either, so the page shot walks open shadow roots only.
 * **Messages.** A broadcast from the page reaches the panel synchronously, inside the call that
   sent it, and the panel receives the very object that was sent. Chrome serialises every message
   and delivers it in a later task, so a value that does not survive serialisation, or code that
@@ -1591,7 +1777,9 @@ screen is the actual code; only the platform is faked. What it does not reproduc
   frame, URL or origin.
 * **The screenshot.** `captureVisibleTab` is the stage drawing the demo frame, not Chrome's
   compositor, so device pixel ratio, zoom and the visual viewport play no part, and no capture
-  quota applies.
+  quota applies. Without a driver's screenshots it is a grey placeholder that does not follow
+  scrolling, so a whole page on the stage is that placeholder stitched together: it shows Page's
+  flow, the scrolling, the count and the item, and not its pixels.
 * **Downloads.** They complete instantly unless `?save=<ms>` slows them, and there is no "Save as"
   dialog to take focus away. No file is written: the path is made up, and
   `conflictAction: 'uniquify'` is ignored, so two captures in the same second get the same path
@@ -1697,7 +1885,8 @@ Both capture scripts are injected repeatedly by `executeScript`, which re-runs t
 every time. They cache a controller on `window` and call `start()` again, so they must stay
 free of top level `const`, `let` and `class`: a redeclaration throws at parse time and the
 whole file fails to run. `content/stop.js`, which a disarm injects, is re-run the same way and
-keeps to the same rule.
+keeps to the same rule, and so is `content/page-shot.js`, which the panel injects for every whole
+page capture and which keeps one controller on `window` across injections.
 
 The collector wrappers must never break a host page. Every one of them preserves `this`, passes
 return values through unchanged, re-rejects rejections, and swallows its own errors. Each is made

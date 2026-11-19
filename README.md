@@ -64,7 +64,8 @@ was collected while you walked. Claude Code opens the images itself.
   order. The numbers follow.
 * **Point at what you mean.** Draw an arrow or an ellipse on a capture before you copy it. The
   marks go into the saved screenshot, and the prompt says they are yours, not the page's.
-* **Three ways to frame.** Drag a region, click an element, or grab the whole viewport.
+* **Four ways to frame.** Drag a region, click an element, grab the whole viewport, or take the
+  whole page, scrolled through and put together into one image.
   Element captures also bring the node's markup, its computed styles, the React or Vue component
   that rendered it, the handlers bound to it, and a line of search targets, so Claude Code opens
   a file instead of grepping class names.
@@ -88,8 +89,8 @@ was collected while you walked. Claude Code opens the images itself.
 
 ### 1. Frame what you noticed
 
-Drag a region, click a single element, or grab the whole viewport. Press <kbd>Esc</kbd> to
-back out. <kbd>Alt</kbd><kbd>Shift</kbd><kbd>C</kbd> opens the panel and arms the region
+Drag a region, click a single element, grab the whole viewport, or take the whole page with
+**Page** (see below). Press <kbd>Esc</kbd> to back out. <kbd>Alt</kbd><kbd>Shift</kbd><kbd>C</kbd> opens the panel and arms the region
 tool in one go. The empty frame shows the shortcut Chrome has actually bound: if another
 extension already holds those keys, it says No shortcut set, and **Set one** opens
 `chrome://extensions/shortcuts`.
@@ -105,14 +106,56 @@ Each capture lands in the frame and joins the sheet, the list just above the cop
 with a tick already in its box. The screenshot is written to `~/Downloads/claude-punch-list/`
 at that moment, so the item has a real path from the start and there is nothing left to save
 later. It is named for the time of the capture and its mode, as in
-`2026-11-16_15-19-22_region.png` (region, element or screen). The page's address is not part
-of the name, so the page toggle keeps it out of the screenshot paths too. **New item** empties
-the frame without touching the sheet, for when you would rather line up the next capture
+`2026-11-16_15-19-22_region.png` (region, element, screen or page). The page's address is not
+part of the name, so the page toggle keeps it out of the screenshot paths too. **New item**
+empties the frame without touching the sheet, for when you would rather line up the next capture
 against a blank frame than against the last one.
+
+**Whole page.** **Page**, the fourth capture button, scrolls the page from the top and takes a
+screenshot of each screen, about half a second a screen, which is as fast as Chrome lets an
+extension take screenshots (two a second). While it runs, the button reads Stop with a count of
+the screens taken, the other capture buttons and **Mark up** wait, and the line at the top of the
+panel says what is going on. The screenshots are then put together into one PNG, named like the others
+with `_page`, and the item reads PAGE. In the frame it shows at the frame's width and scrolls;
+<kbd>Tab</kbd> reaches it, and the arrow keys scroll it too. An element fixed to the top of the
+window, such as a header, shows once at the top, and one fixed to the bottom, such as a cookie
+bar, once at the bottom, as does one inside a component's or a chat widget's shadow root, open or
+closed. A sticky element shows once, in its own place. A fixed element nearly as
+tall as the window, such as a sidebar, is left as it is and repeats down the page, so it reads as
+one column. A page that scrolls inside one area rather than as a whole (an app with a scrolling
+pane under a fixed header) has that area followed, and what is beside it comes from the first
+screen. Scroll snapping is off for the run, and a page's smooth scrolling is skipped.
+
+A whole page stops at 10,000 device pixels tall: about five screens on a Retina display, or ten on
+a display at 1x. Claude reads an image at most 2,576 pixels on its long edge, so a taller one would
+reach it too small to read. A longer page is cut there at full resolution, not shrunk, and the item
+reads CUT SHORT and says how much of the page it shows; for what is further down, scroll there and
+use Screen or Region. A page that stops scrolling before its end is cut where it stopped, and says
+that instead. A page that does not scroll is filed as one screen, and says so. So is a page that
+has locked its scrolling, as an open dialog or menu does: it is not scrolled at all, and the item
+is the screen as you see it. A seam can
+be off where the page moved between two screenshots (an animation, a carousel, content that loaded
+late, a header that a script fixes once the page is scrolled), and the item says so when the page
+changed height while it was taken. A video shows a
+different frame in each screen. Pinch zoom stops it before it starts (zoom back out); browser zoom
+does not.
+
+<kbd>Esc</kbd> or Stop cancels it and files nothing, and so does scrolling, pressing a key or
+clicking on the page. Switching tabs, the tab leaving or reloading the page, the window changing
+size and arming Region with the shortcut stop it too, while it is still scrolling, and the panel
+says why. The item is filed under the page you pressed Page on, even when the page changes its
+address as it scrolls. Whichever way it
+ends, the page goes back to where it was scrolled, with every style the capture changed put back.
+If the panel closes in the middle, the page puts itself back within four seconds. The page sees
+the scrolling as if you had scrolled: lazy images load, an endless feed fetches more, and its own
+scroll handlers and analytics run. What fails of that lands in the log, under this item, since
+the item's time is that of its last screenshot. The prompt says in one sentence that the image is a
+whole page put together from screenshots taken while scrolling, so Claude Code does not take a
+header shown once, or a seam, for a defect of the page. A whole page cannot be marked up (below).
 
 **Marking up a capture.** The pen at the top left of the frame, **Mark up**, opens the capture
 in the frame as large as the panel allows, and Arrow, Ellipse, Undo, Cancel and Done take the
-place of the three capture buttons. Drag to draw: an arrow points from where you pressed to where
+place of the four capture buttons. Drag to draw: an arrow points from where you pressed to where
 you let go, and an ellipse fills the box you dragged. From the keyboard, the first arrow key or
 <kbd>Enter</kbd> on the screenshot puts a crosshair in its middle, the arrows move it (each step a
 fiftieth of the screenshot, or one pixel with <kbd>Alt</kbd>), <kbd>Enter</kbd> sets the first
@@ -141,7 +184,9 @@ Only the panel that took a capture can mark it up, while it stays open, because 
 holds the screenshot without marks, in memory. It holds those of its 10 newest captures, about
 100 MB at most. Any other item, one restored when the panel opened, one captured in another
 window, or an older one, shows Mark up dimmed, and pressing it says why. To mark such an item up,
-capture it again.
+capture it again. A whole page is never held for marking up: at its tallest, on a Retina display,
+it decodes to about 100 MB, and the markup's canvas would need as much again in the side panel. Its Mark up is
+dimmed too, and to point at part of it, capture that part with Region and mark that up.
 
 **From the keyboard.** While Region or Element is armed, the arrow keys and <kbd>Enter</kbd>
 work on the page, and pressed in the panel they go on to the page too, so there is no need to
@@ -715,7 +760,9 @@ before that does not read as a quiet page. Element payloads belong to the item t
 with and are printed under it. An item you marked up is sent with its marked copy, and the
 prompt adds a sentence to its screenshot saying the magenta marks were drawn by you to point at
 what it is about and are not part of the page, so Claude Code does not take an arrow for a
-defect.
+defect. A whole page adds one sentence too: that the image is the page put together from so many
+screenshots taken while scrolling it, how much of the page it shows in CSS pixels, that an
+element fixed to the window shows once, and that a seam can be off where the page moved.
 
 Each toggle is remembered between sessions, and so is the sheet itself: items, sentences and
 thumbnails come back when the panel reopens. A sheet nobody has touched for a week is dropped the
@@ -738,6 +785,10 @@ and any picked element's markup, component name and prop values) goes to the ext
 local storage, which only the extension's own pages can read or write, and text goes to your
 clipboard. While the panel is open it also keeps the full screenshots of its newest captures in
 its memory, so they can be marked up; they are never stored, and they go when the panel closes.
+**Page** is the one feature that makes a site do something you did not: it scrolls the real
+page, so the page loads what it loads on a scroll (lazy images, the next part of an endless
+feed) and its analytics record the scroll as if you had made it. The extension itself still
+sends nothing.
 The [privacy policy](PRIVACY.md) sets out what
 is read, where it is kept and for how long, in one page of its own.
 
@@ -953,7 +1004,7 @@ different jobs. Only one of them can be narrowed, and that one decides where the
 
 | Where | What it controls |
 | :--- | :--- |
-| `host_permissions` | Screenshotting the tab, injecting the overlay and picker, starting the collector on a tab that was open before the extension could start there, and whether Chrome reveals the tab's URL to the extension at all. **Leave it as it is.** Chrome's `tabs.captureVisibleTab` needs `<all_urls>` or `activeTab`, and `activeTab` cannot stand in (see the [architecture notes](docs/ARCHITECTURE.md#permissions)), so a narrower list stops Region, Element and Screen on every site, listed or not. |
+| `host_permissions` | Screenshotting the tab, injecting the overlay and picker, starting the collector on a tab that was open before the extension could start there, and whether Chrome reveals the tab's URL to the extension at all. **Leave it as it is.** Chrome's `tabs.captureVisibleTab` needs `<all_urls>` or `activeTab`, and `activeTab` cannot stand in (see the [architecture notes](docs/ARCHITECTURE.md#permissions)), so a narrower list stops Region, Element, Screen and Page on every site, listed or not. |
 | `content_scripts[].matches`, twice | Where the collector runs, with the small script that hands the element picker your presses before the page's own listeners, and therefore which sites get `console`, `fetch` and `XMLHttpRequest` wrapped: at every page load there, and on a tab that was already open there when the side panel starts it. |
 
 To keep the collector to the sites you work on, change the two `matches` lists, the same way,
@@ -1041,6 +1092,15 @@ to your Downloads directory.
 
 **How long an uncopied sheet is kept.** `REPORT_TTL_MS` in the same file, currently a week.
 
+**How tall a whole page goes.** `PAGE_MAX_HEIGHT` in the same file, in device pixels, currently
+10,000 (about five screens at 2x). Raise it to get more of a long page into one image, at the
+cost of Claude reading it smaller, since it scales any image down to 2,576 pixels on the long
+edge; lower it for text Claude can still read. Two other limits sit beside it and may stop a run
+first: `PAGE_MAX_AREA`, 2^26 pixels in all (about 26,000 rows at 2,560 wide), which keeps the
+canvas well inside what Chrome can encode, and `PAGE_MAX_SCREENS`, 100 screenshots. Taller
+images also take more of the side panel's memory while they are put together (four bytes a
+pixel), and longer to take, at half a second a screen.
+
 **How much history the collector keeps.** `LIMIT` in
 [`content/collector-main.js`](content/collector-main.js), currently the newest 30 entries of
 each kind: console errors, warnings, uncaught errors and failed loads, and failed requests.
@@ -1055,7 +1115,8 @@ For work on the panel there is a faster loop. Serve the repository and open
 `http://localhost:8000/tools/panel-stage.html`: that is the panel running as an ordinary web
 page beside the demo page, with `chrome.*` stood in for by `tools/chrome-shim.js`. Capture
 modes, the collector, the prompt and persistence all work, and reloading the page is the whole
-cycle. The stage loads the broken checkout page by default. Add `?demo=demo-react.html` or
+cycle. Page scrolls the demo page there too, but the stage's placeholder screenshot does not
+follow the scrolling, so it shows the flow rather than a real stitched page. The stage loads the broken checkout page by default. Add `?demo=demo-react.html` or
 `?demo=demo-vue.html` to load a small React or Vue fixture instead, which is how to see the
 component lines without pointing the extension at a real application. It is also where the
 images in this README come from, so they can be regenerated rather than redrawn:

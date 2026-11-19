@@ -610,6 +610,30 @@ EXTRA['long-selector'] = () => {
   return report;
 };
 
+// The checkout as a whole page, taken with Page: one PNG put together from
+// four screens of the 1280 x 720 view at 2x (the 15 px scrollbar cut away),
+// named for the mode, with no element. The prompt says how it was made.
+EXTRA['full-page'] = () => {
+  const report = sampleReport('bug');
+  const [item] = report.items;
+  item.screenshotPath = item.screenshotPath.replace(/_localhost-checkout\.png$/, '_page.png');
+  item.element = null;
+  item.stitched = { screens: 4, cssWidth: 1265, cssHeight: 2840 };
+  return report;
+};
+
+// The walkthrough with the bug taken as a whole page between two regions, on
+// a page longer than a capture covers: it stopped at 10 000 device pixels,
+// the first 5000 CSS pixels at 2x.
+EXTRA['full-page-list'] = () => {
+  const report = sampleReport('mixed');
+  report.items[0].element = null;
+  const page = report.items[1];
+  page.screenshotPath = page.screenshotPath.replace(/_localhost-checkout\.png$/, '_page.png');
+  page.stitched = { screens: 7, cssWidth: 1265, cssHeight: 5000, cut: true };
+  return report;
+};
+
 // Printing is for `npm run prompt`. Importing this file, as the tests do, only
 // hands over the samples. Compared as real paths, because import.meta.url has
 // symlinks resolved and argv does not.

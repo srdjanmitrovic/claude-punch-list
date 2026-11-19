@@ -13,6 +13,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { defaultWorker, loadPanel, makeDataTransfer } from './support/panel-realm.mjs';
+import { lastFiled, panelAndPage } from './support/page-realm.mjs';
 
 const TAB = 7;
 const fromTab = { tab: { id: TAB } };
@@ -1828,7 +1829,7 @@ test('markup: the canvas takes the image\'s place and the tools the capture butt
   assert.equal(panel.element('preview').classList.contains('marking'), true);
   assert.equal(panel.element('marks').hidden, false);
   assert.equal(panel.element('modes').hidden, true, 'the capture buttons stayed in view');
-  for (const id of ['mode-region', 'mode-element', 'mode-visible']) {
+  for (const id of ['mode-region', 'mode-element', 'mode-visible', 'mode-page']) {
     assert.equal(panel.element(id).disabled, true, `${id} could be pressed while marking`);
   }
   // A tab event while marking leaves them off.
@@ -2213,4 +2214,146 @@ test('markup: a capture that cannot be decoded says so and opens nothing', async
   assert.equal(panel.internals.state.markup, null);
   assert.equal(panel.banner(), "Item 1's screenshot could not be opened to mark it up.");
   assert.equal(panel.element('mark-up').disabled, false);
+});
+
+// ------------------------------------------------------------- full page --
+
+const PAGE_PROGRESS = 'Capturing the whole page by scrolling it. Press Esc or Stop to cancel.';
+const SLOW_PHOTO = { id: 'photo', tag: 'img', rect: { x: 0, y: 900, width: 600, height: 200 }, complete: false };
+
+test('page: Page is the fourth mode button, in a row of four, with its count in its icon\'s place', () => {
+  const modes = HTML.slice(HTML.indexOf('id="modes"'), HTML.indexOf('id="marks"'));
+  const at = (id) => modes.indexOf(`id="${id}"`);
+  assert.ok(at('mode-region') < at('mode-element') && at('mode-element') < at('mode-visible'));
+  assert.ok(at('mode-visible') < at('mode-page'), 'Page is not after Screen');
+  assert.match(
+    modes,
+    /<button class="mode" id="mode-page" type="button" aria-pressed="false"> <svg[^>]*aria-hidden="true">.*?<\/svg> <span class="counter" id="mode-page-count" hidden><\/span> <span id="mode-page-label">Page<\/span> <\/button>/
+  );
+  assert.doesNotMatch(modes, /aria-live/, 'the count would be read out every half second');
+  assert.match(CSS, /\.modes \{[^}]*grid-template-columns: repeat\(4, 1fr\)/);
+  assert.match(CSS, /#mode-page\.armed svg \{\s*display: none;/);
+  assert.match(CSS, /\.frame\.tall \.frame-scroll \{[^}]*max-height: 260px;[^}]*overflow-y: auto;/);
+  assert.match(CSS, /\.frame\.tall img \{\s*max-height: none;/);
+  assert.match(HTML, /grab the screen or the whole page\./);
+  // The buttons and the readout stay on the frame, outside what scrolls.
+  const scroller = HTML.slice(HTML.indexOf('id="preview-scroll"'), HTML.indexOf('id="mark-up"'));
+  assert.ok(scroller.includes('id="preview-img"') && scroller.includes('id="markup-canvas"'));
+  assert.ok(scroller.indexOf('</div>') > scroller.indexOf('id="markup-canvas"'), 'the canvas is outside the scroller');
+});
+
+test('page: while it runs, Page is lit and reads Stop with a count, the other modes and Mark up wait, and all comes back after', async () => {
+  const { panel } = await panelAndPage({ page: { height: 2158, elements: [SLOW_PHOTO] } });
+  await captureRegion(panel);
+  const button = panel.element('mode-page');
+  assert.equal(panel.element('mark-up').disabled, false);
+  panel.click('mode-page');
+  await panel.clock.advance(300);
+  assert.equal(button.classList.contains('armed'), true, 'not lit, so no marching ants');
+  assert.equal(button.getAttribute('aria-pressed'), 'true');
+  assert.equal(button.getAttribute('aria-label'), 'Stop the page capture');
+  assert.equal(panel.element('mode-page-label').textContent, 'Stop');
+  assert.equal(panel.element('mode-page-count').hidden, false);
+  assert.equal(panel.element('mode-page-count').textContent, '1/3');
+  assert.equal(button.disabled, false, 'Stop cannot be pressed');
+  for (const id of ['mode-region', 'mode-element', 'mode-visible']) {
+    assert.equal(panel.element(id).disabled, true, `${id} could be pressed during a page shot`);
+  }
+  assert.equal(panel.element('mark-up').disabled, true, 'Mark up during a page shot');
+  assert.equal(panel.banner(), PAGE_PROGRESS);
+  assert.equal(panel.element('banner-live').getAttribute('aria-live'), 'polite');
+  await panel.clock.advance(1000);
+  assert.equal(panel.element('mode-page-count').textContent, '2/3');
+  assert.equal(panel.banner(), PAGE_PROGRESS, 'the banner was said again');
+
+  await panel.clock.advance(8000);
+  assert.equal(lastFiled(panel).item.mode, 'page');
+  assert.equal(button.classList.contains('armed'), false);
+  assert.equal(button.getAttribute('aria-pressed'), 'false');
+  assert.equal(button.getAttribute('aria-label'), null);
+  assert.equal(panel.element('mode-page-label').textContent, 'Page');
+  assert.equal(panel.element('mode-page-count').hidden, true);
+  for (const id of ['mode-region', 'mode-element', 'mode-visible', 'mode-page']) {
+    assert.equal(panel.element(id).disabled, false, `${id} stayed off`);
+  }
+});
+
+test('page: the frame scrolls a page item, as a Tab stop with a label, and no other item', async () => {
+  const { panel } = await panelAndPage({ page: { height: 2000 } });
+  const wrapper = panel.element('preview-scroll');
+  assert.equal(wrapper.hidden, true, 'an empty frame holds a scroller');
+  panel.click('mode-page');
+  await panel.clock.advance(8000);
+  assert.equal(panel.element('preview').classList.contains('tall'), true);
+  assert.equal(wrapper.hidden, false);
+  assert.equal(wrapper.getAttribute('tabindex'), '0');
+  assert.equal(wrapper.getAttribute('aria-label'), 'Whole page screenshot. Scroll to see all of it.');
+  assert.equal(panel.element('preview-meta').textContent, 'PAGE · PNG 1280×2000');
+  assert.equal(row(panel, 0).node.children[1].children[1].children[0].textContent, '1 · PAGE');
+
+  await captureRegion(panel);
+  assert.equal(panel.element('preview').classList.contains('tall'), false);
+  assert.equal(wrapper.getAttribute('tabindex'), null);
+  assert.equal(wrapper.getAttribute('aria-label'), null);
+});
+
+test('page: Page is off on a page the panel may not capture', async () => {
+  const panel = await started({
+    worker: (message) =>
+      message.type === 'cdr:check-tab'
+        ? { ok: true, restriction: 'Chrome does not let extensions capture this page.', armedMode: null }
+        : defaultWorker(message),
+  });
+  assert.equal(panel.element('mode-page').disabled, true);
+  panel.click('mode-page');
+  await panel.flush();
+  assert.equal(panel.internals.state.pageShot, null);
+});
+
+test('page: Mark up is not offered on a page item, and says why', async () => {
+  const { panel } = await panelAndPage({ page: { height: 2000 } });
+  panel.click('mode-page');
+  await panel.clock.advance(8000);
+  const button = panel.element('mark-up');
+  assert.equal(button.hidden, false);
+  assert.equal(button.getAttribute('aria-disabled'), 'true');
+  assert.equal(lastFiled(panel).item.full, undefined, 'the page was held for marking up');
+  assert.equal(panel.internals.state.fulls.length, 0);
+  button.dispatch('click', { detail: 1 });
+  await panel.flush();
+  assert.equal(panel.internals.state.markup, null);
+  assert.equal(
+    panel.banner(),
+    'Item 1 cannot be marked up: a whole page screenshot is too large to mark up in the panel. Capture the part you mean with Region to mark it up.'
+  );
+});
+
+test('page: Esc closes the row tooltip before it stops a page shot, and an arm is not reached', async () => {
+  const { panel } = await panelAndPage({ page: { height: 4000, elements: [SLOW_PHOTO] } });
+  await captureRegion(panel);
+  const { pick, body } = row(panel, 0);
+  body.scrollHeight = 60;
+  body.clientHeight = 34;
+  panel.click('mode-page');
+  await panel.clock.advance(300);
+  pick.dispatch('mouseenter');
+  assert.equal(panel.element('thumb-tip').hidden, false);
+  panel.key('Escape');
+  assert.equal(panel.element('thumb-tip').hidden, true);
+  assert.equal(panel.internals.state.pageShot?.cancelled, false, 'the first Esc stopped the page shot');
+  panel.key('Escape');
+  assert.equal(panel.internals.state.pageShot?.cancelled, true);
+  await panel.clock.advance(3000);
+  assert.equal(panel.internals.state.items.length, 1, 'a stopped page shot filed something');
+});
+
+test('page: a page shot does not start over an open markup, and Page is off until it closes', async () => {
+  const { panel, calls } = await panelAndPage({ page: { height: 2000 } });
+  await captureRegion(panel);
+  await markUp(panel);
+  assert.equal(panel.element('mode-page').disabled, true);
+  await panel.internals.capturePage();
+  assert.deepEqual(calls, [], 'the page was scrolled under the markup');
+  panel.click('mark-cancel');
+  assert.equal(panel.element('mode-page').disabled, false);
 });
