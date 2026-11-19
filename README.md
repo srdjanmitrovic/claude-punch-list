@@ -775,7 +775,8 @@ copy, and the item keeps the screenshot it had; the marks are lost with the pane
 Each window has its own panel, and they all show one sheet. Changes made in two windows at the
 same moment are merged item by item: the newer sentence, tick and intent are kept, and a discard
 or a copy in one window takes the item off every sheet. The toggles and the intent follow from
-window to window.
+window to window. This holds when the computer's clock is set back while panels are open: a
+change made afterwards still reaches every window.
 
 ## Privacy
 

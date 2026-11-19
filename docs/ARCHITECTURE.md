@@ -1551,11 +1551,13 @@ an older or a newer build wrote it, or something else did. It is validated befor
 and `readReport`): known fields only, ids of at most 100 characters and no two alike, at most 500
 items and 50 000 characters per description, paths without control characters or line breaks
 (the prompt prints each on a line of its own), an unknown mode shown as `other`, element data only
-for element items, stamps capped at the current time, a rank only as a finite number no further
-than 2^52 from zero (past 2^53 adding one changes nothing, and a capture could no longer land
-after it), `marked` only as `true`, `stitched` only on a page item and only as whole numbers above
-0 (at most 100 screens and 100,000 CSS pixels a side, `cut` only as `true`), since the prompt
-prints them as facts, and thumbnails only as base64 WebP, PNG or JPEG data URLs,
+for element items, stamps (`editedAt`, `wordsAt`, `fileAt` and each removal's time) only as far as
+two days ahead of the clock, a stamp further ahead read as none and a removal so stamped dropped
+(see Merging, below), a rank only as a finite number no further than 2^52 from zero (past 2^53
+adding one changes nothing, and a capture could no longer land after it), `marked` only as
+`true`, `stitched` only on a page item and only as whole numbers above 0 (at most 100 screens and
+100,000 CSS pixels a side, `cut` only as `true`), since the prompt prints them as facts, and
+thumbnails only as base64 WebP, PNG or JPEG data URLs,
 since anything else in an
 `img` would be a request to the network. Content scripts can write an extension's local storage
 unless it says otherwise, so the worker restricts `chrome.storage.local` to trusted contexts at
@@ -1577,6 +1579,28 @@ the item back. An edit made after the removal, an undo included, does bring it b
 the whole report (another panel's weekly expiry) is ignored by a panel that is still showing it.
 A change that keeps the sheet's shape updates rows in place, with no storage read, list rebuild
 or page read.
+
+The stamps come from the clock, and a change is stamped after the last change or removal of the
+item this panel knows of (`touch`, `leftAt`), so a change made after the clock was set back still
+counts as the newest, and a discard or a copy as coming after the item's last change. Something
+other than a panel can write a stamp into storage, and one far ahead would outrank every later
+change (from 2^53 on, adding one changes nothing, so for good). So a stamp more than two days
+ahead of the clock (`STAMP_AHEAD_MS`) is not believed: it counts as none, and a removal so stamped
+is dropped. The rule holds on both sides of a merge, for what storage holds and for the panel's
+own copy (`forgetFarSheet`), and a side writes back only what is newer by it. No write carries
+such a stamp, and a panel that reads one, on opening too, writes the sheet back at once, so every
+open panel forgets it at the same write. Forgotten by one panel only, it would live on in storage
+and in the panels that had not merged since, and count again once the clock came back within two
+days of it, over the changes made since in the window that forgot it. 0.6.1 capped what it
+read at the clock and kept its own stamps as they were, so once the clock went back each of two
+open panels found its own copy newer than the one it read and wrote it to the other, until the
+clock caught up, and a change made after the set back was lost to the other windows. Within two
+days every stamp keeps its worth and every change crosses. Past that, the stamps from before the
+set back count as none in every window: the next change to an item wins, and a removal from
+before is forgotten, so a write that crossed it as the clock went back brings the item back. A
+stamp counts as none rather than capped at two days ahead: capped, it would be worth the moment
+each panel came to it, and the panel that came last would put its copy back over a change made
+in between.
 
 The marked copy has two cross window races of the same shape as two writes crossing, and neither
 is closed. Whether an item's marked copy is still saving is not stored, so another window does not

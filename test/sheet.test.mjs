@@ -43,6 +43,9 @@ function sharedStorage() {
     data,
     reads: 0,
     writes: 0,
+    // Writes past this count are stored but heard by no panel, so a test of a
+    // write loop ends, and has the count to show for it.
+    heardUpTo: Infinity,
     hold() {
       held = [];
     },
@@ -89,7 +92,7 @@ function sharedStorage() {
     },
   };
   function notify(changes) {
-    if (!Object.keys(changes).length) return;
+    if (!Object.keys(changes).length || store.writes > store.heardUpTo) return;
     if (held) held.push(changes);
     else setImmediate(() => deliver(changes));
   }
@@ -598,8 +601,8 @@ test('sheet: stored values that are not what this build writes are not taken on'
   }
   assert.equal(a.R('readItem')(storedItem('moved', { rank: 1_799_999_000_000.5 })).rank, 1_799_999_000_000.5);
   // Marking up (0.7.0): marks claimed only as true, and a file stamp only as
-  // a moment not yet to come, which would outrank every later file the item
-  // is given.
+  // a moment no further ahead than a clock set back leaves one (below), which
+  // would outrank every later file the item is given.
   for (const marked of ['yes', 1, 'true', {}, null, false]) {
     assert.equal(a.R('readItem')(storedItem('odd', { marked })).marked, undefined, String(marked));
   }
@@ -608,8 +611,27 @@ test('sheet: stored values that are not what this build writes are not taken on'
     assert.equal(a.R('readItem')(storedItem('odd', { fileAt })).fileAt, undefined, String(fileAt));
   }
   const now = a.R('Date').now();
-  assert.equal(a.R('readItem')(storedItem('ahead', { fileAt: now + DAY })).fileAt, now);
   assert.equal(a.R('readItem')(storedItem('stamped', { fileAt: now - 5 })).fileAt, now - 5);
+  // Every stamp is believed up to two days ahead of the clock, where a clock
+  // set back by a day leaves those made before it, and edits go on from them.
+  // Further ahead it is read as none: something else wrote it, and as it is
+  // it would outrank every later change. 0.6.1 read them all as now, and two
+  // open panels then wrote the sheet to each other (see "a clock set back").
+  for (const field of ['editedAt', 'wordsAt', 'fileAt']) {
+    const none = field === 'fileAt' ? undefined : 0;
+    const read = (at) => a.R('readItem')(storedItem('ahead', { [field]: at }))[field];
+    assert.equal(read(now + DAY), now + DAY, `${field} a day ahead`);
+    assert.equal(read(now + 2 * DAY), now + 2 * DAY, `${field} two days ahead`);
+    assert.equal(read(now + 2 * DAY + 1), none, `${field} past two days ahead`);
+    assert.equal(read(now + 365 * DAY), none, `${field} a year ahead`);
+  }
+  const removals = a.R('readReport')({
+    removed: [
+      { id: 'a-day-ahead', at: now + DAY },
+      { id: 'a-year-ahead', at: now + 365 * DAY },
+    ],
+  }).removed;
+  assert.deepEqual(Array.from(removals, (entry) => Array.from(entry)), [['a-day-ahead', now + DAY]]);
   // Full page (0.7.0): how a page was put together, only on a page item and
   // only as whole numbers in range, since the prompt prints them as facts.
   const page = (stitched) => a.R('readItem')(storedItem('page', { mode: 'page', stitched })).stitched;
@@ -1994,24 +2016,27 @@ test('sheet: a capture at or below a place on the sheet still lands last, in eve
   assert.deepEqual(sentences(reopened), order);
 });
 
-// One panel, and a reopen once the capture is stored, rather than a second
-// window open throughout: with the clock set back, two open panels that both
-// hold an item stamped after the new time write the sheet back and forth
-// until the clock passes the stamp, whatever the order (0.6.1 does it on a
-// tick). A reopened panel adopts a write as another window does.
-test('sheet: a capture after the clock was set back still lands last, also after a reopen', async () => {
-  const { storage, downloads, time, panels: [a] } = await world();
+// With a second window open throughout, which 0.6.1 could not ride out: two
+// open panels that both held an item stamped after the new time wrote the
+// sheet back and forth until the clock passed the stamp (see "a clock set
+// back" below). A reopened panel adopts a write as another window does.
+test('sheet: a capture after the clock was set back still lands last, in the other window and after a reopen', async () => {
+  const found = await world({ panels: 2 });
+  const { storage, downloads, time, panels: [a, b] } = found;
   await captures(a, time);
   time.now += 1;
   moveKey(a, 0, 'ArrowDown');
   time.now += 1;
   moveKey(a, 1, 'ArrowDown');
   assert.deepEqual(sentences(a), ['two', 'three', 'one']);
-  time.now -= 60 * 60 * 1000;
+  await settle(a, b);
+  const before = setBack(found, 60 * 60 * 1000);
   await captures(a, time, ['four']);
-  await settle(a);
+  await settle(a, b);
   const order = ['two', 'three', 'one', 'four'];
   assert.deepEqual(sentences(a), order);
+  assert.deepEqual(sentences(b), order, 'the other window put the capture first, by its time');
+  assert.equal(storage.writes - before, 2, 'the capture and its words were written back');
   const reopened = await openPanel({ storage, downloads, time });
   assert.deepEqual(sentences(reopened), order, 'the reopened panel put the capture first, by its time');
 });
@@ -2031,9 +2056,7 @@ test('sheet: moves into a gap a millisecond wide run out of halves, and the orde
     type(a, word);
   }
   // The last row moved up into the gap after the first, two places at a
-  // time, sixty times. A millisecond apart, as keys pressed by a person are:
-  // a stamp ahead of the clock is read as now (readItem), so a second change
-  // to one item within one millisecond would not reach the other window.
+  // time, sixty times, a millisecond apart, as keys pressed by a person are.
   const expected = [...words];
   const up = (index) => expected.splice(index - 1, 0, expected.splice(index, 1)[0]);
   for (let i = 0; i < 60; i += 1) {
@@ -2656,4 +2679,407 @@ test('sheet: an item whose file went missing is whole again once marked up, and 
   assert.equal(a.banner(), null, 'the banner about the missing file stayed');
   assert.equal(a.element('item-missing').hidden, true);
   assert.equal(a.element('submit').disabled, false);
+});
+
+// ------------------------------------------------------- a clock set back
+
+// 0.6.1 read every stamp in storage capped at the clock, and kept its own as
+// they were. With the clock set back and two panels open, each then found its
+// own copy of an item newer than the one it read, and wrote it back to the
+// other, until the clock passed the newest stamp: the reorder package's
+// builder counted 2418 writes before stopping one. A change made after the
+// set back was read as now, and lost to the copy in every other window.
+
+const HOUR = 60 * 60 * 1000;
+
+/**
+ * Set the clock back, as the system clock can be with the panels open. From
+ * here no panel hears a write past the next forty, so a write loop ends, and
+ * its count shows. Returns the count of writes so far.
+ */
+function setBack({ storage, time }, ms) {
+  time.now -= ms;
+  storage.heardUpTo = storage.writes + 40;
+  return storage.writes;
+}
+
+// Two days is as far ahead as a stamp is believed. Past that the stamps made
+// before the set back count as none on both sides, and an edit made now is
+// the newest there is.
+for (const [name, back] of [['an hour', HOUR], ['two days', 2 * DAY], ['a week', 7 * DAY], ['a year', 365 * DAY]]) {
+  test(`sheet: with the clock set back ${name}, two open panels write once for a capture, and edits still cross`, async () => {
+    const found = await world({ panels: 2 });
+    const { storage, time, panels: [a, b] } = found;
+    // The reorder package's probe: words, a tick taken back, and a capture in
+    // the other window once the clock has gone back.
+    await capture(a);
+    type(a, 'one');
+    time.now += 1000;
+    tickRow(a, 0, false);
+    time.now += 1;
+    tickRow(a, 0, true);
+    await settle(a, b);
+    const before = setBack(found, back);
+    await capture(b);
+    for (let round = 0; round < 10; round += 1) await settle(a, b);
+    assert.equal(storage.writes - before, 1, 'the panels wrote the sheet to each other');
+    assert.deepEqual(ids(a), ids(b));
+    assert.deepEqual(sentences(a), ['one', '']);
+
+    time.now += 1000;
+    tickRow(a, 0, false);
+    await settle(a, b);
+    assert.equal(items(b)[0].included, false, 'a tick did not reach the other window');
+    time.now += 1000;
+    pickRow(b, 0);
+    type(b, 'one, from B');
+    for (let round = 0; round < 3; round += 1) await settle(a, b);
+    assert.deepEqual(sentences(a), ['one, from B', ''], 'words did not reach the other window');
+    assert.equal(items(a)[0].included, false);
+    assert.deepEqual(storedSentences(storage), ['one, from B', '']);
+    assert.equal(storage.writes - before, 3, 'a change was written back');
+  });
+}
+
+// Each change is made before the window has heard any write since the clock
+// went back. Past two days its stamps from before count as none from here,
+// so the change is stamped from the clock, not after them, or no other window
+// would believe it either.
+for (const [name, back] of [['an hour', HOUR], ['a week', 7 * DAY]]) {
+  test(`sheet: a tick, an intent, words and a move made after the clock was set back ${name} reach the other window`, async () => {
+    const found = await world({ panels: 2 });
+    const { storage, time, panels: [a, b] } = found;
+    await captures(a, time);
+    await settle(a, b);
+    const before = setBack(found, back);
+    time.now += 1000;
+    tickRow(a, 0, false);
+    await settle(a, b);
+    assert.equal(items(b)[0].included, false, 'the tick');
+    time.now += 1000;
+    a.click('intent-change'); // of 'three', the item in the frame
+    await settle(a, b);
+    assert.deepEqual(items(b).map((item) => item.intent), ['bug', 'bug', 'change'], 'the intent');
+    time.now += 1000;
+    type(a, 'three, later');
+    await settle(a, b);
+    assert.deepEqual(sentences(b), ['one', 'two', 'three, later'], 'the words');
+    time.now += 1000;
+    moveKey(a, 2, 'ArrowUp');
+    await settle(a, b);
+    assert.deepEqual(sentences(b), ['one', 'three, later', 'two'], 'the move');
+    // And from the other window back.
+    time.now += 1000;
+    tickRow(b, 0, true);
+    for (let round = 0; round < 3; round += 1) await settle(a, b);
+    assert.equal(items(a)[0].included, true, 'a tick from the other window');
+    assert.deepEqual(storedSentences(storage), ['one', 'three, later', 'two']);
+    assert.equal(storedItems(storage)[0].included, true);
+    // One write a change, and one more for the intent the next item starts as.
+    assert.equal(storage.writes - before, 6, 'a change was written back');
+  });
+
+  test(`sheet: a marked copy saved after the clock was set back ${name} reaches the other window`, async () => {
+    const found = await world({ panels: 2 });
+    const { storage, time, panels: [a, b] } = found;
+    await capture(a);
+    await settle(a, b);
+    time.now += 1000;
+    await markAndSave(a);
+    await settle(a, b);
+    assert.equal(items(b)[0].marked, true);
+    setBack(found, back);
+    time.now += 1000;
+    // Marked up again with the mark taken back: the clean capture again, under
+    // its own name.
+    a.click('mark-up');
+    await a.flush();
+    a.click('mark-undo');
+    a.click('mark-done');
+    for (let round = 0; round < 3; round += 1) await settle(a, b);
+    const [mine] = items(a);
+    const [theirs] = items(b);
+    assert.doesNotMatch(mine.path, /_marked/);
+    assert.equal(theirs.path, mine.path, 'the other window kept naming the marked copy, deleted since');
+    assert.equal(theirs.downloadId, 3);
+    assert.equal(theirs.marked, undefined);
+    assert.equal(theirs.fileAt, mine.fileAt);
+    assert.equal(storedItems(storage)[0].path, mine.path, 'the deleted marked copy was written back');
+  });
+
+  test(`sheet: a discard, its undo and a copy made after the clock was set back ${name} reach the other window`, async () => {
+    const found = await world({ panels: 2 });
+    const { storage, time, panels: [a, b] } = found;
+    await captures(a, time, ['one', 'two']);
+    await settle(a, b);
+    setBack(found, back);
+    time.now += 1000;
+    pickRow(a, 0);
+    a.click('preview-clear');
+    for (let round = 0; round < 3; round += 1) await settle(a, b);
+    // Stamped now, the removal came before the item's last change, and the
+    // other window kept the item and wrote it back.
+    assert.deepEqual(sentences(b), ['two'], 'the other window kept the discarded item');
+    assert.deepEqual(sentences(a), ['two'], 'the discarded item came back');
+    assert.deepEqual(storedSentences(storage), ['two']);
+    time.now += 1000;
+    a.element('undo').children[1].dispatch('click');
+    for (let round = 0; round < 3; round += 1) await settle(a, b);
+    assert.deepEqual(sentences(b), ['one', 'two'], 'the undo');
+    time.now += 1000;
+    b.click('submit');
+    await b.clock.advance(500);
+    for (let round = 0; round < 3; round += 1) await settle(a, b);
+    assert.deepEqual(sentences(b), [], 'the copy');
+    assert.deepEqual(sentences(a), [], 'the copied items stayed in the other window');
+    assert.deepEqual(storedItems(storage), []);
+  });
+}
+
+/** Both windows and storage show the same sheet: its words and its ticks. */
+function assertOneSheet(storage, a, b) {
+  const sheet = (list) => list.map((item) => [item.description, item.included]);
+  assert.deepEqual(sheet(items(b)), sheet(items(a)), 'the two windows show different sheets');
+  assert.deepEqual(sheet(storedItems(storage)), sheet(items(a)), 'storage holds another sheet');
+}
+
+// Writes that cross as the clock goes back past two days: on one side a
+// stamp from before, too far ahead now, which the other side already reads
+// as none. Each side has to drop it too, or one keeps a removal the other
+// cannot see and they write the sheet to each other again. The discard is
+// lost: neither side can tell any more whether it came after the item's last
+// change.
+test('sheet: a discard that crosses a tick as the clock goes back past two days ends in one sheet, with no loop', async () => {
+  const found = await world({ panels: 2 });
+  const { storage, time, panels: [a, b] } = found;
+  await captures(a, time, ['one', 'two']);
+  await settle(a, b);
+  storage.hold();
+  time.now += 1000;
+  pickRow(a, 0);
+  a.click('preview-clear');
+  const before = setBack(found, 7 * DAY) - 1;
+  tickRow(b, 1, false);
+  storage.release();
+  for (let round = 0; round < 10; round += 1) await settle(a, b);
+  assertOneSheet(storage, a, b);
+  assert.deepEqual(sentences(a), ['one', 'two']);
+  assert.equal(items(a)[1].included, false);
+  assert.equal(storage.writes - before, 3, 'the panels wrote the sheet to each other');
+});
+
+// The undo is stamped from the clock, not after the removal from before the
+// set back, or the item it brings back would count as unchanged in the other
+// window, which keeps its own copy, ticked otherwise.
+test('sheet: an undo after the clock went back past two days, crossing a tick, ends in one sheet', async () => {
+  const found = await world({ panels: 2 });
+  const { storage, time, panels: [a, b] } = found;
+  await captures(a, time, ['one', 'two']);
+  await settle(a, b);
+  storage.hold();
+  time.now += 1000;
+  pickRow(a, 0);
+  a.click('preview-clear');
+  time.now += 1000;
+  tickRow(b, 0, false);
+  const before = setBack(found, 7 * DAY) - 2;
+  a.element('undo').children[1].dispatch('click');
+  storage.release();
+  for (let round = 0; round < 10; round += 1) await settle(a, b);
+  assertOneSheet(storage, a, b);
+  assert.deepEqual(sentences(a), ['one', 'two']);
+  assert.equal(items(a)[0].included, true, 'the undo did not bring the item back as it was');
+  assert.ok(storage.writes - before <= 6, `${storage.writes - before} writes`);
+});
+
+// A window opened since reads the stamps from before as none, and one open
+// since before drops its own the same way. Had it only compared them capped,
+// keeping them, their worth would rise with the clock, and the old window
+// would put its copy back over every change the new one made.
+test('sheet: a window opened after the clock went back past two days changes an item from before, and keeps the change', async () => {
+  const found = await world();
+  const { storage, downloads, time, panels: [a] } = found;
+  await capture(a);
+  type(a, 'one');
+  await settle(a);
+  setBack(found, 7 * DAY);
+  const b = await openPanel({ storage, downloads, time, tab: { id: 9, windowId: 2, url: 'https://example.test/', title: 'Example' } });
+  const before = storage.writes;
+  time.now += 1000;
+  tickRow(b, 0, false);
+  for (let round = 0; round < 10; round += 1) await settle(a, b);
+  assertOneSheet(storage, a, b);
+  assert.equal(items(b)[0].included, false, 'the old window put its tick back');
+  assert.equal(storage.writes - before, 1, 'the old window wrote its copy back');
+});
+
+// Each panel used to forget a stamp from before the set back for itself
+// alone, at a merge, and write nothing. Storage, and every panel that had not
+// merged since, kept it, and once the clock came back within two days of it,
+// it counted again, over every change made since in the window that had
+// forgotten it. Now no write carries such a stamp, and a panel that reads one
+// writes the sheet back, so every open panel forgets it at the same write.
+for (const [name, back] of [['three days', 3 * DAY], ['a week', 7 * DAY]]) {
+  test(`sheet: once the clock is back within two days of the stamps from before a set back of ${name}, a tick and words still cross`, async () => {
+    const found = await world({ panels: 2 });
+    const { storage, time, panels: [a, b] } = found;
+    await captures(a, time, ['one', 'two']);
+    await settle(a, b);
+    const before = setBack(found, back);
+    // The other window writes first, and this one only hears of it.
+    time.now += 1000;
+    tickRow(b, 1, false);
+    for (let round = 0; round < 3; round += 1) await settle(a, b);
+    // From here the stamps of 'one' from before would count again.
+    time.now += back - 2 * DAY + HOUR;
+    tickRow(a, 0, false);
+    for (let round = 0; round < 3; round += 1) await settle(a, b);
+    assert.equal(items(a)[0].included, false, 'the tick was undone');
+    assert.equal(items(b)[0].included, false, 'the tick did not reach the other window');
+    time.now += 1000;
+    pickRow(a, 0);
+    type(a, 'one, later');
+    for (let round = 0; round < 3; round += 1) await settle(a, b);
+    assert.equal(a.element('description').value, 'one, later', 'the old words were put back in the field');
+    assert.deepEqual(sentences(b), ['one, later', 'two'], 'the words did not reach the other window');
+    assertOneSheet(storage, a, b);
+    assert.equal(storage.writes - before, 3, 'a change was written back');
+  });
+}
+
+// A window opened after the set back reads the stamps from before as none,
+// and writes the sheet back at once, so the window open since before forgets
+// them too, while they are still too far ahead to count.
+test('sheet: a window opened after a set back of three days keeps its tick once the stamps from before would count again', async () => {
+  const found = await world();
+  const { storage, downloads, time, panels: [a] } = found;
+  await captures(a, time, ['one']);
+  await settle(a);
+  const before = setBack(found, 3 * DAY);
+  const c = await openPanel({ storage, downloads, time, tab: { id: 9, windowId: 2, url: 'https://example.test/', title: 'Example' } });
+  for (let round = 0; round < 3; round += 1) await settle(a, c);
+  assert.equal(storage.writes - before, 1, 'the new window did not write back the stamps it read as none');
+  time.now += DAY + HOUR;
+  tickRow(c, 0, false);
+  for (let round = 0; round < 3; round += 1) await settle(a, c);
+  assert.equal(items(c)[0].included, false, 'the old window put its tick back');
+  assertOneSheet(storage, a, c);
+  assert.equal(storage.writes - before, 2, 'the old window wrote its copy back');
+});
+
+// A file stamp believed again would be newer than the panel's forgotten one,
+// and take the item's marks with it: Mark up would open on the clean capture.
+test('sheet: a marked item keeps its marks once the clock is back within two days of its file stamp', async () => {
+  const found = await world({ panels: 2 });
+  const { storage, time, panels: [a, b] } = found;
+  await captures(a, time, ['one', 'two']);
+  await settle(a, b);
+  time.now += 1000;
+  await markAndSave(a); // 'two', the item in the frame
+  await settle(a, b);
+  const marked = () => items(a).find((item) => item.description === 'two');
+  const { path } = marked();
+  setBack(found, 2.5 * DAY);
+  time.now += 1000;
+  tickRow(b, 0, false);
+  for (let round = 0; round < 3; round += 1) await settle(a, b);
+  time.now += 0.5 * DAY + HOUR;
+  tickRow(b, 0, true);
+  for (let round = 0; round < 3; round += 1) await settle(a, b);
+  assert.ok(marked().marks, 'the marks remembered for the item were dropped');
+  assert.equal(marked().path, path);
+  assert.equal(items(b)[1].path, path);
+  assert.equal(storedItems(storage)[1].path, path);
+});
+
+// The cap 0.6.1 put on stamps stays, a step further out: a stamp something
+// else wrote, far ahead, would otherwise outrank every later change. Here it
+// counts as none: the panels keep their own copy, the new item it brought is
+// as old as can be, and changes made later win, the clock set back or not.
+test('sheet: a stamp a year ahead, written by something else, neither wins nor holds off a later change', async () => {
+  const found = await world({ panels: 2 });
+  const { storage, time, panels: [a, b] } = found;
+  await capture(a);
+  type(a, 'mine');
+  await settle(a, b);
+  const year = time.now + 365 * DAY;
+  const planted = clone(storage.data.get('cdrReport'));
+  Object.assign(planted.items[0], { description: 'planted', included: false, editedAt: year, wordsAt: year });
+  planted.items.push(storedItem('planted', { capturedAt: time.now + 1, editedAt: year, wordsAt: year }));
+  planted.writer = 'something-else';
+  await storage.api.local.set({ cdrReport: planted });
+  for (let round = 0; round < 3; round += 1) await settle(a, b);
+  for (const [name, panel] of [['first', a], ['second', b]]) {
+    assert.deepEqual(sentences(panel), ['mine', 'words of planted'], `the ${name} window took the planted words`);
+    assert.equal(items(panel)[0].included, true, `the ${name} window took the planted tick`);
+  }
+  const stamps = (list) => list.flatMap((item) => [item.editedAt, item.wordsAt || 0]);
+  for (const at of [...stamps(items(a)), ...stamps(items(b)), ...stamps(storedItems(storage))]) {
+    assert.ok(at < time.now + DAY, `a stamp ${at - time.now} ms ahead was kept`);
+  }
+
+  setBack(found, HOUR);
+  time.now += 1000;
+  type(a, 'mine, later');
+  await settle(a, b);
+  assert.deepEqual(sentences(b), ['mine, later', 'words of planted']);
+  time.now += 1000;
+  pickRow(b, 1);
+  b.click('preview-clear');
+  for (let round = 0; round < 3; round += 1) await settle(a, b);
+  for (const panel of [a, b]) assert.deepEqual(sentences(panel), ['mine, later']);
+  assert.deepEqual(storedSentences(storage), ['mine, later']);
+});
+
+// 0.6.1 read a stamp ahead of the clock as now. touch() stamps a second
+// change to an item within one millisecond one after the first, so the other
+// windows took it for the change they already had.
+test('sheet: a second change to an item within one millisecond reaches the other window', async () => {
+  const { storage, time, panels: [a, b] } = await world({ panels: 2 });
+  await capture(a);
+  await settle(a, b);
+  time.now += 1000;
+  tickRow(a, 0, false);
+  await settle(a, b);
+  tickRow(a, 0, true);
+  await settle(a, b);
+  assert.equal(items(b)[0].included, true, 'the other window kept the first change');
+  assert.equal(storedItems(storage)[0].included, true);
+});
+
+// A copy stamps each removal after the item's last change as the sheet holds
+// it when the copy ends. An item discarded and brought back in another window
+// while the copy read the page is another object by then, with a later stamp
+// than the object the copy started from. Stamped after that one, the removal
+// would come before the undo, and the copied item would stay on every sheet.
+test('sheet: an item discarded and brought back in another window during a copy, after the clock was set back, still leaves every sheet', async () => {
+  const answers = [];
+  const found = await world({
+    panels: 2,
+    setups: [undefined, (chrome) => (chrome.tabs.sendMessage = () => new Promise((resolve) => answers.push(resolve)))],
+  });
+  const { storage, time, panels: [a, b] } = found;
+  await captures(a, time, ['one', 'two']);
+  answers.splice(0).forEach((answer) => answer(null));
+  await settle(a, b);
+  setBack(found, HOUR);
+  time.now += 1000;
+  b.click('submit');
+  await b.flush();
+  time.now += 1000;
+  pickRow(a, 0);
+  a.click('preview-clear');
+  await settle(a, b);
+  assert.deepEqual(sentences(b), ['two']);
+  time.now += 1000;
+  a.element('undo').children[1].dispatch('click');
+  await settle(a, b);
+  assert.deepEqual(sentences(b), ['one', 'two']);
+  answers.splice(0).forEach((answer) => answer(null));
+  await b.clock.advance(500);
+  for (let round = 0; round < 3; round += 1) await settle(a, b);
+  assert.equal(b.element('result').hidden, false, 'the copy did not finish');
+  assert.deepEqual(sentences(b), []);
+  assert.deepEqual(sentences(a), [], 'the item brought back stayed on the sheets');
+  assert.deepEqual(storedItems(storage), []);
 });

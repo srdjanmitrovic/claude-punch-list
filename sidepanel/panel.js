@@ -58,6 +58,11 @@ const PAGE_SCRIPT = 'content/page-shot.js';
 const UNDO_MS = 6000; // how long a discard can be taken back before its files go
 const REMOVED_TTL_MS = 10 * 60 * 1000; // how long the sheet remembers what left it, see state.removed
 const REMOVED_MAX = 200;
+// How far ahead of the clock a stamp on the sheet may be and still count (see
+// tooFarAhead): after the clock is set back, every stamp made before is ahead
+// of it, and edits go on from them. Two days rides out a set back of a full
+// day with room to spare.
+const STAMP_AHEAD_MS = 2 * 24 * 60 * 60 * 1000;
 const CHIPS_MIN_GAP_MS = 1000; // the least time between two chip reads the panel starts on its own
 // How long a copy with no page to read waits for Chrome to report a file
 // gone, counted from the ask (copyReport). Chrome 156 answered in 0.3 to 1.4
@@ -1476,10 +1481,16 @@ function setAllIncluded(included) {
  * Stamp a change to an item, so a merge with another panel's sheet can tell
  * whose copy is newer: { words: true } for the description, otherwise the
  * intent or the tick. Later than any change or removal of it this panel knows
- * of, so taking a discard back brings the item back in every panel.
+ * of, so taking a discard back brings the item back in every panel, and an
+ * edit made after the clock was set back still counts as the newest. Counted
+ * from the stamps a merge believes (forgetFarStamps), or past a larger set
+ * back the edit would be as far ahead as they are, and believed by no panel.
  */
 function touch(item, { words = false } = {}) {
-  const at = Math.max(Date.now(), lastChange(item) + 1, (state.removed.get(item.id) || 0) + 1);
+  const now = Date.now();
+  forgetFarStamps(item, now);
+  const removedAt = state.removed.get(item.id) || 0;
+  const at = Math.max(now, lastChange(item) + 1, (tooFarAhead(removedAt, now) ? 0 : removedAt) + 1);
   if (words) item.wordsAt = at;
   else item.editedAt = at;
 }
@@ -1487,6 +1498,66 @@ function touch(item, { words = false } = {}) {
 /** When anything about an item last changed, in any panel. */
 function lastChange(item) {
   return Math.max(item.editedAt || 0, item.wordsAt || 0);
+}
+
+/**
+ * Whether a stamp is further ahead of the clock than STAMP_AHEAD_MS. A merge
+ * counts such a stamp as none, wherever it comes from (readItem and
+ * forgetFarStamps). It was not made by this browser since the clock was last
+ * set back by less than that: something else wrote it into storage (content
+ * scripts can), or the clock went back further. Taken as it is, it would
+ * outrank every edit made with the clock as it is now, and at 2^53 and past,
+ * where adding one changes nothing, every edit for good. None rather than
+ * capped at the limit: capped, it would be worth the moment each panel came
+ * to it, and the panel that came to it last would win over a change made in
+ * between.
+ */
+function tooFarAhead(stamp, now) {
+  return stamp > now + STAMP_AHEAD_MS;
+}
+
+/**
+ * Drop the stamps of an item this panel holds that are too far ahead, as
+ * readItem drops them from what it reads. The same rule on both sides of a
+ * merge is what ends the write loop 0.6.1 had. It read stored stamps capped at
+ * the clock and kept its own as they were, so once the clock went back each
+ * of two panels found its own copy newer than the one it read, and wrote it
+ * back to the other, until the clock passed the newest stamp. A panel that
+ * only compared its stamps capped would keep them: their worth would rise
+ * with the clock, and a panel holding one would keep winning over newer edits
+ * from a window opened since. A stamp dropped here is dropped for good.
+ */
+function forgetFarStamps(item, now) {
+  if (tooFarAhead(item.editedAt, now)) item.editedAt = 0;
+  if (tooFarAhead(item.wordsAt, now)) item.wordsAt = 0;
+  if (tooFarAhead(item.fileAt, now)) item.fileAt = undefined;
+}
+
+/**
+ * Drop every stamp on the sheet this panel holds that is too far ahead, and
+ * every removal so stamped, before a merge (adoptStored) and before a write
+ * (persist). Forgotten in one panel only, a stamp would live on in storage
+ * and in the panels that had not merged since, and count again once the
+ * clock came back within STAMP_AHEAD_MS of it, over every change the panel
+ * that forgot it had made since.
+ */
+function forgetFarSheet(now) {
+  for (const item of state.items) forgetFarStamps(item, now);
+  for (const [id, at] of state.removed) {
+    if (tooFarAhead(at, now)) state.removed.delete(id);
+  }
+}
+
+/**
+ * The stamp of an item leaving the sheet, by a discard or a copy: now, or just
+ * after its last change when that is later, as it is for a while after the
+ * clock was set back. A removal stamped before the change it ends would not
+ * count as after it (goneAfter in adoptStored): every other window would keep
+ * the item and write it back, and this one would take it back too.
+ */
+function leftAt(item, now = Date.now()) {
+  forgetFarStamps(item, now);
+  return Math.max(now, lastChange(item) + 1);
 }
 
 /** Where an item stands on the sheet: where it was moved to, else when it was captured. */
@@ -1919,7 +1990,7 @@ function discard(ids) {
   if (!entries.length) return;
   const now = Date.now();
   for (const { item } of entries) {
-    state.removed.set(item.id, now);
+    state.removed.set(item.id, leftAt(item, now));
     // Asked now, while there is time to wait for the answer, so a panel
     // closed before the undo lapses can still delete the file (flushOnClose).
     if (item.path) recordFor(item).then((record) => (item.verified = Boolean(record)));
@@ -2125,7 +2196,12 @@ function showUndo(entries) {
 function resetAfterCopy(copied) {
   const ids = new Set(copied.map((item) => item.id));
   const now = Date.now();
-  for (const id of ids) state.removed.set(id, now);
+  for (const item of copied) {
+    // Its stamps as the sheet holds them now, should a write adopted during
+    // the copy have put another object in its place.
+    const live = state.items.find((each) => each.id === item.id) || item;
+    state.removed.set(item.id, leftAt(live, now));
+  }
   // Their clean captures and marks go: state.lastCopy and state.handCopy
   // keep these objects alive, and nothing marks a copied item up.
   for (const item of [...copied, ...state.items.filter((each) => ids.has(each.id))]) releaseFull(item);
@@ -3975,7 +4051,10 @@ function swapFile(item, saved, marks, thumb) {
   live.path = saved.path;
   live.downloadId = saved.downloadId;
   live.marked = marks.length ? true : undefined;
-  live.fileAt = Math.max(Date.now(), (live.fileAt || 0) + 1);
+  // After the last swap, from a stamp a merge believes, as touch() stamps.
+  const now = Date.now();
+  forgetFarStamps(live, now);
+  live.fileAt = Math.max(now, (live.fileAt || 0) + 1);
   live.thumb = thumb;
   live.verified = true; // this session's own download, just completed
   live.unchecked = false;
@@ -4724,14 +4803,19 @@ function pruneRemoved() {
  * Nothing but an item change calls this. The toggles and the intent default
  * have writes of their own, so a panel in another window that never captured
  * anything cannot overwrite this one's report by unticking a box.
+ *
+ * No stamp too far ahead of the clock is written (forgetFarSheet), so every
+ * panel that hears the write drops its own copy of one at the same moment.
  */
 function persist({ thumbs = false } = {}) {
+  const now = Date.now();
+  forgetFarSheet(now);
   pruneRemoved();
   const report = {
     items: state.items.filter((item) => item.path).map(storedForm),
     removed: [...state.removed].map(([id, at]) => ({ id, at })),
     // Age is measured from the last edit, not from the first capture.
-    updatedAt: Date.now(),
+    updatedAt: now,
     writer: PANEL_ID,
   };
   const values = { cdrReport: report };
@@ -4807,12 +4891,16 @@ function adoptSettings(changes) {
  * can write an extension's local storage by default. A mode this build does
  * not know used to throw in the first render and leave the panel inert on
  * every open. The path is printed in the prompt on a line of its own, so it
- * holds no line breaks.
+ * holds no line breaks. A stamp too far ahead of the clock (tooFarAhead) is
+ * read as none, so any copy with a stamp the clock accounts for is newer, and
+ * so is the next edit. `now` is the merge's one reading of the clock, which
+ * holds its own stamps to the same moment.
  */
-function readItem(raw) {
+function readItem(raw, now = Date.now()) {
   if (!raw || typeof raw !== 'object') return null;
   const text = (value, max) => (typeof value === 'string' ? value.slice(0, max) : '');
   const number = (value) => (Number.isFinite(value) ? value : null);
+  const stamp = (value) => (number(value) != null && !tooFarAhead(value, now) ? value : 0);
   if (typeof raw.id !== 'string' || !raw.id || raw.id.length > 100) return null;
   const { path } = raw;
   if (typeof path !== 'string' || !path || path.length > 4096) return null;
@@ -4823,7 +4911,6 @@ function readItem(raw) {
       ? raw.element
       : null;
   const rank = number(raw.rank);
-  const fileAt = number(raw.fileAt);
   return {
     id: raw.id,
     mode,
@@ -4839,15 +4926,16 @@ function readItem(raw) {
     capturedAt: number(raw.capturedAt) ?? 0,
     armedAt: number(raw.armedAt) ?? undefined,
     rank: rank != null && Math.abs(rank) <= MAX_RANK ? rank : undefined,
-    editedAt: Math.min(number(raw.editedAt) ?? 0, Date.now()),
-    wordsAt: Math.min(number(raw.wordsAt) ?? 0, Date.now()),
+    editedAt: stamp(raw.editedAt),
+    wordsAt: stamp(raw.wordsAt),
     thumb: null,
     path,
     downloadId: Number.isSafeInteger(raw.downloadId) && raw.downloadId >= 0 ? raw.downloadId : null,
     // The value true only: anything else claims marks the file may not have.
     marked: raw.marked === true ? true : undefined,
-    // Not in the future, where it would outrank every later file of the item.
-    fileAt: fileAt != null && fileAt > 0 ? Math.min(fileAt, Date.now()) : undefined,
+    // Not too far ahead either, where it would outrank every later file of
+    // the item.
+    fileAt: stamp(raw.fileAt) > 0 ? raw.fileAt : undefined,
     stitched: mode === 'page' ? readStitched(raw.stitched) : undefined,
   };
 }
@@ -4868,16 +4956,23 @@ function readStitched(value) {
   return stitched;
 }
 
-/** A stored report, read with readItem, and its list of removals. */
-function readReport(report) {
+/**
+ * A stored report, read with readItem, and its list of removals. `far` says
+ * whether it held a stamp too far ahead of the clock, on an item it takes
+ * (read as none) or on a removal (dropped).
+ */
+function readReport(report, now = Date.now()) {
   const items = [];
   const seen = new Set();
+  const ahead = (stamp) => Number.isFinite(stamp) && tooFarAhead(stamp, now);
+  let far = false;
   const rawItems = Array.isArray(report?.items) ? report.items.slice(0, MAX_STORED_ITEMS) : [];
   for (const raw of rawItems) {
-    const item = readItem(raw);
+    const item = readItem(raw, now);
     // Two items under one id would be one row that edits two.
     if (!item || seen.has(item.id)) continue;
     seen.add(item.id);
+    if (ahead(raw.editedAt) || ahead(raw.wordsAt) || ahead(raw.fileAt)) far = true;
     items.push(item);
   }
   const removed = [];
@@ -4885,10 +4980,14 @@ function readReport(report) {
   for (const entry of rawRemoved) {
     if (!entry || typeof entry.id !== 'string' || entry.id.length > 100) continue;
     if (!Number.isFinite(entry.at)) continue;
-    // Not in the future, where it would outrank every later edit of the item.
-    removed.push([entry.id, Math.min(entry.at, Date.now())]);
+    // Not too far ahead, where it would outrank every later edit of the item.
+    if (tooFarAhead(entry.at, now)) {
+      far = true;
+      continue;
+    }
+    removed.push([entry.id, entry.at]);
   }
-  return { items, removed };
+  return { items, removed, far };
 }
 
 /**
@@ -4925,13 +5024,22 @@ function thumbFrom(thumbs, id) {
  *   over it. One user types in one window at a time, so the newer stamp is
  *   always the sentence being typed.
  * - Items still being saved here are not in storage yet, and stay.
+ * - Both sides' stamps are held to one rule: one too far ahead of the clock
+ *   counts as none, whether storage holds it or this panel does (readItem
+ *   and forgetFarStamps). A side writes back only what it holds newer by
+ *   that rule, so the clock set back, by any amount, cannot set two panels
+ *   writing to each other. A report that held such a stamp is written back
+ *   at once, on opening too, while the stamp is still too far ahead: storage
+ *   loses it, and every open panel drops its own copy at that write.
  *
  * A change that leaves the sheet's shape alone, such as a keystroke in another
  * window, updates the rows it touches and nothing more: no rebuild of the
  * list, no storage read and no message to the tab.
  */
 function adoptStored(report, thumbs, { initial = false } = {}) {
-  const incoming = readReport(report);
+  const now = Date.now();
+  const incoming = readReport(report, now);
+  forgetFarSheet(now);
   for (const [id, at] of incoming.removed) {
     if (!(state.removed.get(id) >= at)) state.removed.set(id, at);
   }
@@ -4945,7 +5053,7 @@ function adoptStored(report, thumbs, { initial = false } = {}) {
   const seen = new Set();
   const next = [];
   const changed = new Set();
-  let writeBack = false;
+  let writeBack = incoming.far;
   let wantThumbs = false;
 
   for (const theirs of incoming.items) {
@@ -5056,7 +5164,9 @@ function adoptStored(report, thumbs, { initial = false } = {}) {
   }
   // A new item whose thumbnail did not come in the same write.
   if (wantThumbs && !thumbs) readThumbs();
-  if (writeBack && !initial) persist({ thumbs: true });
+  // Opening writes nothing, unless storage holds a stamp too far ahead: a
+  // panel open since before the clock went back may still hold it too.
+  if (writeBack && (!initial || incoming.far)) persist({ thumbs: true });
 }
 
 /**

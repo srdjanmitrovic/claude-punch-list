@@ -128,9 +128,12 @@ still supported. They live in `test/`:
   `panel.layOutRows()`, and `makeDataTransfer()` stands in for Chrome's).
 * `test/sheet.test.mjs` runs one panel realm per window over one shared storage and one downloads
   list, as the side panels of two windows share them in Chrome, and checks what survives two
-  windows writing at once, the order of the sheet across windows, reopens and undo, what a whole
-  page item stores and what is refused of it on reading, which files a discard, a copy or the
-  weekly expiry deletes, and what the panel says about a file it cannot find.
+  windows writing at once, the order of the sheet across windows, reopens and undo, two windows
+  open while the clock is set back, what a whole page item stores and what is refused of it on
+  reading, which files a discard, a copy or the weekly expiry deletes, and what the panel says
+  about a file it cannot find. Its storage can stop delivering writes past a count (`heardUpTo`),
+  so a test that would set two panels writing to each other ends, and shows how many writes
+  there were.
 * `test/static.test.mjs` checks what would otherwise only fail in Chrome: every file the manifest,
   the worker and the panel name exists, every file parses, the re-injected capture scripts
   declare nothing at the top level, the copies of the secret name blocks agree, and `PRIVACY.md`
