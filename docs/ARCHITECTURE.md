@@ -195,7 +195,7 @@ the lookup until a ping it sends on each arm is answered.
 The reply carries two things, `component` and `handlers`, either of which may be absent. Handlers
 come from a different property than the component does: React keeps a host element's own props on
 the node as `__reactProps$<random>`, in a production build as well as a development one because
-event dispatch reads them back from there, and Vue keeps the same names on `__vnode.props`.
+event dispatch reads them back from there, and Vue 3 keeps the same names on `__vnode.props`.
 Neither is the fiber, so the two lookups climb independently and their hop counts can differ.
 That is why the prompt never presents them as one number.
 

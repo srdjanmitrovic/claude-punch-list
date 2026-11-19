@@ -1271,20 +1271,40 @@ screenshots are saved the moment they are taken.
 
 Honest about what is not built yet.
 
-* **Reordering the sheet.** Items are numbered in the order they were captured. Dragging a
-  thumbnail to move it is the obvious next step.
-* **Marking up a capture.** An arrow or a circle on the screenshot itself, for the cases where
-  "the second one from the left" is not good enough.
-* **Full page screenshots** that scroll and stitch. Sticky headers repeat, lazily loaded
-  content shifts under you, and the capture rate limit forces roughly half a second per
-  viewport. Region capture covers most real cases.
-* **More frameworks.** React and Vue 3 are read today. A Svelte development build attaches
-  `__svelte_meta` to each element with the file and line it came from, which is the closest
-  thing to a free win left. Vue 2 hangs its instance off a different property, and Angular
-  exposes a component only through its own development mode globals.
-* **The component name while hovering.** The picker's tag shows the tag name and size. Showing
-  the component would mean a round trip to the page's own JavaScript world on every mouse move,
-  which is why it waits for the click instead.
+* **Vue 3 production builds.** Unless it was built with `__VUE_PROD_DEVTOOLS__`, Vue 3 keeps
+  nothing on an element that says which component rendered it, so a pick there has no Component
+  line and no Handlers line. The handlers at least are within reach: Vue's event code keeps each
+  element's listeners on the element under `Symbol('_vei')`, in production too, and nothing reads
+  them yet.
+* **Svelte and Angular production builds.** Neither leaves anything in the page to read. Svelte's
+  `__svelte_meta` comes with a development build only, and an Angular production build publishes
+  none of the `window.ng` functions the reader calls, so there is nothing to start from.
+* **Preact, Solid and web components.** None of them gets a Component line yet, and handlers are
+  read on React and Vue 3 pages only. Each keeps what rendered an element in its own way, so each
+  needs a reader of its own behind `componentOf`, held to the rules the hover sets and tested
+  against the shapes of a real build.
+* **Marking up an item from an earlier panel.** Only the panel that took a capture can mark it up,
+  while it stays open, because only that panel holds the screenshot without marks, in memory. Any
+  other item would need it read back from disk, but no downloads API reads a file, a `file://`
+  read needs "Allow access to file URLs" (off by default), and an item already marked up no
+  longer has a file without marks. Keeping every clean capture in storage instead would put a
+  second copy of every screenshot in the Chrome profile, with an expiry of its own.
+* **Slices past the whole page cap.** Page stops at 10,000 device pixels, since Claude reads a
+  taller image too small to make out. The rest of a long page could go into further images about
+  2,500 pixels tall under the same item, but discarding, the weekly expiry, the check for a missing
+  file and storage all assume one file per item.
+* **Handing the picked node to the collector's `inspect()` directly.** The hover asks for a name
+  with an event on the node itself, while a pick still marks its node with an attribute and finds
+  it again: with `document.querySelector`, or, inside an open shadow root, with a walk of at most
+  20,000 elements. On a larger page a node in an open shadow root beyond that walk is named on the
+  highlight and then reported with no Component line (F72 in [docs/REVIEW.md](docs/REVIEW.md)).
+  Sending the pick's question on the node, as the hover does, would drop both the attribute and
+  the walk.
+* **A hint to reload a tab after an update.** A tab open from before an update keeps the collector
+  it loaded with until it is reloaded, and nothing in the panel says so. After the update to
+  0.7.0, the highlight names no component in such a tab, and a pick there reads no Svelte, Vue 2
+  or Angular component. No collector says which version it is, so the panel cannot yet tell an old
+  one from a new one.
 
 ## Contributing
 

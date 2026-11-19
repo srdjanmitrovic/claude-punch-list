@@ -2,8 +2,11 @@
 
 Reviewed at commit `a0c9335` on 2026-11-15. The analysis was made without changing code. Two
 sections at the end, added on 2026-11-16, record what was implemented afterwards and what turned
-up while doing it; the 0.6.0 round was recorded in them on 2026-11-17, and the 0.6.1 round on
-2026-11-17 and 2026-11-18. Line references in the sections before them point at `a0c9335`.
+up while doing it; the 0.6.0 round was recorded in them on 2026-11-17, the 0.6.1 round on
+2026-11-17 and 2026-11-18, and the 0.7.0 round on 2026-11-18 and 2026-11-19. Line references in the
+sections before them point at `a0c9335`. A note in parentheses there that starts "Since 0.7.0" says
+what that release changed, one that starts "By 0.7.0" says how things stood by then, and both leave
+the text as it was reviewed; the line references inside such a note point at the 0.7.0 tree.
 
 This file sits under `docs/`, which the release zip does not include. `tools/build.mjs:32` packages
 from an allowlist of six paths (`manifest.json`, `background.js`, `icons`, `content`, `shared`,
@@ -15,14 +18,19 @@ checksum as one without it.
 **What the extension does today.** A Manifest V3 side panel extension (`manifest.json:2`,
 `manifest.json:31`). You frame something on a page in one of three ways (drag a region, click an
 element, take the whole viewport), type one sentence, mark it as a bug or a suggestion, and repeat.
-Each capture is written to Downloads as a PNG the moment it is taken (`sidepanel/panel.js:1015`) and
-becomes a row on a sheet kept in `chrome.storage.local` (`sidepanel/panel.js:1205`). One click builds
-a single markdown prompt (`shared/prompt-template.js:831`) that names every ticked item with the
-absolute path of its screenshot, adds the console errors and failed requests an always on collector
-recorded in the page (`content/collector-main.js:94`, `content/collector-main.js:275`,
+(Since 0.7.0 there is a fourth, Page, which scrolls the page and files one stitched screenshot, a
+capture can be marked up with arrows and ellipses, and the sheet can be reordered; see "The
+roadmap, for 0.7.0".) Each capture is written to Downloads as a PNG the moment it is taken
+(`sidepanel/panel.js:1015`) and becomes a row on a sheet kept in `chrome.storage.local`
+(`sidepanel/panel.js:1205`). One click builds a single markdown prompt
+(`shared/prompt-template.js:831`) that names every ticked item with the absolute path of its
+screenshot, adds the console errors and failed requests an always on collector recorded in the
+page (`content/collector-main.js:94`, `content/collector-main.js:275`,
 `content/collector-main.js:339`), and puts it on the clipboard. Element captures also carry markup,
 computed styles and, on React and Vue pages, the component, its props and its handlers
-(`content/collector-main.js:1160`).
+(`content/collector-main.js:1160`). (Since 0.7.0 Svelte and Angular development builds and Vue 2
+builds are read too, with their props (Svelte's from 5.58) and no handlers, and while picking, the
+highlight's tag names the component; see "The roadmap, for 0.7.0".)
 
 There is no backend. The only `fetch` in the shipped files turns a data URL into a blob
 (`sidepanel/panel.js:1017`), and no shipped file contains a remote URL, `eval` or `new Function`.
@@ -45,9 +53,12 @@ There is no backend. The only `fetch` in the shipped files turns a data URL into
   README says props are the only data read out of the running application (`README.md:428`).
 * The project's own rules (byte for byte output, wrappers that never break a page, no top level
   `const` in injected scripts) are enforced by nothing: there is no test and no CI on push
-  (`CONTRIBUTING.md:61`).
+  (`CONTRIBUTING.md:61`). (By 0.7.0 `npm test` runs 895 tests in 13 files, and CI runs them on
+  Node 22 and 24 for every push to `main` and every pull request; see "Items 2 and 3 of the top
+  5".)
 * Versions 0.3.0 and 0.4.0 were never released, so the README's release zip path leads to a
-  differently named 0.2.0 build (`README.md:345`).
+  differently named 0.2.0 build (`README.md:345`). (By 0.7.0, v0.4.0, v0.5.0, v0.6.0 and v0.6.1
+  are tagged, and the manifest says 0.7.0.)
 
 ## How this was checked
 
@@ -112,7 +123,7 @@ picker and component lookup, `PJ` prompt, `SP` security and privacy, `TR` toolin
 | Failed resource loads | `content/collector-main.js` | fragile | URL is missing for `srcset`, SVG images and objects (M3) and is never truncated (CO7). |
 | Attaching context at copy time | `sidepanel/panel.js`, `content/collector-bridge.js` | fragile | Lead 1. Also loses every URL when the read fails (RO4), can hang the copy (RO5) and can reuse another tab's read (RO1). |
 | React component lookup | `content/collector-main.js`, `shared/prompt-template.js` | fragile | Works on React 16 to 19. Prints a false "defined elsewhere" in the commonest case (PI2), unmapped positions on 19.1 and later (PI9), and props that can be one commit old (M5). |
-| Vue component lookup | `content/collector-main.js` | solid | Vue 3 development builds only, which is what the README claims. |
+| Vue component lookup | `content/collector-main.js` | solid | Vue 3 development builds only, which is what the README claims. (Since 0.7.0 Vue 2 is read too, development and production builds; see "The roadmap, for 0.7.0".) |
 | Handlers and props with redaction | `content/collector-main.js` | fragile | The secret test is an unanchored substring match (PI3) and three text heuristics misfire (PI16). |
 | Prompt: one bug | `shared/prompt-template.js` | solid | Structure held against hostile and degenerate input from an ordinary page (PJ15). |
 | Prompt: change, mixed, several pages | `shared/prompt-template.js` | fragile | Change closing gives the evidence no role (PJ17). Page counting and page lines disagree (PJ9). The caution vanishes with the page toggle off (RO3). |
@@ -122,10 +133,10 @@ picker and component lookup, `PJ` prompt, `SP` security and privacy, `TR` toolin
 | Keyboard shortcuts | `manifest.json`, `sidepanel/panel.js` | incomplete | One command, one undocumented panel shortcut (`sidepanel/panel.js:1526`), Esc bound only on the page. |
 | Release packaging | `tools/build.mjs` | fragile | Validates manifest paths only (TR2) and zips untracked files (TR6). |
 | Release workflow | `.github/workflows/release.yml` | incomplete | 0.3.0 and 0.4.0 were never published (TR1). Manual dispatch cannot succeed from a branch (TR4). |
-| Tests and CI | none | incomplete | No test of any kind (`CONTRIBUTING.md:61`). |
+| Tests and CI | none | incomplete | No test of any kind (`CONTRIBUTING.md:61`). (By 0.7.0, 895 tests in 13 files, run by CI on Node 22 and 24.) |
 | Prompt preview tool | `tools/preview-prompt.mjs` | solid | Renders the real template. 49 of 467 code lines never run in any of the four modes (PJ12). |
 | Panel stage and shim | `tools/panel-stage.html`, `tools/chrome-shim.js` | fragile | Useful and faithful for the panel. Download ids reset on reload (TR8); the docs understate what it cannot reproduce (TR9). |
-| Roadmap: reorder, annotate, full page, more frameworks, component on hover | `README.md` | incomplete | None is built (lead 8). |
+| Roadmap: reorder, annotate, full page, more frameworks, component on hover | `README.md` | incomplete | None is built (lead 8). (Since 0.7.0 all five are built, more frameworks in part: Svelte, Vue 2 and Angular are read, while Vue 3 production handlers, Preact, Solid and web components are not. See "The roadmap, for 0.7.0".) |
 
 **Half built or unused.** No permission is unused: `scripting`, `downloads`, `storage` and
 `sidePanel` each have call sites. What is unused is data: `userAgent` and scroll position
@@ -181,7 +192,11 @@ highlighted and the click is delivered to the framed page for real, same origin 
 (`background.js:99`, PI6). "React" means 16 through 19; a call site exists on 16 to 18 with a
 development JSX transform and on 19.1 and later, where it is an unmapped stack frame (PI9). "Vue 3"
 means development builds. Svelte, Vue 2, Preact, Solid, Angular and web components get no component
-and no handlers (`content/collector-main.js:1182`).
+and no handlers (`content/collector-main.js:1182`). (Since 0.7.0 Svelte development builds, Vue 2
+builds of either kind and Angular development builds get a component and its props, Svelte's props
+from 5.58 only, and Angular is read at a pick only, never on hover. Preact, Solid and web
+components still get none, and handlers are still read on React and Vue 3 only. See "The roadmap,
+for 0.7.0".)
 
 **4. The manifest says 0.4.0 but tags stop at v0.2.0, and the release workflow only runs on tags.
 Confirmed, with one correction.**
@@ -228,20 +243,38 @@ command fires. Chrome allows four suggested keys per extension, and `_execute_ac
 **8. Roadmap items are not built. Confirmed for all five.**
 No drag or reorder code in `sidepanel/`; the only canvas use is crop and thumbnail
 (`sidepanel/panel.js:405`); capture is one `captureVisibleTab` call (`sidepanel/panel.js:379`); the
-hover tag shows tag, id, classes and size (`content/picker.js:339`). Groundwork differs:
+hover tag shows tag, id, classes and size (`content/picker.js:339`). (Since 0.7.0 all five are
+built, the fourth in part; see "The roadmap, for 0.7.0". The notes below say where the build found
+a bullet wrong.) Groundwork differs:
 
 * **Reorder** is close. Order is already the persisted array order and the template numbers by
   index (`shared/prompt-template.js:871`). `adoptStored` appends items still saving after stored
-  ones (`sidepanel/panel.js:1282`), which a reorder must respect.
+  ones (`sidepanel/panel.js:1282`), which a reorder must respect. (Since 0.7.0 it is built, and it
+  was not an array move: since the item merge of improvement 14, `adoptStored` sorted the items by
+  `capturedAt` on every open and every write it adopted, so a moved array went back to capture
+  order at the next write. Each item now carries an optional `rank`, merged under `editedAt`, and
+  the log is split by `capturedAt`, not by list order.)
 * **Annotate** is blocked by design. The full image is released once the download starts and the
   panel keeps a thumbnail of at most 800 px (`sidepanel/panel.js:23`), so marking up has to happen
-  before the save or produce a second file.
+  before the save or produce a second file. (Since 0.7.0 it is built as Mark up, the second way:
+  the capture is saved at once, the panel that took it keeps the clean image in memory, its newest
+  10 or about 100 MB, and Done saves a marked copy that replaces the file.)
 * **Full page** is called out of scope in `CONTRIBUTING.md:109` and roadmap in `README.md:559`.
+  (Since 0.7.0 it is built as the Page mode, one stitched PNG of at most 10,000 device pixels, cut
+  short past that, and `CONTRIBUTING.md` no longer calls it out of scope.)
 * **More frameworks**: the framework field is a two way switch in three places, so a third would
-  print as React unless all three change.
+  print as React unless all three change. (Since 0.7.0 the field is a table in the template
+  (`shared/prompt-template.js:376`) and an allowlist in the picker (`content/picker.js:1109`), and
+  Svelte, Vue 2 and Angular are read. The picker drops a framework no collector sends; one that
+  reached the template from elsewhere would still print as React (`shared/prompt-template.js:389`).)
 * **Component on hover**: the README's stated cost (a round trip per mouse move) is overstated,
   since `onMouseMove` returns early unless the element changed (`content/picker.js:548`). The real
-  cost is writing a `data-cdr-pick` attribute onto every hovered node.
+  cost is writing a `data-cdr-pick` attribute onto every hovered node. (Since 0.7.0 it is built.
+  That code is now `describe()` and `highlight()` (`content/picker.js:1500`, `:1510`), and the early
+  return is in `hover()` (`content/picker.js:2784`). The attribute was a cost, but the larger one
+  was the props guard a pick runs: a pick's round trip with it took 1.24 ms at 20,000 elements and
+  8.5 ms at 100,000 (measured for the design, in Chrome 157), against a few µs for a name.
+  Hovering now writes nothing and runs no guard.)
 
 ## Bugs and risks
 
@@ -871,7 +904,9 @@ Svelte development builds attach `__svelte_meta` with file, line and column in b
 off `__vue__`. Files: `content/collector-main.js`, `content/picker.js`,
 `shared/prompt-template.js`. Risk: all are internals, so read them defensively and add a fixture
 each. The `framework` field is a two way switch in three places and must become a real value.
-Neither was run against a real build.
+Neither was run against a real build. (Since 0.7.0, done in part: Svelte and Vue 2 are read, with
+Angular besides, and were run in Chrome against real builds. Vue 3 production handlers (`_vei`) are
+not done. See "The roadmap, for 0.7.0".)
 
 **8. CSP violations, and failed stylesheet images and fonts.**
 A passive `securitypolicyviolation` listener (confirmed to receive violations from a main world
@@ -895,7 +930,9 @@ plus a closed panel loses every sentence. Persist it under its own key for a sho
 **11. Reorder the sheet.**
 See lead 8. An array move plus `persist()`, with care for items still saving and for the three
 places that read "last" as "newest" (`sidepanel/panel.js:852`, `sidepanel/panel.js:1120`,
-`sidepanel/panel.js:1284`). A reorder would sync across windows for free and inherit SS4.
+`sidepanel/panel.js:1284`). A reorder would sync across windows for free and inherit SS4. (Since
+0.7.0, done, by a drag or by Alt or Option with an arrow, and not as an array move: see lead 8 and
+"The roadmap, for 0.7.0".)
 
 **12. Pick inside shadow roots.**
 Descend through open roots with `shadowRoot.elementFromPoint`; `chrome.dom.openOrClosedShadowRoot`
@@ -920,9 +957,14 @@ the element wanted is covered by a child. Files: `content/picker.js`, `sidepanel
 
 **15. Component name in the hover tag.**
 See lead 8. Use an event based handoff so hovering does not write attributes onto the page.
+(Since 0.7.0, done as such a handoff: an event sent on the node, answered by
+`componentOf(node, true)`. See "The roadmap, for 0.7.0".)
 
 **16. Annotate a capture.**
-See lead 8. It has to run before the save, while the full image still exists.
+See lead 8. It has to run before the save, while the full image still exists. (Since 0.7.0, done
+as Mark up, and this premise was wrong: marking up does not run before the save. The capture is
+saved at once, the panel that took it keeps the clean image in memory, and Done saves a marked copy
+that replaces the file. See "The roadmap, for 0.7.0".)
 
 **17. Capture at full page width with the panel closed.**
 Opening the panel narrows the page, so a layout bug that exists only at full width cannot be
@@ -932,7 +974,8 @@ only if full width capture turns out to matter.
 
 **18. Full page capture.**
 `CONTRIBUTING.md:109` calls it out of scope and `README.md:559` calls it roadmap. One of the two
-should change. The README's own list of obstacles is accurate.
+should change. The README's own list of obstacles is accurate. (Since 0.7.0, done as the Page mode,
+and `CONTRIBUTING.md` no longer calls it out of scope. See "The roadmap, for 0.7.0".)
 
 ## Top 5 to do next
 
@@ -959,31 +1002,75 @@ Stated here so nothing above reads as more certain than it is.
 
 * No run used a visible side panel. Focus behaviour between the page and the panel (CW5, UX5)
   rests on the stage and on reading. For 0.6.0 a real side panel, opened in headless Chrome for
-  Testing 156, settled UX5.
+  Testing 156, settled UX5. For 0.7.0 the checks of reorder, Mark up, Page, the hover name and the
+  framework readers ran in a real side panel opened with `chrome.sidePanel.open`, some of them
+  headed.
 * The fullscreen half of CW3, and whether `_execute_action` opens the panel, come from
   documentation and Chrome's samples. The fullscreen half was observed for 0.6.0 and read wrongly
   then: the overlay was drawn above the fullscreen element, inert, so every press reached the page.
   Since 0.6.1 it goes inside a fullscreen element that can hold it (F36).
 * The cross window races (SS4, SS5) reproduce with artificial delays of 5 to 40 ms; the real gap
-  in Chrome was not measured. SS3 was run against a fake storage.
+  in Chrome was not measured. SS3 was run against a fake storage. For 0.7.0 a row moved in one real
+  side panel showed in another window's after 3 to 4 ms (two runs), a measure of that gap; the
+  races themselves were not run in Chrome.
 * SP3 was not run with an edited manifest; it rests on the tabs reference and Chromium's source.
   For 0.6.0 it was run both ways in Chrome for Testing 156: with `host_permissions` narrowed,
   `captureVisibleTab` refused even on the listed origin, as stated.
 * PI9 was observed on React 19.2.0 from a CDN build; the size of the drift under Vite or Next was
   not measured.
 * The Vue `_vei` and Svelte `__svelte_meta` claims were read from each project's source, not run.
+  For 0.7.0 `__svelte_meta` was run in Chrome on Svelte 5.58, Svelte 4 and SvelteKit builds; the
+  `_vei` claim is still unrun.
 * Whether tamper or bot checks on real sites react to the wrapped natives (CO14) was not tested.
 * How a model actually behaves on the noisier prompts (PJ17, PJ18) is a reading of the output, not
   an experiment. Settling it means running the previews through Claude Code against a fixture
   repository.
+* For 0.7.0 no screen reader was run (NVDA, JAWS or VoiceOver): not on the row moves, nor on
+  whether "Item 1 is already first." is read again after the live region is emptied and refilled,
+  nor on the Mark up canvas and its announcements, nor on the picker's tag. Only the accessibility
+  tree and the live region's text were checked.
+* For 0.7.0, the row drags ran through CDP's intercepted drag events, so no drag loop of the
+  operating system's ran. Esc during a drag was checked as Chrome's own cancel of the drag, since an
+  Escape sent through CDP does not reach a drag it intercepts, and the `dragend` Chrome sends after
+  a real drop was not seen, since it sends none after a CDP drop.
+* For 0.7.0, the "Save as" dialog itself was never pressed. Whether it closes when the worker
+  cancels its download, and that pressing Save afterwards writes no file, was not seen; the API
+  side was (interrupted with `USER_CANCELED`, then erased). Accepting the dialog for a second
+  marked copy was not run either; its " (1)" name was checked without a dialog, and it appears only
+  while the earlier marked copy is still on disk. A save waiting on the dialog was cancelled only
+  after `chrome.sidePanel.close`, not after a window close or `Target.closeTarget`.
+* For 0.7.0, the side panel's own close button could not be pressed, and is taken to behave as
+  `chrome.sidePanel.close` does. Chrome quitting within a discard's undo (expected to leave the
+  files, as the README and `docs/ARCHITECTURE.md` say) and a worker stopped by Chrome's own idle
+  timer over minutes while a dialog waits (only CDP `stopAllWorkers` was run) were not observed.
+  `state.deleting`, which keeps a delete already under way on the worker's list, was checked only
+  in the test model of Chrome.
+* For 0.7.0, the clock set back fix ran with Playwright's page clock, a fake `Date` in two panel
+  pages, over Chrome's real `storage.onChanged`, not with a change of the system clock.
+* For 0.7.0, only Chrome for Testing 156 was run, not Chrome 116, the minimum.
+* For 0.7.0, the framework readers ran against builds served as static files. Not
+  run: a dev server with hot module replacement (SvelteKit's `npm run dev`, `ng serve`, Vite with
+  `@vitejs/plugin-vue2`); a vue-loader project (Vue CLI or webpack, whose `__file` is relative),
+  where `@vitejs/plugin-vue2` was run instead; the Angular DevTools extension, whose calls were
+  stood in for by calling `window.ng` in the same order; and `@angular/material`'s `mat-menu`,
+  where the CDK `cdkConnectedOverlay` it is built on was run, JIT and AOT.
+* For 0.7.0, Page's notice for a page that scrolls itself ran only on Locomotive Scroll 4.1.4, and
+  Lenis 1.1.20 was captured whole. Locomotive with `data-scroll-section`, other such libraries, and
+  a scroll lock with no backdrop over a page whose tall wrapper is moved up (which would be told it
+  scrolls itself, F85) were not run, and the rule that a cover at opacity 0 holds nothing ran only
+  in the page realm. Mandatory scroll snap ran on fixtures only. The corrected Stop count was rerun
+  only on a local 30,000 px page at 1x and 2x, not on the Wikipedia, MDN and GitHub pages where 6/7
+  was seen.
 
 ## Implemented after the review
 
 The first three subsections on 2026-11-16, on the branch `review-fixes`, and their line references
 point at that branch. The fourth, for 0.6.0, on 2026-11-17, on the branch `open-items`; its line
 references point at that tree. The fifth, for 0.6.1, on 2026-11-17 and 2026-11-18; its line
-references, and those in the table after it, point at the 0.6.1 tree. A note in parentheses marked
-"since 0.6.1" in an earlier subsection says what changed later.
+references, and those in the table after it up to F71, point at the 0.6.1 tree. The sixth, for
+0.7.0, on 2026-11-18 and 2026-11-19, on the branch `release-0.7.0`; its line references, and those
+in the table's rows from F72 on, point at the 0.7.0 tree. A note in parentheses marked "since
+0.6.1" or "since 0.7.0" in an earlier subsection says what changed later.
 
 ### Items 2 and 3 of the top 5
 
@@ -1344,7 +1431,11 @@ open items. Items that turned out to be fixed already are marked so. Line refere
   pointer or the keyboard is on Undo (`:1472`), a save that fails for a discarded item takes it out
   of the trash (`:1502`), and Undo after Discard all brings a hand copy's receipt back (`:1564`).
   Closing the panel within the six seconds deletes the files at once. Discard all moved to the far
-  end of the sheet's own row (`sidepanel/panel.html:157`).
+  end of the sheet's own row (`sidepanel/panel.html:157`). (Since 0.7.0, which found that in 0.6.1
+  this failed in real Chrome: with `chrome.sidePanel.close` or a window close, Chrome dropped the
+  calls the panel made on `pagehide`, which went through only with CDP `Target.closeTarget`, so the
+  files stayed. The worker now deletes them once the panel has gone; see "The close path" under
+  "The roadmap, for 0.7.0".)
 * SS6 (improvement 23). The prompt numbers items as the sheet does: the panel sends each ticked
   item's position (`sidepanel/panel.js:2445`), and the template uses those numbers when they rise
   strictly (`shared/prompt-template.js:2265`).
@@ -2175,6 +2266,264 @@ fifth round, and each is now fixed or written down.
   Chrome, and every round so far opened edges that only such a rerun found. The cost: the low edges
   in the F48, F50 and F71 rows stay, each with what it costs.
 
+### The roadmap, for 0.7.0
+
+What was asked: the five items of the README's Roadmap as 0.6.1 left it (reorder the sheet, mark
+up a capture, whole page screenshots, more frameworks, the component name while hovering), built
+under four decisions the owner made on 2026-11-18. A whole page is one PNG of at most about 10,000
+device pixels, cut short past that, with no slices. A marked copy replaces the file, and only the
+captures the open panel took can be marked up, its newest 10 or about 100 MB. Svelte (props from
+5.58), Vue 2 and Angular are read at a pick, names only on hover, and Angular never on hover. And
+the five ship as one release, 0.7.0. Line references point at the 0.7.0 tree (`b0bc439`).
+
+How it was checked. Each feature was built as a package, each change with a test, then reviewed
+adversarially and fixed, each fix with a test that fails without it, and most of those checked by
+putting the old code back one change at a time. The packages went in on
+two tracks, reorder, Mark up, Page and the clock fix on one (`2779f0a`, `64ee5c5`, `5975368`,
+`297bdbd`), and the hover name, the framework readers and the Angular put back on the other
+(`8e01f38`, `0f1ac69`, `22a18a6`), merged at `4306e4b`. Three checkers then ran the merged tree in
+Chrome for Testing 156 with the unpacked extension, in the real side panel wherever a check needed
+one (run `wf_71c2c1b0-a14`): 88 checks passed, 5 failed, and 9 could not be run there, which are
+under "Not verified in real Chrome". The five failures: closing the panel while a marked copy
+waited on a "Save as" dialog left that download running, and closing it within a discard's undo
+left the file on disk with no item naming it, both from one cause that 0.6.1 already had for
+discards; a page scrolled by Locomotive Scroll's smooth mode was filed as one screen under a notice
+that blamed a dialog; on a narrow page the picker's hint covered the tag; and F72, known from the
+build and now confirmed. Two more bugs turned up inside passing checks: the Stop count at the cap,
+and the arrow keys on a whole page item's frame with a mode armed. A fix round on 2026-11-19 (run
+`wf_b3043620-c78`) took all of them but F72 in two tracks, each reviewed and fixed again and
+checked in Chrome against the fix: the polish (`c8b4706`) and the close path (`b0bc439`).
+
+**Reorder (proposal 11, lead 8).**
+
+* A row moves by a drag, from its thumbnail or its pick button, or with Alt (Option on a Mac) and
+  the up or down arrow on a focused row (`sidepanel/panel.js:5952`). The drag carries the panel's
+  own type and no data (`:1280` `ROW_DRAG`), and a drop counts only when this panel started the
+  drag and the type is its own (`:1284` `ownDrag`), so a file or another window's row is not taken.
+* The review called it close to an array move. It was not: since the item merge of improvement
+  14, `adoptStored` sorted the items by `capturedAt` on every open and every write it adopted, so a
+  moved array went back to capture order at the next write, and the template split the log in list
+  order, so a moved item would have taken another's entries. The order is now an optional `rank` on
+  each item, merged under `editedAt`, the stamp the intent and the tick already share (`:5266`),
+  and refused past 2^52 (`:4932` `MAX_RANK`), short of 2^53, past which adding one changes nothing
+  and a capture could no longer land after it. Every list is sorted by `bySheetOrder` (`:1580`,
+  `:5319`), a new capture always joins at the end (`:1602` `rankAtEnd`), Copy lists the ticked
+  items in their places (`:4569`), and the log is split by `capturedAt`
+  (`shared/prompt-template.js:2646`), so each item keeps what was logged before its own capture.
+  Going back to 0.6.1 drops `rank` at its next write and shows capture order.
+* In Chrome, in the real side panel, and in two of them in two windows where a check needed a
+  second, all 12 checks passed: a move in one showed in the other after 3 to 4 ms, and a tick made
+  in the second at the same moment held in both; a drag held 5 px above the bottom of a list of 12
+  rows scrolled it to the end (`scrollTop` 432) in 1.5 s; Esc, a rebuild of the dragged row by the
+  other window's write, the live region ("Item 3 is now item 2 of 3."), Alt with an arrow while
+  Region is armed, and the copied prompt's order and log all held. The drags were driven with CDP's
+  intercepted drag events, with no drag loop of the operating system's, so Esc was checked as
+  Chrome's own cancel of the drag.
+
+**Mark up (proposal 16, lead 8).**
+
+* Arrows and ellipses on a canvas over the frame, drawn with the pointer, or with the arrow keys
+  and Enter (`sidepanel/panel.js:3734` `openMarkup`, `:3530` `MARK_TOOLS`, `:3646` `drawMarks`),
+  in one magenta over a white edge whatever the theme (`:34`). The prompt says the magenta marks
+  are the user's own and not part of the page (`shared/prompt-template.js:241` `MARKS`).
+* Proposal 16's premise was wrong: marking up does not run before the save. The capture is saved
+  at once, as before, and the panel that took it keeps the clean image in memory, never stored, for
+  its newest 10 captures and about 100 MB together (`sidepanel/panel.js:40`, `:41`, `:3548`
+  `holdFull`, `:3571` `trimFulls`). Any other item, a whole page one included, says why it cannot
+  be marked up (`:3590` `markupBlocked`). Done saves a `_marked` copy (`:4135` `saveMarks`),
+  moves the item onto it under a `fileAt` stamp merged per item (`:4221`, `:5283`), and then
+  deletes the old file (`:4207` `swapFile`, `:4229`). Going back to 0.6.x keeps a marked item on
+  its marked file, without the MARKED label or the prompt's sentence.
+* In Chrome, in the real side panel: a drag that left the panel ended at the canvas edge; the
+  marked copy was complete in 219 ms, and the original was erased from Chrome's list and gone from
+  disk; a second marked copy got " (1)" and the first was deleted; of 12 captures of 3840 by 2160
+  at 2x the two oldest were dimmed, and of noisy captures of 23.8 MB each only the 4 newest were
+  held (95 MB). Chrome kept those images file backed in the profile's blob storage (77 MB) and
+  released them 22 to 27 s after the panel closed. Done on a flat 3840 by 2160 capture took 704 ms
+  (`toBlob` 528 ms), and on the worst case, noise, 6,978 ms, almost all of it in `toBlob`, with
+  SAVING shown throughout.
+
+**Whole page (proposal 18, lead 8).**
+
+* Page scrolls the page and files one stitched PNG (`sidepanel/panel.js:3112` `capturePage`,
+  `:2911` `scrollAndShoot`, `:3057` `composePage`), through a script injected for the run
+  (`content/page-shot.js:561` `begin`, `:625` `step`, `:665` `end`). It is at most 10,000 device
+  pixels tall, 2^26 pixels in all and 100 screens (`sidepanel/panel.js:48` to `:50`); past that it
+  stops at full resolution, and the item reads CUT SHORT and says how much it shows (`:2683`
+  `pageCutNotice`). Screenshots are paced 520 ms apart, under `captureVisibleTab`'s two a second
+  (`:52`). An element fixed to the top or the bottom shows once, also in a closed shadow root, which
+  is looked for on every element that can host one (`content/page-shot.js:171` `shadowOf`). A page
+  that has locked its scrolling is filed as the screen in view, unscrolled (`:594`). An older
+  build reading the sheet shows a page item as CAPTURE.
+* Input on the page, a tab switch, a resize or a navigation stops the run and files nothing
+  (`sidepanel/panel.js:2672` `pageStopReason`). So does a run the page ended by itself after its
+  last step answered (`:3039`). Either way the page is put back as it was, by the panel or, if the
+  panel stops calling, by the page's own lease after 4 s (`content/page-shot.js:32`).
+* In Chrome, in the real side panel: a long fixture took 5 screens in about 2.4 s at 2x and filed
+  2028 by 7828, the header once, the bottom bar once, the lazy image drawn, with the page's markup
+  byte for byte as before and its scroll position back; a 30,000 px page was cut at 10,000 device
+  pixels, after 6 screens at 2x (2028 by 10,000) and 12 at 1x; two windows pressing Page 42 ms
+  apart both filed, the first round on the quota retry path at about 1.17 s a screen against 0.55;
+  a navigation, a tab switch, a resize and closing the panel in the middle of a run each filed
+  nothing and left the page as it was, and with the panel paused in the debugger the lease put the
+  page back at 4,071 ms. Mandatory scroll snap, Lenis 1.1.20, a virtual list, lazysizes, 150% zoom
+  and closed roots on custom elements came out with no repeated header and no missing band, as did
+  pages of Wikipedia, MDN and GitHub, save one seam on Wikipedia (F87). About 60 runs logged no console error. On a physical 2x
+  display at the cap, the extension's renderer peaked 146 MB above its baseline and the GPU process
+  263 MB, with no growth over three runs.
+
+**Svelte, Vue 2 and Angular at a pick (proposal 7 in part, leads 3 and 8).**
+
+* Svelte development builds, 3 to 5, give the component, the element's place in its file, the
+  chain of parents from 5.36 and the props from 5.58 (`content/collector-main.js:4587`
+  `svelteSummary`). Vue 2 gives the component, its file in a development build, the chain and the
+  props, in production builds too, without saying which build (`:4325` `vue2Summary`). Angular
+  development builds are asked through the `window.ng` functions Angular publishes for its
+  DevTools, at a pick only (`:4992` `angularRead`), with inputs under their public names (`:4933`
+  `angularInputs`). The props of all three go through the masking React and Vue 3 use (`:3170`
+  `summariseProps`), judged against the fields inside the component's elements (`:3152`
+  `domGuard`). Handlers are still read on React and Vue 3 only. The framework field is a table in
+  the template (`shared/prompt-template.js:376`), and the picker drops a framework no collector
+  sends (`content/picker.js:1121`).
+* An aliased Angular input whose class property has a secret name (`@Input('value') password`)
+  printed its value in the first build. The package's review found it: an input is now filed under
+  its class property when only that name looks secret, so the name rule withholds it
+  (`content/collector-main.js:4947`), and two inputs that land on one name are listed once.
+* The Angular put back. Angular's `window.ng` functions cache an LContext in `__ngContext__` on the
+  elements and instances they are asked about. At `0f1ac69` a pick changed 5 to 9 such objects, and
+  the page's own `JSON.stringify` of an instance in the chain then threw on a cycle. Now each object
+  a call can change is noted before that call and put back in a `finally`, through natives taken at
+  document start, each step in its own try (`:4785` `noteAbove`, `:4819` `noteHost`, `:4859`
+  `putBack`). Over 15 scenarios in Chrome, nothing changed in 13 and the other 2 are the case F76
+  keeps; a pick through a portal took a median of 0.10 ms and at most 0.30 ms.
+* In Chrome, through the real picker and side panel: Svelte 5.58, Svelte 4 and a SvelteKit project
+  from `npx sv create` built in development mode, every tag matching its pick, and the SvelteKit
+  production build with no Component line; Vue 2.7.16 built with Vite 6 and `@vitejs/plugin-vue2`,
+  development and production, every tag matching its pick; and Angular 22.3.0, JIT and AOT, where
+  the AOT build gave `Defined in src/app/coupon-field.ts:8` from Angular's debug info and the
+  production build no Component line. The put back held through the real picker, after calls in the
+  order Angular DevTools makes them, and in a CDK `cdkConnectedOverlay`, JIT and AOT, where only
+  F76's case changed anything. Password values, `apiToken`, `apiKey` and props aliased from such
+  names were withheld on React, Vue 3, Vue 2, Svelte 5 and Angular; what the CDK overlay printed is
+  F73.
+
+**The name on hover (proposal 15, lead 8).**
+
+* While Element is armed, the tag names the component behind the highlighted element, the name its
+  item's Component line starts with (`content/picker.js:1510` `highlight`, `:1264` `askName`,
+  `:1317` `componentLabel`). The picker sends a composed event, `__cdr_name`, on the node itself,
+  and the collector answers it synchronously with `componentOf(node, true)`
+  (`content/collector-main.js:5504` `answerName`, `:5130` `componentOf`), so hovering writes
+  nothing into the page, posts nothing and runs no props guard. The brief read gives a name only:
+  React, Vue 3, Vue 2 and Svelte answer, Angular never does. A name the bundler made up shows as
+  `<A> minified`, and the picker cuts a name at 60 characters and writes it as text.
+* The review's account of the cost was half right. Writing `data-cdr-pick` was a cost (a mutation
+  record for each write and each removal, and `findMarked`'s walk), but the larger one was the
+  props guard, which looks through the document and its shadow roots for secret fields: a pick's
+  round trip with it took 1.24 ms at 20,000 elements and 8.5 ms at 100,000 (measured for the
+  design, in Chrome 157). A name took 2.5 to 3.5 µs at 20,000 elements and 2.7 to 4.5 µs at
+  100,000 in Chrome for Testing 156, flat, so there is no walk per name.
+* In Chrome, on real React 18.3.1 and 19.2.9 and Vue 3.5.43 builds, development and production,
+  and on the repository's demos, every tag matched its pick, in open and closed shadow roots and a
+  frame too, also with `composedPath` patched by the page, and the tag stayed on its element at
+  125% zoom. While hovering, the page's counters saw no mutation record, no message and no
+  `data-cdr-pick`. A page getter that moves the focus while the name is read left the tag where it
+  was. What a tab left open across an
+  update shows is F79, and where the tag and the pick disagree is F72.
+
+**Fixed in the same release.**
+
+* **The clock set back** (`297bdbd`; found while building reorder, and in 0.6.1 too). `readItem`
+  capped every stored stamp at the clock while a panel kept its own as they were, so with the clock
+  set back and two panels open, each wrote its copy back to the other until the clock passed the
+  newest stamp: on `f3de62c`, a set back of one hour and a capture in the other window gave 2,418
+  writes before the test was cancelled. A change made after the set back did not reach the other
+  windows, and a discard came back. Now a stamp more than two days ahead of the clock counts as
+  none, for what storage holds and for the panel's own copy (`sidepanel/panel.js:65`
+  `STAMP_AHEAD_MS`, `:1523` `tooFarAhead`, `:1538` `forgetFarStamps`). No write carries a far
+  stamp, and a panel that reads one writes the sheet back at once, on opening too, so every open
+  panel forgets it at the same write (`:1552` `forgetFarSheet`, `:5155` in `readReport`, `:5243`
+  and `:5356` in `adoptStored`). Changes are stamped from stamps a merge believes (`:1497`
+  `touch`, `:4221` in `swapFile`), and a discard or a copy after the item's last change (`:1566`
+  `leftAt`). In Chrome, with Playwright's page clock in two panel pages over Chrome's real
+  `storage.onChanged`, set backs of an hour and of seven days gave one write for each action, a
+  stamp planted a year ahead three writes in all (the plant and one from each panel), and a third
+  page opened after the set back one. Tests: "a clock set back" in `test/sheet.test.mjs:2685`. What
+  the package found and left is F81 to F83.
+* **The close path** (`b0bc439`; found in real Chrome, and since 0.6.1 for discards). With
+  `chrome.sidePanel.close` or a window close, Chrome dropped the `chrome.downloads` calls the panel
+  made on `pagehide`; only CDP `Target.closeTarget` let them through, which is what the old
+  comment's "checked in Chrome" rested on. A discard closed within its undo left the file on disk
+  and in Chrome's list with no stored item naming it, where the README said "Closing the panel
+  before then deletes them at once", and a marked copy or a first save behind a "Save as" dialog
+  stayed in progress after the panel had gone. Now the panel holds the `cdr:panel` port while it has
+  anything to take back and posts the ids with `cdr:pending` (`sidepanel/panel.js:2369` `holdArm`,
+  `:2447` `pendingDownloads`, `:2473` `notePending`), and the worker settles them when the port
+  closes, only for this extension's downloads whose file no stored item names, with every call
+  caught, and looks a download up again after cancelling it, in case it finished in between
+  (`background.js:938`, `:977` `pendingIds`, `:998` `settlePending`, `:1014` `settleDownload`). A
+  delete already under way stays listed until both its calls have answered (`sidepanel/panel.js:368`
+  `state.deleting`, `:4383` `deleteFile`). Rerun in Chrome against the fix, every file was deleted
+  or cancelled: a discard then a panel close, a discard then a window close, a marked copy and a
+  first save behind "Save as", and a worker stopped during the undo. Without the fix the file
+  stayed. Tests: `test/worker.test.mjs:534` on, and "what a closing panel leaves" in
+  `test/sheet.test.mjs:3088`. What it leaves is F91 and F92.
+* **Polish** (`c8b4706`), what the real Chrome check found:
+  * A locked page whose content was moved up by a transform, with nothing visible covering half the
+    view (a cover at `visibility: hidden` or at opacity 0 does not count), gets its own notice, that
+    the page moves its content with a script; any other locked page gets one that names both causes
+    (`content/page-shot.js:285` `scrolledByScript`, `:262` `liftedOnly`, `:599`;
+    `sidepanel/panel.js:2643`, `:2645`, `:3154`). In Chrome, Locomotive in a window 1,800 px wide at
+    2x got the first, and the modal, the clip and Locomotive under a backdrop or a modal dialog the
+    second. What is left is F85.
+  * The Stop count is held to the cap from the first screenshot and ends on the screens taken
+    (`content/page-shot.js:603` `ratio`, `sidepanel/panel.js:2868` `pageReach`, `:2880`
+    `pageScreens`, `:3013`): on the 30,000 px page, 0/6 to 6/6 at 2x and 0/12 to 12/12 at 1x,
+    where it read 0/34 and then 6/7.
+  * With Region or Element armed, the arrow keys scroll the focused frame of a whole page item
+    (`sidepanel/panel.js:6000` in `forwardsKey`), as the README said they do: 0 to 80 in Chrome,
+    where they had not moved it.
+  * The memory figures for composing a whole page are the measured ones: 146 MB and 263 MB in
+    `docs/ARCHITECTURE.md`, about 150 MB and 260 MB in the README and `PRIVACY.md`, where the docs
+    had counted only a canvas of up to about 100 MB and one decoded screenshot.
+  * The picker's tag draws above its hint, and the hint wraps across the page inside 12 px margins
+    (`content/picker.js:1435`, `:1464`): at an `innerWidth` of 374 the hint is 350 px wide and
+    44 px tall and the tag is readable, where the hint had wrapped to four lines and covered the
+    name of an element near the top. Older than 0.7.0; the overlay's hint keeps the problem (F90).
+  * The README says that a Vue 3 production build shows no name, no Component line and no Handlers
+    line, checked in Chrome on Vue 3.5.43.
+
+  Tests: `test/page-shot.test.mjs:317`, `:379`, `:1117`, `:1137` and `:1207`,
+  `test/panel-ui.test.mjs:2303` and `test/picker-events.test.mjs:1976`.
+
+**Judgment calls.**
+
+* **F72 is left for a later release.** The fix round took every other failure of the real Chrome
+  check. The cost: on a page of more than 20,000 elements, a component in an open shadow root past
+  the walk is named on the tag and missing from the item.
+* **Past two days a stamp counts as none, rather than being capped.** A cap is worth the moment
+  each panel read it, so the panel that read last would win over a change made in between. The
+  cost: near the two day line an old stamp can win once more, and past it a removal from before the
+  set back is forgotten (F83).
+* **A navigation inside the document does not stop a whole page capture.** Chrome reports
+  `pushState`, `replaceState` and hash changes to `tabs.onUpdated` as loading, and an endless feed
+  changes its URL while it is scrolled. The cost: a run can go on over a new route (F88).
+* **The Angular put back stops short of a temporary accessor.** One would make F76's first case
+  exact, but it puts an accessor on a page object while Angular runs, which a page wrapper around
+  `ng.getHostElement` could see, and can leave V8 a slower object shape, all for a state Angular
+  reads the same way. The cost: that case (F76).
+* **The worker settles only what it is told, and only this extension's downloads that no stored
+  item names.** A malformed list settles nothing, and an id the panel has not held to its file (one
+  Chrome may have reissued after a restart) is listed only once Chrome's record matches the item's
+  path, since listing it earlier could cancel another window's save. The cost: a save with no id
+  yet (F91), and a worker stopped as the panel closes (F92), are not settled.
+
+`npm test` passes 895 tests in 13 files on Node 22.21.1 and 24.10.0 (648 in 12 files in 0.6.1, and
+866 at the merge `4306e4b`); the new file is `test/page-shot.test.mjs`. There are 35 goldens: 7 are
+new (`angular`, `full-page`, `full-page-list`, `list-marked`, `marked`, `reordered`, `svelte`), and
+none of the 28 of 0.6.1 changed, so every prompt they hold, one item and lists, prints byte for byte
+as before.
+
 ## Found while implementing, not fixed
 
 F21 and F24 to F29 were fixed for 0.6.0, at the lines of that tree the subsection for 0.6.0 gives.
@@ -2192,15 +2541,19 @@ were checked against the code, at `tools/release-check.mjs:178` (`tagCommitOf`).
 F38, F39, F41, F48, F50 and F52 were fixed in part, and their rows keep only what remains. F31 and
 F45 were tried and taken back, and their rows say what a safe version needs. F30, F32, F33, F34,
 F42, F44, F47 and F49 were checked again and kept, with what was measured. F60 to F66 and F68 to F71
-are new: what the 0.6.1 rounds found and left, each with what it costs. Each row says whether it is
-older than the round that found it.
+are new: what the 0.6.1 rounds found and left, each with what it costs. 0.7.0 fixed none of these
+rows. F32 gained a sentence, since the hover's name request is open to a page script too, and F48
+one, since its rules now also judge the props of Svelte, Vue 2 and Angular components. F72 to F92
+are new: what the 0.7.0 rounds and their check in real Chrome found and left, each with what it
+costs. The rows up to F71 point at the 0.6.1 tree, and the new sentences in F32 and F48 and the
+rows from F72 on at the 0.7.0 tree. Each row says whether it is older than the round that found it.
 
 | Id | Where | What | Fix |
 | :--- | :--- | :--- | :--- |
 | F10 | `content/collector-main.js:2107` (`backstop`), `:2081` | A page listener added before the first `open()` that stops every event a failed request ends with (the `readystatechange` to DONE, then `load`, `error` or `timeout`, then `loadend`) still hides it until the object is opened again. Stopping `loadend` or `timeout` alone has not hidden one since 0.6.0, and stopping `readystatechange` and `loadend` together has not since 0.6.1: the collector settles a failed request a task later from whichever of those events reaches it first, with one timer per request, and labels a status 0 end that lasted the timeout as a timeout. Low; also at `a0c9335`. | Not fixable short of replacing the `XMLHttpRequest` constructor. Listeners on one target run in the order they were added, whatever their capture flag (Chrome for Testing 156), so only the constructor comes earlier, and a Proxy of it would print `function () { [native code] }` (F34), and `XMLHttpRequest.prototype.constructor` would no longer be `XMLHttpRequest` unless the collector rewrote the native prototype, on every page. |
 | F30 | `content/collector-main.js:703` (`walk`) | `serialize()` no longer uses `JSON.stringify` (0.6.0). What remains is the list of an object's keys, which V8 collects whole before handing out the first: about 100 ms for an object of a million keys, in the page's thread, and only for an object the page hands to `console.error` or `console.warn`. Low; also at `a0c9335`, slower there. | Not fixable from a script. Measured in Chrome for Testing 156 on an object of a million keys: a for-in that stops at its first key takes 92 ms, `Object.keys` 93, `Reflect.ownKeys` 159, `Object.getOwnPropertyNames` 154, a `JSON.stringify` whose replacer stops at the first key 100, and a for-in over a proxy of the object 193, against under 0.1 ms for a thousand keys. Nothing a script can call hands out a key before the whole list is built. |
 | F31 | `sidepanel/panel.js:2920` (`checkFiles`) | Chrome looks at the disk at most once every ten seconds, for all downloads together, so a screenshot deleted within about ten seconds of its last look is still copied. A copy whose page read beats Chrome's answer also names the file, and then says so on the receipt. Low; also at `a0c9335`, where nothing was checked after startup. | Not fixable with Chrome's records: no downloads API makes Chrome look sooner. Tried for 0.6.1 and taken back. Where Chrome allows file access (the Allow access to file URLs switch, on for the unpacked extension in Chrome 156), the panel opened the file URL of each screenshot and listed its folder when the file did not open. The checks in Chrome for Testing 156 found three problems. An open on a volume that stops answering stays blocked in one of Chrome's file threads, which Chrome cannot cancel, and the panel opened each such path once per panel page: 60 items took the browser process from 44 to 101 threads, 300 took it to 286, and a sheet of 30 with the panel reopened 9 times reached 288, past which an unrelated file URL did not open within 5 s and downloads stalled across the whole browser. A file that exists but will not open, in a folder Chrome lists as empty (mode 311), was called missing, held Copy back and stayed missing at every later check, though Chrome's record said it existed. And a deletion a second before Copy was still missed in folders of about 2,000 files or more (smaller ones on a slower machine), because the listing did not end within the copy's wait. With 0.6.0's behaviour back, 300 quiet items leave the browser at 40 to 41 threads and 9 reopens at 42 to 45, unrelated file URLs open in about 1 ms, and downloads complete in about 55 ms. A safe version needs: one late open marking its whole folder or volume as not answering, with no more opens there until it returns; a cap on the opens a page leaves outstanding; that state shared by every panel page, in every window and across reopens; an empty listing taken as no answer when Chrome's record says the file exists, with the missing shortcut used only when the record agrees; disk asks that outlive the copy's wait, with a late gone said on the receipt and naming the disk; and `PRIVACY.md` and the README saying that the panel opens its screenshots' file URLs and lists their folder. |
-| F32 | `content/collector-main.js:116` (`PROBE`), `content/collector-bridge.js:60` (`HELLO`) | A page script written against this extension can tell it is installed, by the probe event a running collector answers. It can open a channel of its own and read its log, or push the live bridge's channel out with eight of them, and it can watch the counts on a channel of its own, which say less than the log. When the extension starts on a tab already open, it can overhear the bridge's channel and answer in the collector's place, a collector started late takes the page's builtins as they are then, and a page that heard the bridge's HELLO can send `unwatch` on the bridge's own channel, which holds the live chips back until the panel's next read, though it can no longer make the bridge drop the panel's port. On a declared start it never learns the channel, and cannot hold the counts back. On a declared site's undeclared path it can answer the worker's probe and get a bridge. None of this puts into a prompt more than logging made up lines would. Low; new with CO14 and improvement 9, the `unwatch` with F46. | Not fixable for code in the page's world: the guard needs a signal both copies of the collector can see there, which the page sees too, and a tab already open has no path between the worlds that a page listener cannot hear. Nor would a silent probe hide the extension. In Chrome for Testing 156 a page with the collector running also reads `punch-list://extension/collector-main.js` in the stack of an error thrown through a wrapper (`new XMLHttpRequest().open('GET')`), gets an answer over the picker's protocol, and reads `function () { [native code] }` for `fetch` (F34). The address is the collector's sourceURL, kept for the console cost (judgment calls). The bridge on undeclared paths is kept on purpose (judgment calls). |
+| F32 | `content/collector-main.js:116` (`PROBE`), `content/collector-bridge.js:60` (`HELLO`) | A page script written against this extension can tell it is installed, by the probe event a running collector answers. It can open a channel of its own and read its log, or push the live bridge's channel out with eight of them, and it can watch the counts on a channel of its own, which say less than the log. When the extension starts on a tab already open, it can overhear the bridge's channel and answer in the collector's place, a collector started late takes the page's builtins as they are then, and a page that heard the bridge's HELLO can send `unwatch` on the bridge's own channel, which holds the live chips back until the panel's next read, though it can no longer make the bridge drop the panel's port. On a declared start it never learns the channel, and cannot hold the counts back. On a declared site's undeclared path it can answer the worker's probe and get a bridge. None of this puts into a prompt more than logging made up lines would. Since 0.7.0 the hover's name request is open to such a script too (`content/collector-main.js:5488`, `NAME_REQUEST`, in the 0.7.0 tree): it can be told the name of the component behind a node of its own, which also tells it the extension is installed, hear the picker's requests and so learn which element the highlight is on, and answer in the collector's place, which reaches no further than the tag, since the picker cuts the reply to a name of at most 60 characters, writes it as text and never puts it in a prompt. Low; new with CO14 and improvement 9, the `unwatch` with F46. | Not fixable for code in the page's world: the guard needs a signal both copies of the collector can see there, which the page sees too, and a tab already open has no path between the worlds that a page listener cannot hear. Nor would a silent probe hide the extension. In Chrome for Testing 156 a page with the collector running also reads `punch-list://extension/collector-main.js` in the stack of an error thrown through a wrapper (`new XMLHttpRequest().open('GET')`), gets an answer over the picker's protocol, and reads `function () { [native code] }` for `fetch` (F34). The address is the collector's sourceURL, kept for the console cost (judgment calls). The bridge on undeclared paths is kept on purpose (judgment calls). |
 | F33 | `content/collector-main.js:151` (`LATE`) | A page can hide what its own log says about its start. On a late start into a page still loading, a listener it added earlier can stop the event the collector sends as it starts, or it can make `document.readyState` lie, and the late caveat goes. A false caveat needs code that runs before a declared collector, which a page's own script never does: another extension's document_start script in the page's world that cancels that event, or makes `dispatchEvent` cancel every event. An opener cannot plant a listener on a popup's first window either: in Chrome for Testing 156 the page the popup went to had a window of its own, after `window.open()`, `window.open('')` and `window.open('about:blank')`. Low; new with improvement 9. | Not worth it: it changes only what a log says about its own start, not what it holds, and only for code written against this extension or one that breaks `dispatchEvent` for every page. The event is the one path from the worker's world to the collector; any other signal the two worlds share is in the DOM, where every page script and observer would see it. |
 | F34 | `content/collector-main.js:1026` (`wrapNative`) | A wrapper's `toString` reads `function () { [native code] }`, as V8 writes it for any callable proxy, where the native's reads `function fetch() { [native code] }`. A script looking for wrappers in general can tell. Low; new with CO14, which replaced named wrappers whose source printed. | Not worth it: answering it would mean replacing `Function.prototype.toString`, which every page uses. Checked in Chrome for Testing 156: a Proxy with no trap, a Proxy with a trap and a bound function each print `function () { [native code] }`, and only the native prints its name. A replacement of `toString` prints that text for itself unless it lies about itself too, and adds its own frame to the stack of every error it passes on (checked in V8). |
 | F35 | `content/collector-main.js:1915`, `:359` (`beforeZone`) | On a late start, `setTimeout`, `addEventListener` and, since 0.6.1, `Error` are taken from the natives zone.js keeps under its own names, so recording a request adds no task to an Angular zone and runs no `ZoneAwareError`. Anything else that replaced them before the start, fake timers for one, is used as it is, and the collector's timer and listeners go through it. Low; new with improvement 9. | Not fixable from the page's world: after the page has run, an untouched copy can only come from a new realm (an iframe), which would change the page. Another way to wait a task, a `MessageChannel`, is the page's to replace as much, and switching to it would change every page for the sake of a test clock. |
@@ -2213,7 +2566,7 @@ older than the round that found it.
 | F44 | `sidepanel/panel.js:1262` (`focusDescription`) | After a Region drag the panel puts the caret in the field, but the page keeps the keyboard, so typed characters go into the page's focused input until the user clicks the panel. The panel says so under the field. Medium (UX5); also at `a0c9335`, unsaid. | Not fixable from the panel. Checked again in Chrome for Testing 156 with a real side panel. The panel hears the drag's message with the user activation the content script's message carries, and in that same task `chrome.sidePanel.open` and `chrome.windows.update` with `focused` resolved and `window.focus()` ran. After each, the panel still reported `document.hasFocus()` false. Only a click into the panel moved the keyboard. Blurring the page's element on arm would change the page. |
 | F45 | `sidepanel/panel.js:2691` (`writeReceiptNote`) | A screenshot whose download record Chrome has erased (the download list was cleared) cannot be asked about, so the copy goes ahead and the receipt names the item as not checked. Low; also at `a0c9335`, unsaid. | Not fixable with Chrome's records: no other extension API tells whether such a file exists. Tried for 0.6.1 and taken back with F31: file URLs can answer for such a file, but asking through them brought the three problems the F31 row records. A safe version needs the same mechanisms. |
 | F47 | `content/collector-main.js:1189` (`CSP_NOTE`) | A fetch the page's CSP blocks is reported by the browser and in the site's CSP reports with the collector as its source, now named `punch-list`. The prompt says the page's policy blocked it and keeps the page's caller. Low (M4). | Not fixable, checked in Chrome for Testing 156: the report names the script of the topmost frame when the native runs. A wrapper whose trap is a function of its own is named, even when it calls the native from a microtask. A trap that is `Reflect.apply` itself, or a bound copy, names the page's line, and runs nothing that could record the request. A call deferred to run from no frame names no source at all, not the page's, and sends what the page's init holds by then: a POST the page changed to PUT just after calling went out as PUT. |
-| F48 | `content/collector-main.js:2594` (`documentValues`), `:2759` (`editedFrom`), `:2796` (`seedLike`), `:2670` (`shadowTree`) | Props are withheld when they hold the value of a secret control in the document or in its open shadow roots, or that value changed in one place when it reads as a passphrase or a seed (white space, or 12 characters or more, and not a number of fewer than 12 digits), and, in a component that renders a password, code or card control, when a string has a secret's shape. A value no control holds and of another shape still prints (a passphrase with spaces, a password of letters only or under eight characters), as does any such value handed to a component that renders no such control, and a password under 12 characters with no space, seeded and then changed in one character, outside such a component (`Xk9#mQ2p` beside `Xk9#mQ2z`, `hunter3hunt` beside `hunter2hunt`). A card number counts by its digits only in a prop of 64 characters or fewer that holds nothing else, and its digits run together count in any prop. Grouped inside a sentence (`Card 4111-1111-1111-1111 declined` beside a field holding `4111 1111 1111 1111`), in digits other than ASCII, or grouped by commas, it is caught only when grouped as the field groups it, and a prop holding fewer than 12 of its digits prints, as does, beside a field that groups it, its digits run together with one character changed (`45391488X3436467`), both as in 0.6.0. Each held number of 12 digits or more is looked for in every string prop twice, as written and as its digits: with 63 held card numbers and twelve 1 MB props that hold none of them, a pick takes 511 to 581 ms against 245 to 282 ms in 0.6.0, and with one held card 7.0 to 7.9 against 3.1 to 3.5 ms. In a component the shape rule applies to, an ordinary code of that shape is withheld, such as a coupon code or an order number, and anywhere a string that shares three quarters of such a passphrase or seed at its ends is withheld, such as an e-mail address one character from the user's in a field named `email`, or a number of 12 digits or more one digit from the one in such a field. A field in a closed shadow root, in a root past the first 512 in depth first document order, in a root whose host comes after the first 100,000 elements, or in a frame is not found, and a field two shadow roots deep inside what a component renders brings neither the shape rule nor its `value` props. The walk is bounded in roots, in elements asked for a root and in controls read, not in the elements each root's selector looks at, about 60 ns an element: 512 roots of 2,000 elements took 58.9 ms a pick and 300 of 1,000 took 17.9 ms (0.6.0: 0.2 and 0.1 ms, since it looked into no nested root). Low; each printed at `a0c9335` too, and the costs of the walk and of the second search are new with the 0.6.1 rounds. | Not worth it for what remains: a secret is known by the control that holds it or by its shape, and judging every string by shape everywhere would withhold the ids and hashes every page passes. Catching short passwords changed in one character would withhold again what the first round's rule withheld, numbers and month labels one character from a short secret. A frame's fields belong to another document, whose values reach this one's components only through the page's own messages, and a closed shadow root answers the page's world nothing. A shared element budget would cap the walk, but one root of 10,000 elements or more, such as a data grid, would use it up and hide a field in every root after it. The bounds keep a pick at 16.1 to 17.1 ms on 300,000 elements (0.6.0: 13.0). A number held as its bare digits is searched for twice in the same form, which could be skipped (S); for a grouped one the second search is what finds its digits run together. |
+| F48 | `content/collector-main.js:2594` (`documentValues`), `:2759` (`editedFrom`), `:2796` (`seedLike`), `:2670` (`shadowTree`) | Props are withheld when they hold the value of a secret control in the document or in its open shadow roots, or that value changed in one place when it reads as a passphrase or a seed (white space, or 12 characters or more, and not a number of fewer than 12 digits), and, in a component that renders a password, code or card control, when a string has a secret's shape. A value no control holds and of another shape still prints (a passphrase with spaces, a password of letters only or under eight characters), as does any such value handed to a component that renders no such control, and a password under 12 characters with no space, seeded and then changed in one character, outside such a component (`Xk9#mQ2p` beside `Xk9#mQ2z`, `hunter3hunt` beside `hunter2hunt`). A card number counts by its digits only in a prop of 64 characters or fewer that holds nothing else, and its digits run together count in any prop. Grouped inside a sentence (`Card 4111-1111-1111-1111 declined` beside a field holding `4111 1111 1111 1111`), in digits other than ASCII, or grouped by commas, it is caught only when grouped as the field groups it, and a prop holding fewer than 12 of its digits prints, as does, beside a field that groups it, its digits run together with one character changed (`45391488X3436467`), both as in 0.6.0. Each held number of 12 digits or more is looked for in every string prop twice, as written and as its digits: with 63 held card numbers and twelve 1 MB props that hold none of them, a pick takes 511 to 581 ms against 245 to 282 ms in 0.6.0, and with one held card 7.0 to 7.9 against 3.1 to 3.5 ms. In a component the shape rule applies to, an ordinary code of that shape is withheld, such as a coupon code or an order number, and anywhere a string that shares three quarters of such a passphrase or seed at its ends is withheld, such as an e-mail address one character from the user's in a field named `email`, or a number of 12 digits or more one digit from the one in such a field. A field in a closed shadow root, in a root past the first 512 in depth first document order, in a root whose host comes after the first 100,000 elements, or in a frame is not found, and a field two shadow roots deep inside what a component renders brings neither the shape rule nor its `value` props. The walk is bounded in roots, in elements asked for a root and in controls read, not in the elements each root's selector looks at, about 60 ns an element: 512 roots of 2,000 elements took 58.9 ms a pick and 300 of 1,000 took 17.9 ms (0.6.0: 0.2 and 0.1 ms, since it looked into no nested root). Since 0.7.0 the same rules judge the props of Svelte, Vue 2 and Angular components, so all of the above holds for them too: in such a component that renders a password field, a code shaped like a password is withheld (`code=<redacted>` in `test/collector.test.mjs:5591`), and what their scope by the component's elements misses is F73 (`content/collector-main.js:3152`, `domGuard`, in the 0.7.0 tree). Low; each printed at `a0c9335` too, and the costs of the walk and of the second search are new with the 0.6.1 rounds. | Not worth it for what remains: a secret is known by the control that holds it or by its shape, and judging every string by shape everywhere would withhold the ids and hashes every page passes. Catching short passwords changed in one character would withhold again what the first round's rule withheld, numbers and month labels one character from a short secret. A frame's fields belong to another document, whose values reach this one's components only through the page's own messages, and a closed shadow root answers the page's world nothing. A shared element budget would cap the walk, but one root of 10,000 elements or more, such as a data grid, would use it up and hide a field in every root after it. The bounds keep a pick at 16.1 to 17.1 ms on 300,000 elements (0.6.0: 13.0). A number held as its bare digits is searched for twice in the same form, which could be skipped (S); for a grouped one the second search is what finds its digits run together. |
 | F49 | `content/collector-main.js:1741` (`watched`) | After a late start, a fetch promise that is not a plain engine promise (one the page decorated with an `abort` method, a Bluebird promise, a thenable) is handed back as the page's own object and watched on a side chain. Any observer marks a promise as handled, so a rejection the page leaves unhandled no longer fires the page's own unhandled rejection report, and the prompt has no `[unhandled]` line for it, though the failed request is still recorded. Low; new with improvement 9. | Not worth it: any reaction marks a promise handled (PerformPromiseThen in ECMAScript), so it cannot be watched without that. Handing back a new promise made the page's own calls on it throw (`p.abort`, Bluebird's `.tap`), and a side chain that rethrows reports a rejection the page handles. Checked in Chrome for Testing 156 with the collector started after load, on a page whose fetch decorates its promise: an unhandled failed fetch fired `unhandledrejection` without the collector and none with it, and was logged; a rethrowing side chain fired one for a rejection the page caught. |
 | F50 | `content/picker.js:978` (`PASS_SELECTOR`), `:2576` (`holding`), `:3079` (`surveyFrames`), `:2507` (`drawnSince`), `:3257` (`mount`) | Picker edges that remain. A press in the same animation frame as a page's own assignment of `adoptedStyleSheets`, with no pointer move since, can reach a frame. When the page's new sheet list is restyled before the sheet goes back (it reads a style or forces layout right after setting the list, or sets it in an animation frame callback added after the picker's), a frame with a discrete `pointer-events` transition runs it and the page hears it, as in 0.6.0. A frame whose own `pointer-events` is an inline `!important`, an `!important` in a cascade layer of the page's, or one with more than eight ids keeps a shield, under which a hover menu loses its hover. On a page that spaces `body`'s children by margin (`space-y`), the page shifts by the full gap while armed (4 px on a vertically centred test page), which is undone before the element is read and photographed; the fix that moved the host after `body` was reverted. The fallback content of an `<object>` shows no hover while picking. When no frame among the first 2,000 found has a discrete `pointer-events` transition, one beyond them is adopted without a hold: the page hears its transition at the arm, and for half of it the frame takes a press. A frame that gains such a transition after the arm, while none had one, is found by the next survey (within 15 frames) or when the pointer reaches it, and picking that ends before then removes the sheet without a hold. So is a frame not drawn at the survey that the page removes and puts back after a move (in Chrome, 9 transition events on three moves and 3 at an Escape, as in the fourth round; the fifth held it), and an Escape in the same animation frame as the page scrolls such a frame into view gives the page 3 events, as in 0.6.0, since the frame is drawn only after the sheet is gone. A frame drawn before the arm and then hidden with `content-visibility: hidden` gives the page 2 events at the arm, as in 0.6.0, and 1 when the page shows it while armed, since its transition runs as it is drawn with the sheet in place (0.6.0: 13). A frame drawn before the arm and then scrolled into skipped content takes a press made right after the page scrolls it back, as in 0.6.0. A page that puts back a stale copy of its sheet list holding the picker's emptied sheet can make the next arm add the rule without a hold. Asking every frame costs a page of 2,000 plain iframes 1.0 to 1.2 ms a survey, about four times a second, where the second round's survey took 0.3 ms (at the arm 3.8 to 6 ms against 2.6 to 2.8), and once such a frame is found every lift pays one more restyle (5.4 to 7 ms against 3.2 to 3.7 ms on that page). While 1,999 frames sit in skipped content or with `display: none`, asking those again costs each move over a frame about 0.5 ms (3.8 to 3.9 ms against 3.3 to 3.5 in the fourth round and 0.6.0). Fixed in 0.6.1: a popover in a shadow root hidden and shown again, Enter held past the tail, an `!important` id rule on a frame, and a discrete transition, also on a frame past the first 100 and on one not drawn at the arm and shown or scrolled into view while armed. Low; the `space-y` shift as in 0.5.0, the rest new with the 0.6.0 round. | Not worth it. No event or observer reports an assignment of `adoptedStyleSheets`, so the sheet goes back on the next frame and at every press. Nothing in the page's origin beats an inline `!important` or one in an earlier layer, only the worker can insert a user origin sheet, asynchronously, while the hit test lifts the sheet in the middle of a move, and a layer of the sheet's own made every lift six times slower. After `body` the host took `:last-child` from `body` itself, and no place under the html element leaves `body`'s structural pseudo classes unchanged. The only CSS that gives the fallback the pointer back cuts off a `none` the page set above the object (checked in Chrome 156); an earlier note that it slowed every restyle by a quarter did not reproduce. The 2,000 is the bound the picker already keeps on the frames it boxes (`FRAME_BOXES`, `:992`). S for a frame put back: keep a frame that is not connected in the list until the next survey. A frame drawn with no such transition is dropped from it, since asking it again at every change of the sheet would read the style of every frame drawn since the survey, the cost the fourth round took out. |
 | F52 | `shared/prompt-template.js:1396` (`isCredentials`), `:1349` (`CONSONANT_GROUPS`) | A URL's user name with no password that reads as words is kept, so a short token of small letters with no digit and no five consonants in a row, counting common letter groups as one (`https://abcdefghij@host`), prints. The rule strips about 44, 64 and 78 percent of random tokens of 8, 12 and 16 small letters. Of 138 common service and admin accounts only `smmsp` loses its name, as do about 0.2 percent of first name plus surname forms (`ernstsmith@`) and 0.06 percent of first name plus initial ones. Low; the price of F24's fix, which kept `git@` and e-mail addresses. | Not worth more: a table of the 145 letter pairs English rarely writes catches 73% at eight letters but strips 11% of user names made of an initial and a first name, telling the rest from `administrator` needs a dictionary, and a passphrase of real words (`correct-horse-battery-staple@`) cannot be caught even with one. |
@@ -2228,6 +2581,27 @@ older than the round that found it.
 | F69 | `content/overlay.js:317` (`collectRoots`), `:48` (`ROOT_WALK_MS`) | On a page that changes its tree all the time and has many closed shadow roots, the armed overlay costs about three times 0.6.0: over 3 s, 11 to 12 ms against 4 with 2,000 closed roots, and 23 to 24 against 6.5 to 6.7 with 6,000. That is the walk itself, 6 to 7 ms on 6,000 roots once a second, which 0.6.0 never paid: it walked only when placing the overlay and never saw a closed root. Busy pages with open roots cost about half what they did in 0.6.0, and quiet pages at or below it. At 120 Hz (derived, not measured, since headless Chrome stays at 60 frames a second) the walk still lands in an 8.3 ms frame once a second. Low; new with F37 and F51. | Not worth it: the walk is what finds a popover or a dialog in a closed root (F37), and it runs at most once a second. Walking only the roots that changed would need a further observer, which this round did not add. |
 | F70 | `tools/build.mjs:657` (`sweepScratch`), `tools/release-check.mjs:140` (`GROUP`) | What a stopped run leaves behind. When the build alone is killed (not its process group) while a child is stuck, that child keeps running with no limit. A build stopped by a signal leaves its temporary folder, a copy of every shipped script (about 0.8 MB), until a build at least an hour later removes it. On a local release check, a `git` or `gh` call that runs out of time is stopped, but what it started keeps running, as in 0.6.0. Low; the release check's as in 0.6.0, the rest new with the build's temporary folders. | Not worth it: a process that is killed runs none of its own code, so only a later build can remove its folder, and only after an hour, since a running build uses each of its folders for one child, within that child's time limit. A group per call on a local run takes the call out of the terminal's reach, so Ctrl+C would leave it running with no limit, as the second round's did (F59). The sweep costs 8 to 10 ms a build with 21,365 entries in the temp directory. |
 | F71 | `content/picker.js:2459` (`frameAt`), `:992` (`FRAME_BOXES`) | `frameAt()` reads the box of every frame found before the one under the pointer, and in Chrome the box of a frame that is not drawn is not cheap to read: the first such reads after a hit test lay out skipped `content-visibility: auto` content. With 1,999 frames in skipped content found before the one under the pointer, the first move over it after an arm takes 0.81 s in 0.6.0 and 0.95 s in 0.6.1, and each later move 53 to 58 ms (39 to 57 ms behind 1,999 frames with `display: none`); the page alone takes 0.70 to 0.75 s for the first 1,999 such reads and 47 to 49 ms after that. With the frame under the pointer found first, a move over it takes 3.8 to 3.9 ms. The comment on `FRAME_BOXES` held for drawn frames only, and now says so. Low; also in 0.6.0, found by the last rerun of the 0.6.1 rounds. | S: pass over a frame that `checkVisibility({ contentVisibilityAuto: true })` says is not drawn, which cannot be under the pointer, before reading its box (0.3 to 0.5 ms for 2,000 frames in Chrome). Left for a later round, since the loop stopped at the sixth (see Judgment calls). |
+| F72 | `content/collector-main.js:5067` (`SHADOW_SCAN`), `:5077` (`findMarked`), `:5504` (`answerName`) | On a page of more than 20,000 elements, the tag can name a component in an open shadow root that the pick then does not report. The hover reads the node off the event's path, with no walk. The pick marks the element with `data-cdr-pick`, and `findMarked` looks for the mark through open roots from the end of the document, for at most `SHADOW_SCAN` elements; past them `inspect()` finds no node and the item has no Component line, though the tag showed the name that line was to start with. Confirmed in Chrome through the real panel on React 18 with 30,000 spans after the app: the tag read `<SaveButton>` and the item had only the selector `#openhost >>> #inner`. Low; new in 0.7.0, from the hover, the limit itself older. | M: send the pick's request on the node as the hover does, answered synchronously with the whole summary, which drops `data-cdr-pick` and `findMarked`, and with them the rule that the attribute goes on only after `outerHTML` is read. Left for a later release, and listed in the README's Roadmap. |
+| F73 | `content/collector-main.js:3152` (`domGuard`), `:2686` (`documentValues`) | The props of a Svelte, Vue 2 or Angular component are judged against the secret fields inside the component's elements, so a secret field it renders elsewhere (an Angular CDK overlay, a portal) brings neither the shape rule nor its `value` props. Its value is still matched through `documentValues` when the field is a password, code or card control, or a control whose name or id is a secret name. In Chrome a `draft` prop of `Xk9mQ2zp7Lw` printed in a CDK overlay, since neither its name nor its element looks secret. Low; new with 0.7.0, the same depth as F48's for shadow roots. | Not fixable with what the readers have: these components keep no tree of host props that the collector reads (`domGuard`'s comment), so the guard can follow only the component's elements, and a field outside them cannot be told from the page's other fields. |
+| F74 | `content/collector-main.js:4992` (`angularRead`), `:5012` | An Angular pick on the root host itself (`<app-root>`) gives no component: it sits in no template, so `getOwningComponent` answers null for it and for every element above it. A pick on anything inside it is read. Low; new with 0.7.0. | S, not tried: ask `getComponent` of the element when the climb finds no owner, through the same put back. |
+| F75 | `content/collector-main.js:5002` (the climb in `angularRead`), `:2321` (`CLIMB_LIMIT`) | An Angular pick on an element Angular did not render, deep in the page, asks `getOwningComponent` once for each element it climbs, and each call climbs to the root inside Angular, so the cost grows with the square of the depth, bounded by `CLIMB_LIMIT` and paid at a pick only, never on hover. Not measured. Low; new with 0.7.0. | Not worth it while unmeasured: the climb stops at the first element that has an owner, so only a deep element no template wrote comes near the bound. |
+| F76 | `content/collector-main.js:4819` (`noteHost`), `:4859` (`putBack`) | What the Angular put back leaves. On the host of a component whose elements an overlay or a portal moved away from it (a host above neither the picked element nor an earlier host in the chain), an LContext made before the pick with nothing filled in, by Angular DevTools asking `getOwningComponent`, `getContext` or `getInjector` about that host, is given back the number Angular set at render, since it cannot be told from one the pick's call made; that LContext's own component is put back as unset, and Angular reads either form the same way. Also left: what Angular's own write hands to a setter the page defined on `__ngContext__`, and a member the page made unwritable during the pick (an object it froze then, or a proxy that refuses), which stays as the call left it. In Chrome exactly one object changed in that case (`app-overlay`, from the LContext to the number 2; `app-menu` in a CDK overlay), and every instance still serialised. Low; new with 0.7.0. | Not worth it: a complete fix for the first case would put a temporary accessor on the instance's `__ngContext__` during `getHostElement`, whose setter runs after Angular has found the host and before it writes it. That puts an accessor on a page object while Angular runs, which a page wrapper around `ng.getHostElement` could see, and switches the property from data to accessor and back, which V8 can turn into a slower object shape, to restore a state Angular reads the same way. |
+| F77 | `content/collector-main.js:4628` (in `svelteSummary`) | The Svelte chain is Svelte's own render stack, folded only where a name repeats the one before it, so a snippet's element lists its owner twice (CheckoutForm, CouponField, CheckoutForm, App), and SvelteKit's generated root shows twice (`Inside +page > root > +layout > root`, seen in Chrome). Faithful to Svelte, and harder to read. Low; new with 0.7.0. | S: fold every repeat, or leave out SvelteKit's `root`; either drops a step of the true stack. |
+| F78 | `content/collector-main.js:4404` (in `vue2Summary`) | Vue 2's file prints as the build recorded it. `@vitejs/plugin-vue2` records an absolute `__file`, so in a development build the item reads `Defined in` and the whole path, the home directory and the user's name with it, in a prompt meant to be pasted, where Svelte's and Angular's paths are relative to the project. Seen in Chrome with Vite 6. Low; new with 0.7.0. | S: keep the part from the last `/src/` on, or say that the path is as the bundler recorded it. |
+| F79 | `content/picker.js:1317` (`componentLabel`) | A tab left open across an update or reload of the extension keeps the old collector until it is reloaded: the tag shows no name, and a pick on a Vue 2 or Svelte page has no Component line, since the old collector has no reader for them (a React pick still gives 0.6.1's line). The README says the tag stays silent; the panel gives no hint. Seen in Chrome on React, Vue 2 and Svelte 5 tabs. Low; new with the hover and the new readers, the old collector itself as after every update. | S: a one line hint in the panel to reload the tab. |
+| F80 | `sidepanel/panel.js:4207` (`swapFile`) | Whether a marked copy is saving is not stored, so another window does not hold Copy back for it. If window B copies the item in the gap between A's marked copy completing and A hearing of B's copy, A swaps and deletes the capture B's prompt names. If B discards the item after A swapped but before B heard of the swap, B's trash names the capture A already deleted and erased, so `recordFor` refuses the delete when the undo lapses and the marked copy stays on disk with no item naming it; an undo in B instead brings the item back in every window naming the deleted capture, without its marks, and it can no longer be marked up. The gap is the storage delivery time, not measured for this race; a row move crossed between two real side panels in 3 to 4 ms. Low; new with Mark up. | S to M: hold the delete for a round trip through storage, or store that a marked copy is saving. Written down in `docs/ARCHITECTURE.md`, "The sheet in storage". |
+| F81 | `sidepanel/panel.js:5447` (in `restore`) | The weekly expiry counts from `updatedAt`, so a sheet whose `updatedAt` is ahead of the clock (written before the clock was set back, or planted ahead) is not dropped as a week old until the clock passes it by a week. Any write sets `updatedAt` again, so only a sheet nobody touches is kept longer. Low; older than 0.7.0. | S: take an `updatedAt` more than `STAMP_AHEAD_MS` ahead as stale, or as now. |
+| F82 | `sidepanel/panel.js:5113` (`capturedAt` in `readItem`), `:1602` (`rankAtEnd`) | `capturedAt` is read with no bound. With an item planted at a `capturedAt` of 2^60, `rankAtEnd`'s highest plus one changes nothing, `readItem` then refuses the stored rank as past `MAX_RANK`, and after a capture the capturing window lists the planted item first and the other window last. A capture time a year ahead is harmless. Planted data only. Low; the unbounded read older than 0.7.0, the order it upsets new with reorder. | S: hold `capturedAt` to the bound `rank` has, or to `STAMP_AHEAD_MS`. |
+| F83 | `sidepanel/panel.js:1523` (`tooFarAhead`), `:65` (`STAMP_AHEAD_MS`) | Edges of the clock fix at the two day line. A stamp can cross the line between one panel's write and another panel's merge, milliseconds apart: the first has forgotten it, the second still believes it and writes it back, and the old stamp wins once more, the same class as an undo made within ten minutes of exactly two days. Past two days the stamps from before the set back count as none everywhere, so the next change to an item wins, and a removal from before the set back is forgotten: a write that crossed it as the clock went back brings the item back. Documented in `docs/ARCHITECTURE.md`. Low; new with the clock fix, where 0.6.1 had a write loop instead. | Not worth it: a cap at the line instead is worth the moment each panel read it, so the panel that read last would win over a change made in between, at any set back and not only at the line (see Judgment calls for 0.7.0). |
+| F84 | `sidepanel/panel.js:1280` (`ROW_DRAG`), `:1434` | A row dropped on a page that accepts drops tells the page the drag's type, `application/x-punch-list-row`, with no data, so such a page can tell the extension is installed, as the probe already lets a page do (F32). Seen in Chrome. Low; new with reorder. | Not worth it: the type is how the panel tells its own drag from a file after a lost drag or from another window's row (`:1284` `ownDrag`), and the page learns nothing F32 does not already give it. |
+| F85 | `content/page-shot.js:594`, `:285` (`scrolledByScript`), `sidepanel/panel.js:3154` | A page that has locked its scrolling (`overflow` hidden or clip on html or body, with no inner scroller of at least a quarter of the view) is filed as one screen, unscrolled, with a notice. Which notice can be wrong at the edges. A page that scrolls itself is told apart only once its content has been moved up by a transform and nothing visible covers half the view, so Locomotive Scroll at its very top (translate 0), or with `data-scroll-section` and every section shorter than the view, gets the notice that names both causes; so does a page under a cover hidden by an ancestor's opacity of 0, or at an opacity near 0. The one false claim: a scroll lock with no backdrop (a modal dropdown) over a page whose tall wrapper is moved up by a transform would be told that the page scrolls itself. None of these edges was run in Chrome. Low; new with 0.7.0. | Not worth it: every miss falls back to the wording that names both causes, which stays true, and the false claim needs a page that moves its own wrapper and opens a menu with no backdrop. |
+| F86 | `sidepanel/panel.js:3039` (in `scrollAndShoot`) | A touch on the page (a wheel, a key, a press) in the few milliseconds between the last screenshot and `end()` cancels the run and files nothing, though every screenshot was in. Low; new with the fix that reads what `end()` answers, which keeps a run the page ended after its last step from filing a screen drawn once the page was put back. | Not worth it: it follows the README's rule that input on the page cancels and files nothing, and the window is a few milliseconds. |
+| F87 | `sidepanel/panel.js:2971` (in `scrollAndShoot`), `:2636` (`PAGE_GREW`) | Seams on pages that move while they are captured. A header a scroll handler takes out of the flow cut 56 px out at the first seam in Chrome for Testing 156, which scroll anchoring did not make up for. Wikipedia's "Web browser" article (Vector 2022) cut a line of text in half at the first seam, at 2x and 1x: once scrolled, the content above moves up 5 CSS px (paragraph tops 214 to 209, `scrollHeight` 6288 to 6283). Carousels and animations differ from screen to screen. Such pages get the notice that the page changed height or moved; they are flagged, not corrected. A feed that grows while it is scrolled gets the notice even when its seams line up. Low; new with 0.7.0. | Not fixed: each band is placed by the scroll position the page reported, so a page that moves its content between two screenshots shows the move at the seam, and the notice says so. |
+| F88 | `sidepanel/panel.js:2672` (`pageStopReason`), `content/page-shot.js:500` (`onPageHide`) | A navigation inside the document (`pushState`, `replaceState`, a hash change) does not stop a whole page capture, so a run can go on over a new route. Only the page's own `pagehide` or a controller that has gone stops it. Low; new with 0.7.0. | Not worth it: `tabs.onUpdated` reports those changes as loading, and an endless feed changes its URL while it is scrolled, so stopping on it would stop a run on such a feed (see Judgment calls for 0.7.0). |
+| F89 | `content/page-shot.js:171` (`shadowOf`), `:94` | In a closed shadow root, an element asked about once in a run that gets a root attached afterwards is missed until the next run, so a fixed element in that root can repeat down the stitched page. A widget's new host is a new element, and is asked about. Low; new with 0.7.0. | Not worth it: every element that can host a root is asked once a run, about 15 ms over 20,000 elements, and a walk runs twice a step; asking again at every walk would pay that each time. |
+| F90 | `content/overlay.js:122` to `:135` (`.hint`) | The Region overlay's hint does not wrap (`white-space: nowrap`, centred by `left: 50%` and `translateX(-50%)`), so on a narrow page it runs off both edges and both ends of its text are cut. In Chrome for Testing 156 it was 443 px wide, starting 35 px left of the page and ending at 409, at an `innerWidth` of 374, and starting 72 px left and ending at 371 at 299 (125% zoom). Low; older than 0.7.0. | S: what the picker's hint now does (12 px from each side, as wide as its text, wrapping), with a test like `test/picker-events.test.mjs:1976`. |
+| F91 | `sidepanel/panel.js:4328` (in `saveScreenshot`) | A save whose `chrome.downloads.download()` call has not answered yet has no id to list, so a panel closed in that moment (milliseconds, after the composite for a marked copy) cannot have it taken back, and the file can land in Downloads with no item naming it. Low; older than 0.7.0, since the old `flushOnClose` had the same gap. | Not fixable from the panel: there is nothing to cancel until Chrome answers with the id, and Chrome drops what a closing panel sends. |
+| F92 | `sidepanel/panel.js:2399` (in `holdArm`), `background.js:998` (`settlePending`) | If the worker is stopped and the panel closes before the reopened port is up (a back off of 100 to 2,000 ms after repeated quick shuts), nothing settles what the panel had pending beyond its own first try on `pagehide`, which Chrome may drop. Low; new with the close fix, the same exposure the armed overlay's hold already has. | Not worth it: reopening at once after a quick shut would loop against a worker that shuts the port (the comment at `sidepanel/panel.js:2387`), and the back off starts only once a reopened port has been shut again within a second. |
 
 The stage (`tools/panel-stage.html`) cannot model an arm that lands out of order because of the
 stage's own artificial delay; the real extension landed 75 of 75 back to back injections in order.

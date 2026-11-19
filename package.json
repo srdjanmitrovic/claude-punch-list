@@ -1,6 +1,6 @@
 {
   "name": "claude-punch-list",
-  "version": "0.6.1",
+  "version": "0.7.0",
   "description": "Chrome extension that turns a walkthrough of your app into one paste-ready prompt for Claude Code: every screenshot, every note, and the console behind them.",
   "license": "MIT",
   "private": true,
