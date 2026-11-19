@@ -127,7 +127,11 @@ still supported. They live in `test/`:
 * `test/worker.test.mjs` runs `background.js` in a `node:vm` realm against a model of the pages
   it injects into (`test/support/worker-realm.mjs`), and holds the worker to its ordering rules:
   an arm against the disarm that cancels it and against an older arm, a capture message against
-  the arm after it, and a probe against the change it asks about.
+  the arm after it, and a probe against the change it asks about. Over a model of Chrome's
+  download list (`makeDownloads`) and of storage it holds the worker to what it settles when a
+  panel closes: the last list the panel posted, only this extension's downloads, none a stored
+  item names, nothing for a list it cannot read, and the list said again to a worker started
+  after one was stopped.
 * `test/panel.test.mjs` runs `sidepanel/panel.js` against a stub of the DOM
   (`test/support/panel-realm.mjs`), with each test playing the worker, and checks which mode is
   lit and what a Screen or Page capture says when replies and broadcasts arrive in an unlucky
@@ -143,10 +147,12 @@ still supported. They live in `test/`:
   list, as the side panels of two windows share them in Chrome, and checks what survives two
   windows writing at once, the order of the sheet across windows, reopens and undo, two windows
   open while the clock is set back, what a whole page item stores and what is refused of it on
-  reading, which files a discard, a copy or the weekly expiry deletes, and what the panel says
-  about a file it cannot find. Its storage can stop delivering writes past a count (`heardUpTo`),
-  so a test that would set two panels writing to each other ends, and shows how many writes
-  there were.
+  reading, which files a discard, a copy or the weekly expiry deletes, which downloads the panel
+  tells the worker it would leave if it closed, and what the panel says about a file it cannot
+  find. A few of its tests run the real worker beside the panel, the port between them, and
+  close the panel as Chrome does, its own calls on the way out lost. Its storage can stop
+  delivering writes past a count (`heardUpTo`), so a test that would set two panels writing to
+  each other ends, and shows how many writes there were.
 * `test/static.test.mjs` checks what would otherwise only fail in Chrome: every file the manifest,
   the worker and the panel name exists, every file parses, the re-injected capture scripts
   declare nothing at the top level, the copies of the secret name blocks agree, and `PRIVACY.md`
@@ -295,12 +301,17 @@ reading a single file, and breaking them tends to fail silently rather than loud
 * Screenshots go to disk at capture time, and an item is only persisted once it has a path.
   Discarding an uncopied item deletes its file once the undo lapses, and the weekly expiry
   deletes the files of the sheet it drops; the reset after a copy must not, because the prompt on
-  the clipboard names every file. Before deleting a file or trusting what Chrome says about it,
-  hold the download record to the item (`recordFor` in `sidepanel/panel.js`): Chrome hands
-  download ids out again. An item has one file at a time. Marking it up gives it another one,
-  so point the item at the new file and store that, stamped with `fileAt`, before the old file
-  is deleted (`swapFile`), and keep the old one when a prompt still names it. The clean capture
-  kept for marking up lives in the panel's memory only and is never stored (`holdFull`).
+  the clipboard names every file. What the panel would take back if it closed is the worker's to
+  do, since Chrome drops the calls a closing side panel makes: a new save goes in `state.saves`
+  from its start to its end, a file is deleted through `deleteFile`, which keeps it in
+  `state.deleting` until both of its calls have answered, and wherever that list
+  (`pendingDownloads`) can change, call `notePending`, after the write that stores an item naming
+  its new file. Before deleting a file or trusting what Chrome says about it, hold the download
+  record to the item (`recordFor` in `sidepanel/panel.js`): Chrome hands download ids out again.
+  An item has one file at a time. Marking it up gives it another one, so point the item at the
+  new file and store that, stamped with `fileAt`, before the old file is deleted (`swapFile`),
+  and keep the old one when a prompt still names it. The clean capture kept for marking up lives
+  in the panel's memory only and is never stored (`holdFull`).
 * `shared/prompt-template.js` must render a one item report byte for byte as it did before.
   `npm test` is the check: the goldens in `test/golden/` are that "before", and a deliberate
   change to them belongs in the same commit as the change to the template.

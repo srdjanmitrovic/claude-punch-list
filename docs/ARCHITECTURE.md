@@ -17,8 +17,9 @@ sidepanel/panel.js ......... orchestrates everything. Captures the tab, crops
    |
    +-- background.js ....... service worker. Side panel behaviour, the keyboard
    |                         command, injecting the capture scripts, starting
-   |                         the collector on a tab open from before, and a
-   |                         map of which tab is currently armed.
+   |                         the collector on a tab open from before, a map of
+   |                         which tab is currently armed, and settling the
+   |                         downloads a closed panel left behind.
    |
    +-- content/overlay.js .. drag a rectangle (injected on demand)
    +-- content/page-shot.js  ISOLATED world, injected by the panel itself for
@@ -559,10 +560,12 @@ every `chrome.*` API it needs.
 
 So the worker stays thin. It owns only what must survive the panel being closed, or hear it
 close: side panel behaviour, the keyboard command, script injection, the armed tab map, and the
-port that disarms a tab when the panel that armed it goes away.
+port that disarms a tab when the panel that armed it goes away and settles the downloads it left
+(see Discard, undo and close under [The sheet in storage](#the-sheet-in-storage)).
 
-The panel holds that port while a mode is armed. Chrome stopping the worker closes the port from
-that end, and the panel opens a new one. A port shut within a second of opening is reopened at
+The panel holds that port while a mode is armed, and while it has downloads it would take back
+if it closed. Chrome stopping the worker closes the port from that end, and the panel opens a new
+one and says again on it what it holds. A port shut within a second of opening is reopened at
 once the first time. After that the panel waits 100 ms, and twice as long each time up to two
 seconds, so a worker stopped twice in quick succession is held again before the panel is likely
 to close, and a port that is always shut is not reopened in a loop.
@@ -637,7 +640,7 @@ could see.
 | `cdr:verify` | panel | worker | After a navigation, ask the page which mode, if any, is still live on it |
 | `cdr:check-tab` | panel | worker | Ask whether a tab is usable, and what is armed on it |
 | `cdr:collect` | panel | worker | Start collecting on a tab where nothing answered the panel's read: bridge a collector already running there, or start one where the manifest's `content_scripts` would have run (see [A tab that was open before](#a-tab-that-was-open-before)). `{ tabId }` gets `{ ok: true, fresh }` once a collector and a bridge are in the tab, `{ ok: false, outside: 'site' }` when the manifest keeps the collector off the tab's whole site (nothing is injected), `{ ok: false, outside: 'path' }` when the site is declared, the tab's URL is not, and no collector was found running there, or `{ ok: false, error }` |
-| port `cdr:panel` | panel | worker | Opened while a mode is armed. The panel posts `cdr:holding` with the tab it holds, or `null`. When the port closes because the panel closed, the worker disarms that tab. A panel still armed reopens the port when the worker is stopped, after a growing pause if it keeps being shut as it opens |
+| port `cdr:panel` | panel | worker | Opened while a mode is armed, or while the panel has downloads it would take back if it closed. The panel posts `cdr:holding` with the tab it holds, or `null`, and `cdr:pending` with `{ ids }`, the ids of those downloads in ascending order (at most 5000), each time that list changes, the empty list once it empties. When the port closes because the panel closed, the worker disarms that tab and settles each download of the last list. A list that is not an array of safe non negative integers, or is longer, leaves none. A panel still armed, or with downloads still pending, reopens the port when the worker is stopped, after a growing pause if it keeps being shut as it opens, and posts both again on it. The panel never closes the port itself |
 | `cdr:armed` | worker | panel | A capture mode is now waiting on a tab. Carries the `armId` of the `cdr:arm` behind it, or none for the shortcut, so a panel can ignore the echo of an arm it cancelled in flight, and the `run` the injection answered with |
 | `cdr:region-selected` | overlay | panel | A rectangle was dragged, or selected with the keys. Carries `moved: true` when the host, put into the element shown fullscreen, moved that element's last children while armed, so the panel says the crop may be off |
 | `cdr:element-picked` | picker | panel | An element was picked |
@@ -1695,8 +1698,9 @@ while its copy saves is swapped where it waits in the discard, so Undo brings it
 lapse deletes both files once each. An item that has left for good meanwhile, copied here or in
 another window or its discard settled, keeps the file it had, which a prompt may name, and the copy
 nothing names is deleted. A save that fails, or is cancelled in a "Save as" dialog, changes
-nothing on the item, says so, and keeps the marks for the next Done. On `pagehide` a marked copy
-still saving is taken back like any save in flight, and the stored item keeps the file it had.
+nothing on the item, says so, and keeps the marks for the next Done. A marked copy still saving
+when the panel closes is taken back like any save in flight (see Discard, undo and close under
+[The sheet in storage](#the-sheet-in-storage)), and the stored item keeps the file it had.
 
 ## The sheet in storage
 
@@ -1849,11 +1853,43 @@ left and then sorts the sheet, so when rows were moved in the meantime it goes w
 puts it, as every other panel and the next open put it. Cmd or Ctrl+Z undoes a discard and nothing
 else: a move is undone by moving the row back, and while a markup is open the key takes back the
 last mark instead, and the discard waits on. When the time is up, the files are deleted with
-`downloads.removeFile` and their history entries with `downloads.erase`. On `pagehide` the
-panel settles the pending discard and takes back any save still in flight, a marked copy included,
-by sending `cancel`,
-`removeFile` and `erase` without waiting for them; Chrome completes those calls after the page has
-gone.
+`downloads.removeFile` and their history entries with `downloads.erase`.
+
+A panel that closes leaves its downloads to the worker. What it would take back is listed by
+`pendingDownloads`: every save still on its way (`state.saves`), a first save or a marked copy,
+wherever its item is by then, on the sheet, in the discard or gone for good; the files of the
+pending discard, unless another window has put the item back on the sheet; and every file being
+deleted (`state.deleting`), a lapsed discard, the capture a marked copy replaced or a copy nothing
+names, from the call to `deleteFile` until its `removeFile` and `erase` have both answered, since
+a closing panel would never send what is left. Only ids this session made, or held to the item's
+path when it was discarded or deleted (`verified`, `recordFor`), so none that Chrome has reissued
+to another file. `notePending` posts that list to the worker on the `cdr:panel` port wherever a
+save or a delete starts or ends and wherever a discard is made, undone, settled, or changed by
+another window's write, after the write that stores an item naming its new file. The port is held
+open while the list is not empty, and opened again when the worker is stopped, as for an arm.
+When the port closes, the worker reads the stored sheet once and settles each id of the last list
+whose download this extension started (`byExtensionId`) and whose file no stored item names: it
+cancels one still in progress or waiting on a "Save as" dialog, looks again in case it finished
+first, takes a complete one off the disk with `removeFile`, and erases it from the list. Every
+call is caught.
+
+The panel still sends `cancel`, `removeFile` and `erase` for the same list on `pagehide`
+(`flushOnClose`, without waiting), as a first try. Checked in Chrome for Testing 156, those calls
+were carried out when the panel's page was closed on its own (CDP `Target.closeTarget`), and never
+reached the browser when the side panel was closed with `chrome.sidePanel.close` or with its
+window; the native close button could not be pressed in the check and is taken to behave like
+`chrome.sidePanel.close`. With the worker settling them, a discard closed within its undo was
+deleted in all three. A marked copy and a first save waiting on a "Save as" dialog were cancelled
+when the panel was closed with `chrome.sidePanel.close`; closing the window or the page itself
+with a dialog open was not checked. A second cancel or erase of an id does nothing. From
+`pagehide` on the panel posts nothing more, so a save that ends as the page goes cannot take its
+id off the list the worker settles.
+
+What holds if the worker cannot run when the panel closes, as when Chrome itself quits within the
+undo: the discarded files stay on disk and in the download list, and the stored sheet, written
+when the discard was made, no longer names them, so nothing ever deletes them. The same holds for
+a worker stopped in the moment the panel closes, before its port was opened again. A save whose
+`download()` call has not answered yet has no id to list.
 
 **Expiry.** A report whose `updatedAt` is more than a week old is removed when a panel starts,
 and the files of its items with it, since nothing was copied and no prompt names them. That
@@ -1875,7 +1911,7 @@ manual copy.
 | :--- | :--- |
 | `host_permissions: <all_urls>` | Screenshot the tab, inject the overlay and picker, start the collector on a tab open from before (where the `content_scripts` matches cover it), and read `tab.url`. Chrome withholds the URL entirely for any origin this does not cover. |
 | `scripting` | Inject the region overlay and element picker on demand, and the collector into a tab where nothing collects and the `content_scripts` matches would have run it, or a bridge to a collector already running on a site they name. From the panel itself: hand an armed mode the keys pressed in the panel, and for Page inject `content/page-shot.js`, which scrolls the page and hides what is fixed to the window while the capture runs |
-| `downloads` | Save each PNG as it is captured, read back its absolute path, delete it again if the item is discarded or its sheet expires, and learn if it has since gone missing |
+| `downloads` | Save each PNG as it is captured, read back its absolute path, delete it again if the item is discarded or its sheet expires, and learn if it has since gone missing. In the worker: cancel or delete the downloads a closed panel left behind |
 | `storage` | Keep the report (items, descriptions, thumbnails) between panel sessions, plus the toggle settings |
 | `sidePanel` | The panel itself |
 
@@ -1948,7 +1984,9 @@ reproduce:
 
 * **The worker.** The shim answers `cdr:arm`, `cdr:disarm` and `cdr:verify` itself. It mirrors
   the ordering rule, but there is no service worker to be stopped, no keyboard command and no
-  `sidePanel.open()`, and an arm lands as fast as the stage lets it.
+  `sidePanel.open()`, and an arm lands as fast as the stage lets it. There is no
+  `runtime.connect` either, so no `cdr:panel` port: a panel reloaded on the stage takes back what
+  it leaves with its own calls on `pagehide` alone.
 * **Tabs.** There is one tab, `tabs.onActivated` and `tabs.onUpdated` never fire, and
   `cdr:check-tab` reports every page as usable, so switching tabs, navigating, restricted pages
   and file access cannot be exercised.

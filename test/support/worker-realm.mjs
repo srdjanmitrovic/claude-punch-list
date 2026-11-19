@@ -19,6 +19,10 @@
  *
  * Time is a fake clock the test moves, and Chrome stopping the worker is
  * kill(): nothing reaches the worker after it, while the pages carry on.
+ *
+ * Chrome's download list (makeDownloads) and storage.local (a Map) outlive a
+ * worker, so a test can hand the same ones to the worker started after one
+ * was stopped.
  */
 
 import { readFileSync } from 'node:fs';
@@ -592,16 +596,72 @@ export class FakePage {
 }
 
 /**
+ * Chrome's download list, as the worker's chrome.downloads sees it. Each
+ * record is { id, state, filename, exists, byExtensionId? }, filename being
+ * '' while a "Save as" dialog waits, as in Chrome. As Chrome 156 does it:
+ * cancel() ends a download in progress as interrupted (USER_CANCELED) and
+ * leaves any other as it is, removeFile() is refused for a download that is
+ * not complete and leaves its record marked gone, and erase() takes the
+ * record out of the list. `calls` lists every call as [name, id], in order.
+ */
+export function makeDownloads(records = []) {
+  const list = new Map(records.map((record) => [record.id, { exists: true, ...record }]));
+  const calls = [];
+  return {
+    records: list,
+    calls,
+    /** The calls of one kind, by id. */
+    made(name) {
+      return calls.filter(([each]) => each === name).map(([, id]) => id);
+    },
+    api: {
+      async search({ id }) {
+        calls.push(['search', id]);
+        return list.has(id) ? [plain(list.get(id))] : [];
+      },
+      async cancel(id) {
+        calls.push(['cancel', id]);
+        const record = list.get(id);
+        if (!record) throw new Error(`Invalid download id ${id}`);
+        if (record.state === 'in_progress') Object.assign(record, { state: 'interrupted', error: 'USER_CANCELED' });
+      },
+      async removeFile(id) {
+        calls.push(['removeFile', id]);
+        const record = list.get(id);
+        if (!record) throw new Error(`Invalid download id ${id}`);
+        if (record.state !== 'complete') throw new Error('Download must be complete');
+        record.exists = false;
+      },
+      async erase({ id }) {
+        calls.push(['erase', id]);
+        return list.delete(id) ? [id] : [];
+      },
+    },
+  };
+}
+
+/**
  * @param {{
  *   pages?: Record<number, FakePage>,
  *   tabsGet?: (tabId: number) => Promise<object>,
  *   holdFiles?: boolean,
+ *   downloads?: ReturnType<typeof makeDownloads>,
+ *   storage?: Map<string, any>,
  *   setup?: (chrome: object) => void,
  * }} options  holdFiles keeps every file injection in the package read until
- *   releaseFiles(), so a test can send a function injection past one. setup
- *   can change the chrome fake before the worker starts.
+ *   releaseFiles(), so a test can send a function injection past one.
+ *   downloads and storage are Chrome's download list and storage.local, new
+ *   ones unless given. setup can change the chrome fake before the worker
+ *   starts.
  */
-export function loadWorker({ pages = { 1: new FakePage() }, tabsGet, holdFiles = false, setup = () => {} } = {}) {
+export function loadWorker({
+  pages = { 1: new FakePage() },
+  tabsGet,
+  holdFiles = false,
+  downloads = makeDownloads(),
+  storage = new Map(),
+  setup = () => {},
+} = {}) {
   const clock = makeClock();
   const listeners = { message: [], updated: [], removed: [], command: [], connect: [] };
   const broadcasts = [];
@@ -641,8 +701,19 @@ export function loadWorker({ pages = { 1: new FakePage() }, tabsGet, holdFiles =
         setAccessLevel: async (options) => {
           accessLevels.push(plain(options));
         },
+        get: (keys) => {
+          const out = {};
+          for (const key of Array.isArray(keys) ? keys : [keys]) {
+            if (storage.has(key)) out[key] = plain(storage.get(key));
+          }
+          return toWorker(Promise.resolve(out));
+        },
       },
     },
+    // Every call answers only while the worker lives, as the others do.
+    downloads: Object.fromEntries(
+      Object.entries(downloads.api).map(([name, call]) => [name, (...args) => toWorker(call(...args))])
+    ),
     tabs: {
       get: (tabId) =>
         toWorker(
@@ -719,6 +790,8 @@ export function loadWorker({ pages = { 1: new FakePage() }, tabsGet, holdFiles =
     injections,
     internals,
     accessLevels,
+    downloads,
+    storage,
     /**
      * A message from a panel or a content script; resolves to the reply, if
      * any. From the panel unless a sender is given: a content script's names

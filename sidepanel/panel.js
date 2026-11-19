@@ -358,6 +358,14 @@ const state = {
   markupOpening: null, // a markup whose screenshot is being decoded, so a second press waits
   markTool: 'arrow', // the tool a markup starts with; sticks for the life of the panel
   fulls: [], // the items holding their clean capture, oldest first, see holdFull
+  // Every save on its way to disk, from its start until it ends however it
+  // ends: an item for its first save, its markSave for a marked copy. Each
+  // carries its downloadId once Chrome has given one (see pendingDownloads).
+  saves: new Set(),
+  // Every file being deleted (deleteFile), from the call until removeFile and
+  // erase have both answered. Each carries the downloadId it is taking back
+  // once that id is known to be the item's own (see pendingDownloads).
+  deleting: new Set(),
 };
 
 // ---------------------------------------------------------------- helpers --
@@ -1838,6 +1846,9 @@ async function addItem(capture) {
     // Kept for marking up while this panel stays open; the data URL is let
     // go with this call, as before.
     holdFull(item, blob);
+    // A closing panel takes the save back from here until it ends, wherever
+    // the item has gone meanwhile (pendingDownloads).
+    state.saves.add(item);
     // Named for the moment of the capture rather than of the save, so that
     // a marked copy of it, named the same way, shares its name.
     const saved = await saveScreenshot(
@@ -1845,6 +1856,7 @@ async function addItem(capture) {
       item.mode,
       (downloadId) => {
         item.downloadId = downloadId;
+        notePending();
       },
       { at: item.capturedAt }
     );
@@ -1885,7 +1897,11 @@ async function addItem(capture) {
     // About the report, not the page: it is all that is left of the item.
     showBanner(`${error?.message || error} Capture it again.`, 'error', 'report');
   } finally {
+    state.saves.delete(item);
     updateSubmitState();
+    // After the write that stores the item with its path, so the worker
+    // hears this download is no longer pending once the sheet names its file.
+    notePending();
   }
 }
 
@@ -1992,8 +2008,14 @@ function discard(ids) {
   for (const { item } of entries) {
     state.removed.set(item.id, leftAt(item, now));
     // Asked now, while there is time to wait for the answer, so a panel
-    // closed before the undo lapses can still delete the file (flushOnClose).
-    if (item.path) recordFor(item).then((record) => (item.verified = Boolean(record)));
+    // closed before the undo lapses still has the file deleted: the answer
+    // puts its download on the list the worker settles (pendingDownloads).
+    if (item.path) {
+      recordFor(item).then((record) => {
+        item.verified = Boolean(record);
+        notePending();
+      });
+    }
   }
   persist({ thumbs: true });
   // field: what the discard left in the description, the next item's words,
@@ -2002,6 +2024,7 @@ function discard(ids) {
   state.trash = { entries, timer: null, field: el.description.value, typed: false, receipt: null };
   showUndo(entries);
   startUndoTimer();
+  notePending();
 }
 
 function inTrash(item) {
@@ -2089,6 +2112,9 @@ function settleTrash() {
     // One still saving has no path yet; addItem deletes it once it has.
     if (item.path) deleteFile(item);
   }
+  // A file being deleted stays pending until its calls have answered
+  // (deleteFile), and one still saving as a first save, until addItem has it.
+  notePending();
 }
 
 /** Put the last discard back where it was. */
@@ -2098,6 +2124,8 @@ function undoDiscard() {
   clearTimeout(trash.timer);
   state.trash = null;
   showUndo(null);
+  // Its files are kept now, whatever happens to the panel.
+  notePending();
   const restored = [];
   for (const { item, index } of trash.entries) {
     if (state.items.some((candidate) => candidate.id === item.id)) continue;
@@ -2306,6 +2334,15 @@ let holdRetryTimer = 0;
 let holdRetryMs = 0;
 const HOLD_RETRY_FIRST_MS = 100;
 const HOLD_RETRY_MAX_MS = 2000;
+/**
+ * The list of pendingDownloads the worker last heard on the port open now,
+ * joined, so that only a change is posted. A new port starts with none.
+ */
+let pendingSent = '';
+/** The page is going (flushOnClose): the worker keeps the last list it heard. */
+let closing = false;
+/** The most ids one list carries, as MAX_PENDING in background.js, which takes no longer one. */
+const PENDING_MAX = 5000;
 
 /**
  * Tell the worker, over a port, which tab this panel has armed, so that
@@ -2315,16 +2352,24 @@ const HOLD_RETRY_MAX_MS = 2000;
  * message on its way out, but its port closes with it, and the worker hears
  * that.
  *
- * Called on every change of the armed state. The port is opened on the first
- * arm and kept; with nothing armed it says so (null) and stays quiet. Chrome
- * stops an idle worker port or no port, which closes the port from that end;
- * a panel still armed then opens a new one, which starts the worker again,
- * and one with nothing armed waits for its next arm, so an idle panel does not
- * keep the worker awake.
+ * The same port carries the downloads this panel would take back if it
+ * closed now (pendingDownloads, see notePending), and the worker settles
+ * them when it hears the panel go. flushOnClose sends those calls itself on
+ * pagehide, but in Chrome they never reached the browser from a side panel
+ * closed with chrome.sidePanel.close or with its window.
+ *
+ * Called on every change of the armed state, and by notePending. The port is
+ * opened on the first arm, or the first download pending, and kept; with
+ * nothing armed it says so (null) and stays quiet. Chrome stops an idle
+ * worker port or no port, which closes the port from that end; a panel still
+ * armed, or with downloads still pending, then opens a new one, which starts
+ * the worker again, and says both again on it. One with neither waits for
+ * the next, so an idle panel does not keep the worker awake.
  */
 function holdArm() {
+  if (closing) return;
   const tabId = state.armedMode ? state.armedTabId : null;
-  if (tabId == null && !holdPort) return;
+  if (tabId == null && !holdPort && !pendingDownloads().length) return;
   if (!holdPort) {
     let port;
     try {
@@ -2333,6 +2378,7 @@ function holdArm() {
       return; // no worker to hold it (the extension is being reloaded)
     }
     holdPort = port;
+    pendingSent = '';
     const openedAt = Date.now();
     port.onDisconnect.addListener(() => {
       void chrome.runtime.lastError;
@@ -2347,14 +2393,15 @@ function holdArm() {
       // armed with nothing holding it, and closing the panel then left the
       // overlay up. So it is reopened after a pause, which doubles each time
       // up to a bound: neither a loop nor giving up while the arm stands.
+      // Downloads pending are held the same way.
       const quick = Date.now() - openedAt < 1000;
-      if (!state.armedMode) return;
+      if (!holdWanted()) return;
       if (quick && holdRetried) {
         holdRetryMs = Math.min(HOLD_RETRY_MAX_MS, holdRetryMs ? holdRetryMs * 2 : HOLD_RETRY_FIRST_MS);
         clearTimeout(holdRetryTimer);
         holdRetryTimer = setTimeout(() => {
           holdRetryTimer = 0;
-          if (!holdPort && state.armedMode) holdArm();
+          if (!holdPort && holdWanted()) holdArm();
         }, holdRetryMs);
         return;
       }
@@ -2365,6 +2412,76 @@ function holdArm() {
   }
   try {
     holdPort.postMessage({ type: 'cdr:holding', tabId });
+  } catch {
+    holdPort = null;
+    return;
+  }
+  notePending();
+}
+
+/** Whether the panel has anything for the worker to hold: an arm, or downloads pending. */
+function holdWanted() {
+  return Boolean(state.armedMode) || pendingDownloads().length > 0;
+}
+
+/**
+ * The downloads this panel would take back if it closed now (flushOnClose),
+ * by the ids Chrome gave them, in ascending order:
+ *
+ * - every save still on its way (state.saves), a first save or a marked copy,
+ *   wherever its item is by now: on the sheet, in the last discard, or gone
+ *   for good. None is stored yet, so no item would name its file;
+ * - the files of the last discard while it can still be undone, unless
+ *   another window has put the item back on the sheet, which uses the file
+ *   again;
+ * - every file being deleted (state.deleting): a discard that has lapsed, a
+ *   capture its marked copy replaced, a copy nothing names. Its calls go out
+ *   one after the other, so a panel closed before the last has answered
+ *   would leave the file on disk, or its row in the download list. The
+ *   stored sheet no longer names it.
+ *
+ * Only ids this session made, or checked against the item's path when it was
+ * discarded or deleted (verified, recordFor), which Chrome cannot have
+ * reissued to another file.
+ */
+function pendingDownloads() {
+  const ids = new Set();
+  const add = (id) => {
+    if (Number.isSafeInteger(id) && id >= 0) ids.add(id);
+  };
+  for (const save of state.saves) add(save.downloadId);
+  for (const each of state.deleting) add(each.downloadId);
+  const onSheet = new Set(state.items.map((item) => item.id));
+  for (const { item } of state.trash?.entries || []) {
+    if (item.path && item.verified && !onSheet.has(item.id)) add(item.downloadId);
+  }
+  return [...ids].sort((a, b) => a - b).slice(0, PENDING_MAX);
+}
+
+/**
+ * Tell the worker which downloads this panel would take back if it closed
+ * now, when that has changed since it last heard: called wherever a save or a
+ * delete starts or ends and wherever a discard is made, undone, settled or
+ * changed.
+ * A first one opens the port (holdArm); the empty list is said too, so a save
+ * that has finished or a discard undone is not settled when the panel goes.
+ *
+ * Nothing more is said once the page is going: what flushOnClose clears, and
+ * a save that ends as the page goes, must not take an id off the list the
+ * worker settles.
+ */
+function notePending() {
+  if (closing) return;
+  if (!holdPort) {
+    if (pendingDownloads().length) holdArm();
+    return;
+  }
+  const ids = pendingDownloads();
+  const key = ids.join(',');
+  if (key === pendingSent) return;
+  try {
+    holdPort.postMessage({ type: 'cdr:pending', ids });
+    pendingSent = key;
   } catch {
     holdPort = null;
   }
@@ -4017,6 +4134,10 @@ function commitMarks({ focus = false } = {}) {
  */
 async function saveMarks({ item, marks, bitmap, width, height }) {
   const canvas = document.createElement('canvas');
+  // A closing panel takes the copy back from here until it ends, wherever
+  // the item has gone meanwhile (pendingDownloads).
+  const save = item.markSave;
+  if (save) state.saves.add(save);
   try {
     canvas.width = width;
     canvas.height = height;
@@ -4034,7 +4155,8 @@ async function saveMarks({ item, marks, bitmap, width, height }) {
       blob,
       item.mode,
       (downloadId) => {
-        if (item.markSave) item.markSave.downloadId = downloadId;
+        if (save) save.downloadId = downloadId;
+        notePending();
       },
       // Named for what it holds: with every mark taken back it is the clean
       // capture again, and takes the capture's own name.
@@ -4057,10 +4179,13 @@ async function saveMarks({ item, marks, bitmap, width, height }) {
     canvas.width = 0;
     canvas.height = 0;
     item.markSave = null;
+    state.saves.delete(save);
     const live = state.items.find((each) => each.id === item.id);
     renderFrame();
     if (live) refreshRow(live);
     updateSubmitState();
+    // After swapFile stored the item naming the copy, as for a first save.
+    notePending();
   }
 }
 
@@ -4082,10 +4207,11 @@ async function saveMarks({ item, marks, bitmap, width, height }) {
 function swapFile(item, saved, marks, thumb) {
   const live = state.items.find((each) => each.id === item.id) || (inTrash(item) ? item : null);
   if (!live) {
-    deleteFile({ path: saved.path, downloadId: saved.downloadId });
+    // This session's own download, just completed.
+    deleteFile({ path: saved.path, downloadId: saved.downloadId, verified: true });
     return;
   }
-  const old = { path: live.path, downloadId: live.downloadId };
+  const old = { path: live.path, downloadId: live.downloadId, verified: live.verified };
   live.path = saved.path;
   live.downloadId = saved.downloadId;
   live.marked = marks.length ? true : undefined;
@@ -4246,29 +4372,52 @@ async function recordFor(item) {
  * Take a discarded screenshot back off the disk, and out of the download
  * history with it, if the id still names it (see recordFor). Both calls fail
  * harmlessly if the user already moved or deleted the file by hand.
+ *
+ * Until both have answered, the download is on the list the worker settles if
+ * the panel closes (pendingDownloads): a closing side panel's calls do not
+ * reach the browser, and those not yet sent never would. It is listed from
+ * the call when the id is already known to be the item's own (verified), and
+ * otherwise once recordFor has found it so; an id Chrome may have reissued to
+ * another file is never listed.
  */
 async function deleteFile(item) {
-  const record = await recordFor(item);
-  if (!record) return;
+  const deleting = { downloadId: item.verified ? item.downloadId : null };
+  state.deleting.add(deleting);
+  notePending();
   try {
-    await chrome.downloads.removeFile(record.id);
-  } catch {
-    /* already gone */
-  }
-  try {
-    await chrome.downloads.erase({ id: record.id });
-  } catch {
-    /* already gone */
+    const record = await recordFor(item);
+    if (!record) return;
+    deleting.downloadId = record.id;
+    notePending();
+    try {
+      await chrome.downloads.removeFile(record.id);
+    } catch {
+      /* already gone */
+    }
+    try {
+      await chrome.downloads.erase({ id: record.id });
+    } catch {
+      /* already gone */
+    }
+  } finally {
+    state.deleting.delete(deleting);
+    notePending();
   }
 }
 
 /**
  * The same, for a page on its way out, which cannot wait for an answer: the
- * calls are sent at once and Chrome carries them out after the panel has gone
- * (checked in Chrome, closing the panel's page during the calls). Only for an
- * id this session made or already checked, which Chrome cannot have reissued.
- * cancel() stops a download still waiting on a "Save as" dialog or writing;
- * removeFile() is refused for those and takes back a finished one.
+ * calls are sent at once, without asking first. Only for an id this session
+ * made or already checked, which Chrome cannot have reissued. cancel() stops
+ * a download still waiting on a "Save as" dialog or writing; removeFile() is
+ * refused for those and takes back a finished one.
+ *
+ * Whether Chrome carries them out depends on how the panel went. Checked in
+ * Chrome for Testing 156: they were carried out when the panel's page was
+ * closed on its own (CDP Target.closeTarget), and never reached the browser
+ * when the side panel was closed with chrome.sidePanel.close or with its
+ * window. So this is only a first try; the worker settles the same downloads
+ * when the panel's port closes (see holdArm and background.js).
  */
 function deleteNow(downloadId) {
   chrome.downloads.cancel?.(downloadId)?.catch?.(() => {});
@@ -5205,6 +5354,8 @@ function adoptStored(report, thumbs, { initial = false } = {}) {
   // Opening writes nothing, unless storage holds a stamp too far ahead: a
   // panel open since before the clock went back may still hold it too.
   if (writeBack && (!initial || incoming.far)) persist({ thumbs: true });
+  // An item of the last discard that another window put back is in use again.
+  notePending();
 }
 
 /**
@@ -5705,33 +5856,32 @@ document.addEventListener('pointerover', (event) => {
  * The panel is closing: the side panel was shut, or the window. What was
  * waiting on this page is done now, since nothing will be left to do it.
  *
- * - The last discard is settled, so its files go as promised. Its ids were
- *   made this session or checked when it was discarded, so the calls go out
- *   without asking again (deleteNow).
- * - A save still in flight is taken back: its item was never stored, so its
- *   file would be left in the Downloads folder with nothing pointing at it.
- *   So is a marked copy still on its way: the stored item names the file it
- *   had, which stays, and marks not yet saved are lost with the panel.
+ * - The downloads it would leave behind are taken back (pendingDownloads).
+ *   The last discard is settled, so its files go as promised. A save still
+ *   on its way is cancelled: its item was never stored, so its file would be
+ *   left in the Downloads folder with nothing pointing at it. So is a marked
+ *   copy still on its way: the stored item names the file it had, which
+ *   stays, and marks not yet saved are lost with the panel. A delete still
+ *   under way is sent again whole. Every id was made this session or checked
+ *   when it was discarded or deleted, so the calls go out without asking
+ *   again (deleteNow).
+ *
+ *   This is a first try. In Chrome these calls did not reach the browser
+ *   from a side panel closed with chrome.sidePanel.close or with its window,
+ *   only from one whose page was closed on its own. The worker settles the
+ *   same list when the port closes (holdArm), and a second cancel or erase
+ *   of an id does nothing. So from here the worker keeps the list it last
+ *   heard (closing): what this clears must not take an id off it.
  * - A page shot still scrolling is told to put the page back. The call may
  *   not get out of a closing page; the lease in page-shot.js is the
  *   backstop, and puts the page back 4 s after the last call.
  */
 function flushOnClose() {
+  closing = true;
   if (state.pageShot) callPage(state.pageShot.tabId, 'end').catch(() => {});
-  const trash = state.trash;
+  for (const id of pendingDownloads()) deleteNow(id);
+  clearTimeout(state.trash?.timer);
   state.trash = null;
-  if (trash) {
-    clearTimeout(trash.timer);
-    for (const { item } of trash.entries) {
-      if (item.markSave?.downloadId != null) deleteNow(item.markSave.downloadId);
-      if (state.items.some((candidate) => candidate.id === item.id)) continue;
-      if (item.downloadId != null && (item.verified || !item.path)) deleteNow(item.downloadId);
-    }
-  }
-  for (const item of state.items) {
-    if (!item.path && item.downloadId != null) deleteNow(item.downloadId);
-    if (item.markSave?.downloadId != null) deleteNow(item.markSave.downloadId);
-  }
 }
 window.addEventListener('pagehide', flushOnClose);
 

@@ -354,7 +354,12 @@ focus, and starts again from six once both have left. <kbd>Cmd</kbd><kbd>Z</kbd>
 <kbd>Ctrl</kbd><kbd>Z</kbd> elsewhere, takes it back too, even in the description field, provided
 you have not typed in it since the discard. When the countdown runs out, the discarded
 screenshots are deleted from disk and from Chrome's download list. Closing the panel before then
-deletes them at once.
+deletes them at once. The extension's service worker does that, because Chrome does not carry
+out what a side panel asks for as it closes: the worker hears the panel go and deletes the
+discarded screenshots, unless a panel in another window has taken the item back. If the worker
+cannot run at that moment (Chrome itself quits within those six seconds, say), the screenshots
+stay in your Downloads folder and in Chrome's download list with no item naming them, and the
+extension never deletes them; delete them by hand.
 
 Under the field, the **console** and **network** chips count what the page has produced so
 far, so a glance tells you whether it has thrown anything yet. While the panel is open and
@@ -845,8 +850,9 @@ thumbnails come back when the panel reopens. A sheet nobody has touched for a we
 next time a panel opens, and the screenshots of its items are deleted with it: nothing was
 copied, so no prompt names them. A panel open in another window keeps the sheet. Screenshots of
 items you copied are never deleted by the extension. Closing the panel while a screenshot is
-still saving cancels that download. Closing it while a marked copy is still saving cancels the
-copy, and the item keeps the screenshot it had; the marks are lost with the panel.
+still saving cancels that download, also one waiting on a "Save as" dialog. Closing it while a
+marked copy is still saving cancels the copy, and the item keeps the screenshot it had; the marks
+are lost with the panel. As for a discard, the service worker does this once the panel has gone.
 
 Each window has its own panel, and they all show one sheet. Changes made in two windows at the
 same moment are merged item by item: the newer sentence, tick and intent are kept, and a discard

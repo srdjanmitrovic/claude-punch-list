@@ -4,8 +4,8 @@
  * Deliberately thin. The side panel is a real document, so it can call
  * chrome.tabs, chrome.downloads and canvas APIs directly; routing those through
  * here would only add a hop. What lives here is the work that must survive the
- * panel being closed: side-panel behaviour, the keyboard command, and injecting
- * the capture scripts.
+ * panel being closed: side-panel behaviour, the keyboard command, injecting
+ * the capture scripts, and settling the downloads a closed panel left behind.
  *
  * Message protocol
  * ----------------
@@ -18,6 +18,9 @@
  *                                                      | { ok: false, outside: 'site'|'path' }
  *                                                      | { ok: false, error }
  * panel      => worker   port 'cdr:panel'   posts cdr:holding { tabId|null }; closing it disarms that tab
+ *                                            posts cdr:pending { ids: number[] }, the downloads the
+ *                                            panel would take back if it closed now, the empty
+ *                                            list when there are none; closing it settles them
  * content    -> *        cdr:region-selected { rect, viewport, run, moved? }
  * content    -> *        cdr:element-picked  { rect, viewport, element, run }
  * content    -> *        cdr:capture-cancelled { mode, run }
@@ -919,9 +922,18 @@ function endsArm(message, mode, run) {
  * with nobody left to take the screenshot, a drag would end the overlay
  * exactly as a capture does and leave nothing behind, with no word said.
  *
+ * It holds the same port while it has downloads it would take back if it
+ * closed (a first save or a marked copy still on its way, the files of a
+ * discard that can still be undone, a file it is deleting), and says which
+ * over it, each time that changes. Closing the panel settles them here (settlePending). The panel
+ * sends the same calls on its way out, but in Chrome they do not get out of a
+ * side panel closed with chrome.sidePanel.close or with its window; this
+ * worker outlives it. The panel never closes the port itself.
+ *
  * An idle worker is stopped with the port open, which closes it from this
- * end; a panel still armed then opens a new one, which starts the worker
- * again, so there is always one here to hear the panel go.
+ * end; a panel still armed, or still holding downloads, then opens a new one,
+ * which starts the worker again, and says it all again on it, so there is
+ * always one here to hear the panel go.
  */
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name !== 'cdr:panel' || !fromExtensionPage(port.sender)) {
@@ -929,15 +941,109 @@ chrome.runtime.onConnect.addListener((port) => {
     return;
   }
   let holding = null;
+  let pending = [];
   port.onMessage.addListener((message) => {
-    if (message?.type !== 'cdr:holding') return;
-    holding = Number.isInteger(message.tabId) ? message.tabId : null;
+    if (message?.type === 'cdr:holding') {
+      holding = Number.isInteger(message.tabId) ? message.tabId : null;
+    } else if (message?.type === 'cdr:pending') {
+      // Each list replaces the one before. One this build does not send
+      // leaves none: the panel's last word is then not known, and the list
+      // before it may be one it has moved past.
+      pending = pendingIds(message.ids) ?? [];
+    }
   });
   port.onDisconnect.addListener(() => {
     void chrome.runtime.lastError;
     if (holding != null) disarm(holding).catch(() => {});
+    if (pending.length) settlePending(pending).catch(() => {});
   });
 });
+
+/**
+ * The most download ids one cdr:pending names, as PENDING_MAX in
+ * sidepanel/panel.js, which sends no more. Each item has at most a few
+ * downloads a closing panel would take back (its file or its first save, a
+ * marked copy, and for a moment the file that copy replaced, being deleted),
+ * so this is far beyond any sheet in use; it bounds the work one message can
+ * ask for.
+ */
+const MAX_PENDING = 5000;
+
+/**
+ * The ids of a cdr:pending message, each once, or null when it is not a list
+ * a panel sends: an array, no longer than MAX_PENDING, of download ids, which
+ * Chrome makes safe non negative integers.
+ */
+function pendingIds(ids) {
+  if (!Array.isArray(ids) || ids.length > MAX_PENDING) return null;
+  if (!ids.every((id) => Number.isSafeInteger(id) && id >= 0)) return null;
+  return [...new Set(ids)];
+}
+
+/**
+ * What a closed panel left behind, settled: each download it named, cancelled
+ * while it is still being written or waits on a "Save as" dialog, taken off
+ * the disk once complete, and out of Chrome's download list either way.
+ *
+ * Only a download this extension started, so no list can reach the user's own
+ * downloads or another extension's. And only one whose file no item of the
+ * stored sheet names: another window may have taken the item back, with an
+ * undo or an edit made after the discard. The sheet is read once, when the
+ * port has closed, which is after the panel's last write was sent; a sheet
+ * that cannot be read leaves every file as it is.
+ *
+ * Every call is caught. The panel's own calls on pagehide may have got out
+ * first, and a second cancel, removeFile or erase of the same id does nothing.
+ */
+async function settlePending(ids) {
+  let stored;
+  try {
+    stored = await chrome.storage.local.get('cdrReport');
+  } catch {
+    return;
+  }
+  const items = Array.isArray(stored?.cdrReport?.items) ? stored.cdrReport.items : [];
+  const named = new Set();
+  for (const item of items) {
+    if (typeof item?.path === 'string' && item.path) named.add(item.path);
+  }
+  await Promise.all(ids.map((id) => settleDownload(id, named)));
+}
+
+/** One download of settlePending. Never rejects. */
+async function settleDownload(id, named) {
+  const find = async () => {
+    try {
+      const [record] = await chrome.downloads.search({ id });
+      return record || null;
+    } catch {
+      return null;
+    }
+  };
+  // A download waiting on a "Save as" dialog has no filename yet, which no
+  // stored item can name.
+  const ours = (record) => record?.byExtensionId === chrome.runtime.id && !named.has(record.filename);
+  let record = await find();
+  if (!ours(record)) return;
+  if (record.state === 'in_progress') {
+    await quietly(() => chrome.downloads.cancel(id));
+    // One that finished before the cancel reached it is not cancelled, and
+    // its file is now on disk.
+    record = await find();
+    if (!ours(record)) return;
+  }
+  if (record.state === 'complete') await quietly(() => chrome.downloads.removeFile(id));
+  await quietly(() => chrome.downloads.erase({ id }));
+}
+
+/** Run a chrome.* call and wait for it, whether it throws, rejects or answers. */
+async function quietly(call) {
+  try {
+    await call();
+  } catch {
+    /* already done, or nothing left to do */
+  }
+}
 
 /**
  * The capture mode a content script's message comes from, by its type, or by

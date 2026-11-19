@@ -7,11 +7,14 @@
  * after it, and a probe against the change it asks about. The model is how
  * Chrome was observed to order injections, so what passes here still has to
  * pass in Chrome; what fails here fails there too.
+ *
+ * And what it settles when a panel closes: the downloads the panel said it
+ * would take back, and none it may not touch.
  */
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { FakePage, flush, loadWorker } from './support/worker-realm.mjs';
+import { FakePage, PANEL_SENDER, flush, loadWorker, makeDownloads } from './support/worker-realm.mjs';
 
 const TAB = 1;
 const fromTab = { tab: { id: TAB } };
@@ -491,4 +494,173 @@ test('worker: a site is declared only when Chrome would run the collector on som
   const worker = loadWorker({ pages: { [TAB]: page }, setup: narrowedTo({ include_globs: ['*café*'] }) });
   assert.deepEqual(await worker.settled(worker.send({ type: 'cdr:collect', tabId: TAB })), { ok: false, outside: 'site' });
   assert.deepEqual(worker.injections, []);
+});
+
+// ------------------------------------------------- what a closed panel left
+
+const DIR = '/Users/you/Downloads/claude-punch-list/';
+const OURS = PANEL_SENDER.id;
+
+/** A download record, this extension's unless `extra` says otherwise. */
+const download = (id, extra = {}) => ({ id, state: 'complete', filename: `${DIR}${id}.png`, byExtensionId: OURS, ...extra });
+
+/** A stored sheet whose items name these files. */
+const sheetNaming = (...paths) =>
+  new Map([['cdrReport', { items: paths.map((path, index) => ({ id: `item-${index}`, path })), removed: [], updatedAt: 1, writer: 'x' }]]);
+
+/** Open the panel's port, post each message on it, close it as the panel goes, and let the worker finish. */
+async function panelCloses(worker, ...messages) {
+  const port = worker.connect('cdr:panel');
+  for (const message of messages) port.post(message);
+  port.close();
+  await flush();
+  return port;
+}
+
+/** The ids the worker touched, by call. */
+const touched = (downloads) => ({
+  cancel: downloads.made('cancel'),
+  removeFile: downloads.made('removeFile'),
+  erase: downloads.made('erase'),
+});
+
+const NOTHING = { cancel: [], removeFile: [], erase: [] };
+
+// Found while checking 0.7.0 in Chrome for Testing 156: the panel's own
+// cancel, removeFile and erase on pagehide never reached the browser when the
+// side panel was closed with chrome.sidePanel.close or with its window. A
+// discard closed within its undo left the file on disk and in the download
+// list for good, and a copy waiting on a "Save as" dialog was not cancelled.
+test('worker: closing the panel settles the downloads it said were pending', async () => {
+  const downloads = makeDownloads([
+    download(1), // a discarded file
+    download(2, { state: 'in_progress', filename: '' }), // a marked copy waiting on a "Save as" dialog
+    download(3, { state: 'in_progress', filename: `${DIR}3.png.crdownload` }), // a first save being written
+    download(4), // a file the panel did not name
+  ]);
+  const worker = loadWorker({ downloads });
+  await panelCloses(worker, { type: 'cdr:pending', ids: [1, 2, 3] });
+  assert.deepEqual(touched(downloads), { cancel: [2, 3], removeFile: [1], erase: [1, 2, 3] });
+  assert.deepEqual([...downloads.records.keys()], [4]);
+});
+
+test('worker: a download that finishes before the cancel reaches it is taken off the disk', async () => {
+  const downloads = makeDownloads([download(5, { state: 'in_progress', filename: '' })]);
+  // The user pressed Save in the dialog as the panel closed.
+  downloads.api.cancel = async (id) => {
+    downloads.calls.push(['cancel', id]);
+    Object.assign(downloads.records.get(id), { state: 'complete', filename: `${DIR}5_marked.png` });
+  };
+  const worker = loadWorker({ downloads });
+  await panelCloses(worker, { type: 'cdr:pending', ids: [5] });
+  assert.deepEqual(touched(downloads), { cancel: [5], removeFile: [5], erase: [5] });
+});
+
+test('worker: a closing panel settles only downloads of this extension that no stored item names', async () => {
+  const downloads = makeDownloads([
+    download(1, { byExtensionId: 'another-extension' }),
+    download(2, { byExtensionId: undefined }), // the user's own download, which Chrome reissued the id to
+    download(3), // the item was taken back in another window, which stored it
+    download(4),
+  ]);
+  const worker = loadWorker({ downloads, storage: sheetNaming(`${DIR}3.png`) });
+  await panelCloses(worker, { type: 'cdr:pending', ids: [1, 2, 3, 4, 9] });
+  assert.deepEqual(touched(downloads), { cancel: [], removeFile: [4], erase: [4] });
+
+  // A stored sheet that cannot be read leaves every file as it is.
+  const unreadable = makeDownloads([download(4)]);
+  const blind = loadWorker({
+    downloads: unreadable,
+    setup: (chrome) => {
+      chrome.storage.local.get = () => Promise.reject(new Error('IO error'));
+    },
+  });
+  await panelCloses(blind, { type: 'cdr:pending', ids: [4] });
+  assert.deepEqual(touched(unreadable), NOTHING);
+
+  // A content script's port is shut, and nothing it says is settled.
+  const fromPage = makeDownloads([download(4)]);
+  const attacked = loadWorker({ downloads: fromPage });
+  const port = attacked.connect('cdr:panel', { id: OURS, url: 'https://evil.test/', tab: { id: 1 } });
+  port.post({ type: 'cdr:pending', ids: [4] });
+  port.close();
+  await flush();
+  assert.equal(port.closed, true);
+  assert.deepEqual(touched(fromPage), NOTHING);
+});
+
+test('worker: a list it cannot read settles nothing, not even the list before it', async () => {
+  const malformed = [
+    { type: 'cdr:pending' },
+    { type: 'cdr:pending', ids: 4 },
+    { type: 'cdr:pending', ids: '4' },
+    { type: 'cdr:pending', ids: ['4'] },
+    { type: 'cdr:pending', ids: [4, -1] },
+    { type: 'cdr:pending', ids: [4, 1.5] },
+    { type: 'cdr:pending', ids: [4, 2 ** 53] },
+    { type: 'cdr:pending', ids: [4, null] },
+    { type: 'cdr:pending', ids: { length: 1, 0: 4 } },
+    { type: 'cdr:pending', ids: Array.from({ length: 5001 }, (_, i) => i) },
+  ];
+  for (const message of malformed) {
+    const downloads = makeDownloads([download(4)]);
+    await panelCloses(loadWorker({ downloads }), { type: 'cdr:pending', ids: [4] }, message);
+    assert.deepEqual(touched(downloads), NOTHING, JSON.stringify(message).slice(0, 80));
+  }
+  // The longest list a panel sends is taken.
+  const downloads = makeDownloads([download(4)]);
+  await panelCloses(loadWorker({ downloads }), { type: 'cdr:pending', ids: Array.from({ length: 5000 }, (_, i) => i) });
+  assert.deepEqual(touched(downloads), { cancel: [], removeFile: [4], erase: [4] });
+});
+
+test('worker: each list replaces the one before, and an empty one leaves nothing to settle', async () => {
+  // A save that finished, or a discard undone, before the panel closed.
+  const emptied = makeDownloads([download(1), download(2)]);
+  await panelCloses(loadWorker({ downloads: emptied }), { type: 'cdr:pending', ids: [1, 2] }, { type: 'cdr:pending', ids: [] });
+  assert.deepEqual(touched(emptied), NOTHING);
+
+  const replaced = makeDownloads([download(1), download(2)]);
+  await panelCloses(
+    loadWorker({ downloads: replaced }),
+    { type: 'cdr:pending', ids: [1] },
+    { type: 'cdr:pending', ids: [] },
+    { type: 'cdr:pending', ids: [2] }
+  );
+  assert.deepEqual(touched(replaced), { cancel: [], removeFile: [2], erase: [2] });
+
+  // Nothing is settled while the panel stays open.
+  const open = makeDownloads([download(1)]);
+  const worker = loadWorker({ downloads: open });
+  worker.connect('cdr:panel').post({ type: 'cdr:pending', ids: [1] });
+  await flush();
+  assert.deepEqual(touched(open), NOTHING);
+});
+
+test('worker: a panel that holds a tab and downloads disarms the one and settles the others when it closes', async () => {
+  const downloads = makeDownloads([download(1)]);
+  const worker = loadWorker({ downloads });
+  assert.deepEqual(await worker.settled(worker.send({ type: 'cdr:arm', mode: 'region', tabId: TAB, armId: 'a' })), { ok: true });
+  await panelCloses(worker, { type: 'cdr:holding', tabId: TAB }, { type: 'cdr:pending', ids: [1] });
+  await worker.clock.advance(200);
+  assert.equal(worker.pages[TAB].live(), null);
+  assert.deepEqual(touched(downloads), { cancel: [], removeFile: [1], erase: [1] });
+});
+
+// The worker is stopped while idle with the port open, which closes the port
+// from its end; the panel opens a new one, which starts a new worker, and says
+// the list again on it (the panel's side is in sheet.test.mjs).
+test('worker: a port reopened after the worker stopped settles the list said again on it, once', async () => {
+  const downloads = makeDownloads([download(1), download(2, { state: 'in_progress', filename: '' })]);
+  const storage = new Map();
+  const stopped = loadWorker({ downloads, storage });
+  const first = stopped.connect('cdr:panel');
+  first.post({ type: 'cdr:pending', ids: [1, 2] });
+  stopped.kill();
+  first.close(); // nothing reaches a stopped worker
+  await flush();
+  assert.deepEqual(touched(downloads), NOTHING);
+
+  const started = loadWorker({ downloads, storage });
+  await panelCloses(started, { type: 'cdr:holding', tabId: null }, { type: 'cdr:pending', ids: [1, 2] });
+  assert.deepEqual(touched(downloads), { cancel: [2], removeFile: [1], erase: [1, 2] });
 });

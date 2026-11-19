@@ -17,6 +17,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { loadPanel } from './support/panel-realm.mjs';
 import { makePage, reachPage } from './support/page-realm.mjs';
+import { PANEL_SENDER, flush, loadWorker } from './support/worker-realm.mjs';
 
 const DIR = '/Users/you/Downloads/claude-punch-list/';
 const UNDO_MS = 6000;
@@ -3082,4 +3083,462 @@ test('sheet: an item discarded and brought back in another window during a copy,
   assert.deepEqual(sentences(b), []);
   assert.deepEqual(sentences(a), [], 'the item brought back stayed on the sheets');
   assert.deepEqual(storedItems(storage), []);
+});
+
+// ------------------------------------------------- what a closing panel leaves
+
+/**
+ * The downloads the worker would settle if the panel closed now: the last
+ * list posted on the port open now, or none on a new port. Null with no port
+ * open, when nothing would be settled.
+ */
+function workerList(panel) {
+  const port = panel.ports.at(-1);
+  if (!port || port.disconnected) return null;
+  const lists = port.posted.filter((message) => message.type === 'cdr:pending');
+  return lists.length ? Array.from(lists.at(-1).ids) : [];
+}
+
+/** The worker stopped while idle, which closes the port from its end, a while after it opened. */
+async function workerStops(panel, time) {
+  time.now += 2000;
+  panel.ports.at(-1).close();
+  await panel.flush();
+}
+
+// Found while checking 0.7.0 in Chrome for Testing 156 (present since 0.6.1):
+// flushOnClose's calls never reached the browser from a side panel closed with
+// chrome.sidePanel.close or with its window, so a discard closed within its
+// undo left its file for good. The worker settles what the panel says.
+test('sheet: a discard is pending for the worker until its undo lapses, and the port is held so long', async () => {
+  const { downloads, time, panels: [a] } = await world();
+  await capture(a);
+  const [item] = items(a);
+  assert.deepEqual(workerList(a), [], 'a saved capture was left pending');
+  a.click('preview-clear');
+  await a.flush();
+  assert.deepEqual(workerList(a), [item.downloadId], 'the worker was not told of the discard');
+
+  // The worker stopped: the port is opened again, and the list said again on it.
+  const ports = a.ports.length;
+  await workerStops(a, time);
+  assert.equal(a.ports.length, ports + 1, 'the panel let the port go with a discard pending');
+  assert.deepEqual(workerList(a), [item.downloadId], 'the new port did not hear the list');
+
+  await a.clock.advance(UNDO_MS + 100);
+  await settle(a);
+  assert.deepEqual(downloads.calls.removeFile, [item.downloadId]);
+  assert.deepEqual(workerList(a), [], 'a discard the panel settled stayed pending');
+
+  // Nothing armed and nothing pending: a worker stopped now is left to sleep.
+  await workerStops(a, time);
+  await a.clock.advance(5000);
+  assert.equal(a.ports.length, ports + 1, 'an idle panel woke the worker');
+});
+
+test('sheet: Undo takes the discard off the worker\'s list', async () => {
+  const { downloads, panels: [a] } = await world();
+  await capture(a);
+  const [item] = items(a);
+  a.click('preview-clear');
+  // At once, for a file this session saved: the panel may close any moment.
+  assert.deepEqual(workerList(a), [item.downloadId]);
+  await a.flush();
+  assert.deepEqual(workerList(a), [item.downloadId]);
+  a.element('undo').children[1].dispatch('click');
+  await settle(a);
+  assert.deepEqual(workerList(a), [], 'an item brought back stayed pending');
+  await a.clock.advance(UNDO_MS + 100);
+  assert.deepEqual(downloads.calls.removeFile, []);
+});
+
+test('sheet: a first save is pending for the worker while it saves, and comes off once the stored sheet names its file', async () => {
+  const { storage, downloads, time, panels: [a] } = await world();
+  const held = holdNextDownload(downloads);
+  await capture(a);
+  const [item] = items(a);
+  assert.equal(item.path, null);
+  assert.deepEqual(workerList(a), [item.downloadId], 'the worker was not told of the save');
+  await workerStops(a, time);
+  assert.deepEqual(workerList(a), [item.downloadId], 'the port reopened without the save');
+
+  // What storage names at the moment the worker hears the save is done.
+  const port = a.ports.at(-1);
+  const post = port.postMessage;
+  const heard = [];
+  port.postMessage = (message) => {
+    if (message.type === 'cdr:pending') heard.push({ ids: Array.from(message.ids), stored: storedItems(storage).map((each) => each.path) });
+    post.call(port, message);
+  };
+  await held.finish(a);
+  assert.ok(item.path);
+  assert.deepEqual(heard, [{ ids: [], stored: [item.path] }], 'the worker heard the save was done before the sheet named its file');
+
+  // One that fails comes off too.
+  const failing = holdNextDownload(downloads);
+  time.now += 1000;
+  await capture(a);
+  assert.deepEqual(workerList(a), [2]);
+  await failing.fail(a);
+  assert.equal(items(a).length, 1);
+  assert.deepEqual(workerList(a), []);
+});
+
+test('sheet: a marked copy is pending for the worker while it saves, and comes off when it ends', async () => {
+  const { storage, downloads, panels: [a] } = await world();
+  await capture(a);
+  const [item] = items(a);
+  const held = holdNextDownload(downloads);
+  await markAndSave(a);
+  assert.deepEqual(workerList(a), [2], 'the worker was not told of the marked copy');
+  await held.finish(a);
+  assert.match(storedItems(storage)[0].path, /_marked\.png$/);
+  assert.deepEqual(workerList(a), [], 'a marked copy the item names stayed pending');
+
+  // Cancelled in the dialog, it comes off as well, and the capture is not pending.
+  const cancelled = holdNextDownload(downloads);
+  await markAndSave(a);
+  assert.deepEqual(workerList(a), [3]);
+  await cancelled.fail(a);
+  assert.deepEqual(workerList(a), []);
+  assert.equal(item.downloadId, 2);
+});
+
+// The same gap in flushOnClose: a save discarded while it waited left the
+// discard when the undo lapsed, and no list named it after that.
+test('sheet: a save discarded while it waits stays pending after the undo lapses, until it ends', async () => {
+  for (const close of [false, true]) {
+    const { downloads, panels: [a] } = await world();
+    const held = holdNextDownload(downloads);
+    await capture(a);
+    a.click('preview-clear');
+    await a.flush();
+    await a.clock.advance(UNDO_MS + 100);
+    await settle(a);
+    assert.equal(a.internals.state.trash, null);
+    assert.deepEqual(workerList(a), [1], `the save left the list with the discard (close ${close})`);
+    if (close) {
+      a.R('flushOnClose')();
+      assert.ok(downloads.calls.cancel.includes(1), 'the panel closing left the save running');
+    } else {
+      await held.finish(a);
+      assert.deepEqual(downloads.calls.removeFile, [1]);
+      assert.deepEqual(workerList(a), []);
+    }
+  }
+});
+
+test('sheet: once the page is going the panel tells the worker nothing more', async () => {
+  const { downloads, time, panels: [a] } = await world();
+  await capture(a);
+  a.click('preview-clear');
+  await a.flush();
+  const held = holdNextDownload(downloads);
+  time.now += 1000;
+  await capture(a);
+  assert.deepEqual(workerList(a), [1, 2]);
+  const posted = a.ports.at(-1).posted.length;
+  a.windowEvent('pagehide');
+  // Its own first try, and a save that ends as the page goes.
+  assert.ok(downloads.calls.removeFile.includes(1));
+  assert.ok(downloads.calls.cancel.includes(2));
+  await held.finish(a);
+  await a.clock.advance(UNDO_MS + 100);
+  assert.equal(a.ports.at(-1).posted.length, posted, 'the worker was told a shorter list as the page went');
+  assert.deepEqual(workerList(a), [1, 2]);
+});
+
+test('sheet: a discarded file this panel did not save is pending once Chrome\'s record is held to it, and never otherwise', async () => {
+  const { downloads, panels: [a, b] } = await world({
+    panels: 2,
+    seed: ({ storage, downloads, time }) => {
+      // An id Chrome has since given to another file.
+      storage.data.set('cdrReport', { items: [storedItem('reissued', { downloadId: 3 })], updatedAt: time.now, writer: 'x' });
+      recordFor(downloads, 3, `${DIR}someone-else.png`);
+    },
+  });
+  b.click('preview-clear');
+  await settle(b);
+  assert.equal(workerList(b), null, 'an id Chrome reissued was put on the list');
+  await b.clock.advance(UNDO_MS + 100);
+
+  // Captured in the other window: this one has not asked Chrome about it.
+  await capture(a);
+  await settle(a, b);
+  const [theirs] = items(b);
+  assert.ok(!theirs.verified);
+  b.click('preview-clear');
+  assert.equal(workerList(b), null);
+  await b.flush();
+  assert.deepEqual(workerList(b), [theirs.downloadId], 'the checked record did not reach the list');
+  assert.deepEqual(downloads.calls.removeFile, []);
+});
+
+test('sheet: the panel never sends a longer list than the worker takes', async () => {
+  const worker = readFileSync(new URL('../background.js', import.meta.url), 'utf8');
+  const most = Number(/const MAX_PENDING = (\d+);/.exec(worker)?.[1]);
+  assert.ok(most > 0);
+  const { panels: [a] } = await world();
+  for (let id = 0; id <= most; id += 1) a.internals.state.saves.add({ downloadId: id });
+  a.R('notePending')();
+  assert.equal(workerList(a).length, most);
+});
+
+test('sheet: a discarded item another window puts back comes off the worker\'s list', async () => {
+  const { storage, time, panels: [a, b] } = await world({ panels: 2 });
+  await capture(a);
+  await settle(a, b);
+  const id = items(a)[0].downloadId;
+  storage.hold();
+  time.now += 1000;
+  a.click('preview-clear');
+  await a.flush();
+  assert.deepEqual(workerList(a), [id]);
+  time.now += 1000;
+  b.R('document').activeElement = b.element('description');
+  type(b, 'still wanted');
+  storage.release();
+  await settle(a, b);
+  assert.deepEqual(sentences(a), ['still wanted']);
+  assert.deepEqual(workerList(a), [], 'the file of an item back on the sheet stayed pending');
+});
+
+/**
+ * One panel and the real worker over one storage and one downloads list, the
+ * panel's port to the worker going straight to it, as in Chrome. The records
+ * name this extension as their starter. ports lists the panel's ports: gone()
+ * is the panel going away, as the worker hears it, and stop() the worker
+ * stopped, as the panel hears it.
+ */
+async function panelAndWorker() {
+  const ports = [];
+  const live = { worker: null };
+  const found = await world({
+    setups: [
+      (chrome) => {
+        chrome.runtime.id = PANEL_SENDER.id;
+        chrome.runtime.connect = ({ name } = {}) => {
+          const end = live.worker.connect(name);
+          const onDisconnect = [];
+          const port = {
+            name,
+            posted: [],
+            disconnected: false,
+            postMessage(message) {
+              if (port.disconnected) throw new Error('Attempting to use a disconnected port object');
+              port.posted.push(clone(message));
+              end.post(clone(message));
+            },
+            disconnect() {
+              port.disconnected = true;
+              end.close();
+            },
+            onDisconnect: { addListener: (fn) => onDisconnect.push(fn) },
+            onMessage: { addListener() {} },
+            gone() {
+              port.disconnected = true;
+              end.close();
+            },
+            stop() {
+              port.disconnected = true;
+              for (const fn of onDisconnect) fn(port);
+            },
+          };
+          ports.push(port);
+          return port;
+        };
+      },
+    ],
+  });
+  const { storage, downloads } = found;
+  const download = downloads.api.download;
+  downloads.api.download = async (options) => {
+    const id = await download(options);
+    downloads.records.get(id).byExtensionId = PANEL_SENDER.id;
+    return id;
+  };
+  const start = () => (live.worker = loadWorker({ downloads: { api: { ...downloads.api } }, storage: storage.data }));
+  start();
+  return { ...found, ports, live, start };
+}
+
+/** The panel closed as Chrome closed it: its own calls on the way out never reach the browser. */
+async function panelClosesInChrome(panel, ports) {
+  const lost = [];
+  const drop = (name) => (id) => {
+    lost.push([name, typeof id === 'object' ? id.id : id]);
+    return new Promise(() => {});
+  };
+  panel.chrome.downloads = { ...panel.chrome.downloads, cancel: drop('cancel'), removeFile: drop('removeFile'), erase: drop('erase') };
+  panel.windowEvent('pagehide');
+  ports.at(-1).gone();
+  await flush();
+  return lost;
+}
+
+test('sheet: a panel closed as Chrome closes it has what it left settled by the worker', async () => {
+  const { storage, downloads, time, ports, panels: [a] } = await panelAndWorker();
+  await capture(a); // 1, discarded below
+  time.now += 1000;
+  await capture(a); // 2, marked up below
+  const marked = items(a)[1];
+  const copy = holdNextDownload(downloads);
+  await markAndSave(a); // 3, waiting on a "Save as" dialog
+  pickRow(a, 0);
+  a.click('preview-clear');
+  await a.flush();
+  const save = holdNextDownload(downloads);
+  time.now += 1000;
+  await capture(a); // 4, a first save waiting on its dialog
+  assert.ok(copy.record && save.record);
+  assert.deepEqual(workerList({ ports }), [1, 3, 4]);
+
+  const lost = await panelClosesInChrome(a, ports);
+  assert.ok(lost.some(([name, id]) => name === 'removeFile' && id === 1), 'the panel did not try first');
+  assert.deepEqual(downloads.calls.cancel, [3, 4], 'a save left waiting on its dialog was not cancelled');
+  assert.deepEqual(downloads.calls.removeFile, [1], 'the discarded file was left on disk');
+  assert.deepEqual(downloads.calls.erase, [1, 3, 4]);
+  assert.ok(storedItems(storage).some((item) => item.path === marked.path && item.downloadId === 2));
+});
+
+test('sheet: a panel closed as Chrome closes it after the worker stopped has its discard settled by the next worker', async () => {
+  const { downloads, time, ports, live, start, panels: [a] } = await panelAndWorker();
+  await capture(a);
+  a.click('preview-clear');
+  await a.flush();
+  const first = live.worker;
+  first.kill();
+  start();
+  time.now += 2000;
+  ports.at(-1).stop();
+  await a.flush();
+  assert.equal(ports.length, 2, 'the panel did not open a port to the new worker');
+  await panelClosesInChrome(a, ports);
+  assert.deepEqual(downloads.calls.removeFile, [1]);
+  assert.deepEqual(downloads.calls.erase, [1]);
+});
+
+/** Hold every call of one chrome.downloads method until release(), as a slow browser would. */
+function holdCalls(downloads, name) {
+  const real = downloads.api[name];
+  const waiting = [];
+  downloads.api[name] = (arg) => new Promise((resolve) => waiting.push(() => resolve(real(arg))));
+  return {
+    waiting,
+    async release(panel) {
+      downloads.api[name] = real;
+      for (const go of waiting.splice(0)) go();
+      await settle(panel);
+    },
+  };
+}
+
+/** Every list the panel posted to the worker, on every port, in order. */
+function everyList(panel) {
+  return panel.ports.flatMap((port) =>
+    port.posted.filter((message) => message.type === 'cdr:pending').map((message) => Array.from(message.ids))
+  );
+}
+
+// Found in review: a delete under way had already left the list, so a panel
+// closed before its calls had answered left the file on disk, or its row in
+// the download list, with no item naming it.
+test('sheet: a file being deleted stays on the worker\'s list until both of its calls have answered', async () => {
+  const { downloads, time, panels: [a] } = await world();
+  await capture(a); // 1
+  time.now += 1000;
+  await capture(a); // 2
+  pickRow(a, 0);
+  a.click('preview-clear');
+  await a.flush();
+  assert.deepEqual(workerList(a), [1]);
+  const removing = holdCalls(downloads, 'removeFile');
+  const erasing = holdCalls(downloads, 'erase');
+  // A second discard settles the first, whose delete starts now.
+  pickRow(a, 0);
+  a.click('preview-clear');
+  assert.deepEqual(workerList(a), [1, 2], 'the file the second discard began deleting left the list');
+  await settle(a);
+  assert.equal(removing.waiting.length, 1);
+  assert.deepEqual(workerList(a), [1, 2], 'a file whose removeFile had not answered left the list');
+  await removing.release(a);
+  assert.equal(erasing.waiting.length, 1);
+  assert.deepEqual(workerList(a), [1, 2], 'a file whose erase had not answered left the list');
+  await erasing.release(a);
+  assert.deepEqual(downloads.calls.removeFile, [1]);
+  assert.deepEqual(downloads.calls.erase, [1]);
+  assert.deepEqual(workerList(a), [2]);
+});
+
+test('sheet: a marked copy whose item has left for good stays on the worker\'s list until it is deleted', async () => {
+  const { downloads, panels: [a] } = await world();
+  await capture(a); // 1
+  const copy = holdNextDownload(downloads);
+  await markAndSave(a); // 2
+  pickRow(a, 0);
+  a.click('preview-clear');
+  await a.clock.advance(UNDO_MS + 100);
+  await settle(a);
+  assert.deepEqual(workerList(a), [2]);
+  const before = everyList(a).length;
+  await copy.finish(a);
+  assert.deepEqual(downloads.calls.removeFile, [1, 2]);
+  // Off the list once, when its delete has answered, and not in between.
+  assert.deepEqual(everyList(a).slice(before), [[]]);
+});
+
+test('sheet: a file the weekly expiry deletes is listed once Chrome\'s record is held to it, and an id Chrome reissued never', async () => {
+  const { downloads, panels: [a] } = await world({
+    seed: ({ storage, downloads, time }) => {
+      storage.data.set('cdrReport', {
+        items: [storedItem('stale', { downloadId: 4 }), storedItem('reissued', { downloadId: 5 })],
+        updatedAt: time.now - 8 * DAY,
+        writer: 'x',
+      });
+      recordFor(downloads, 4, `${DIR}stale.png`);
+      recordFor(downloads, 5, `${DIR}someone-else.png`);
+    },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(downloads.calls.removeFile, [4]);
+  assert.deepEqual(everyList(a), [[4], []]);
+});
+
+test('sheet: a panel closed as Chrome closes it in the middle of a delete has the rest done by the worker', async () => {
+  // A discard the next one settled, closed before the delete's calls went out.
+  {
+    const { downloads, time, ports, panels: [a] } = await panelAndWorker();
+    await capture(a); // 1
+    time.now += 1000;
+    await capture(a); // 2
+    pickRow(a, 0);
+    a.click('preview-clear');
+    await a.flush();
+    pickRow(a, 0);
+    a.click('preview-clear');
+    const lost = await panelClosesInChrome(a, ports);
+    assert.ok(lost.some(([name, id]) => name === 'removeFile' && id === 1), 'the panel did not try first');
+    const byId = (list) => [...list].sort((x, y) => x - y);
+    assert.deepEqual(byId(downloads.calls.removeFile), [1, 2], 'the file being deleted was left on disk');
+    assert.deepEqual(byId(downloads.calls.erase), [1, 2]);
+  }
+  // The capture a marked copy replaced, closed while its removeFile is on its way.
+  {
+    const { storage, downloads, ports, panels: [a] } = await panelAndWorker();
+    await capture(a); // 1
+    const copy = holdNextDownload(downloads);
+    await markAndSave(a); // 2
+    // The panel's own removeFile never answers; the worker's calls are Chrome's.
+    downloads.api.removeFile = () => new Promise(() => {});
+    await copy.finish(a);
+    assert.match(storedItems(storage)[0].path, /_marked\.png$/);
+    assert.deepEqual(workerList({ ports }), [1], 'the capture being deleted was not on the list');
+    // The capture joins the list before the copy leaves it: at no moment is
+    // there nothing to settle.
+    assert.deepEqual(everyList({ ports }), [[1], [], [2], [1, 2], [1]]);
+    await panelClosesInChrome(a, ports);
+    assert.deepEqual(downloads.calls.removeFile, [1], 'the capture the copy replaced was left on disk');
+    assert.deepEqual(downloads.calls.erase, [1]);
+    assert.ok(downloads.records.has(2), 'the copy the stored item names was settled');
+  }
 });
