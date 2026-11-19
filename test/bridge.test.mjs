@@ -8,8 +8,9 @@
  * script can change in its world only. makeWorlds (test/support/
  * worker-realm.mjs) is that, as far as these two can tell; page scripts run
  * in the collector's world, as they do in Chrome. What this proves is the
- * conversation between the two halves, what the bridge hands the panel, and
- * what a page script can reach of it, not Chrome.
+ * conversation between the two halves, the picker's question for a
+ * component's name, what the bridge hands the panel, and what a page script
+ * can reach of it, not Chrome.
  */
 
 import test from 'node:test';
@@ -47,7 +48,40 @@ function world(options) {
     /** An event the browser fires on the window. */
     fire: (type) => tab.fire(type),
     isolated: tab.isolated.window,
+    /** A node both worlds share, as each wraps it (see makeWorlds). */
+    node: (options) => tab.node(options),
+    /** Code of the extension's own, in its world, as the picker's. */
+    extension: (code) => tab.run('isolated', code),
   };
+}
+
+/**
+ * The picker's question while it hovers, as askName() in content/picker.js
+ * asks it, run in the extension's world about a node set there as `asked`:
+ * whether a reply came before dispatchEvent returned, and its detail.
+ */
+const ASK_NAME = `(() => {
+  let heard = false;
+  let detail;
+  const take = (event) => {
+    if (heard) return;
+    heard = true;
+    detail = event.detail;
+  };
+  window.addEventListener('__cdr_name:reply', take, true);
+  try {
+    asked.dispatchEvent(new CustomEvent('__cdr_name', { composed: composed !== false }));
+  } finally {
+    window.removeEventListener('__cdr_name:reply', take, true);
+  }
+  return { heard, detail };
+})()`;
+
+/** Asks the collector, from the extension's world, the name behind a shared node. */
+function askName(tab, node, { composed = true } = {}) {
+  tab.isolated.asked = node.isolated;
+  tab.isolated.composed = composed;
+  return tab.extension(ASK_NAME);
 }
 
 test('bridge: reads the log over its own channel, whichever half starts first, and posts nothing (CO14)', async () => {
@@ -800,4 +834,89 @@ test('bridge: on a late start, a page that answers in the collector\'s place and
   const asks = tab.page.asks - from;
   assert.ok(asks <= 6, `${asks} asks in a second`);
   assert.ok(panel.posted.length <= 7, `${panel.posted.length} posts in a second`);
+});
+
+// ------------------------------------------------------ the name on hover --
+// While Element is armed the picker asks, from the extension's world, the
+// name of the component behind the highlighted element, with an event sent
+// on the node itself (see the name request in collector-main.js).
+
+test('bridge: a name asked from the extension\'s world on a node is answered before dispatchEvent returns, from the page\'s own wrapper, as a copy', () => {
+  const tab = world();
+  tab.bridge();
+  tab.collector();
+  const button = tab.node();
+  tab.page.button = button.main;
+  // React's expando, which only the page's world can see.
+  tab.realm(`
+    button.__reactFiber$k = { tag: 5, type: 'button', return: { tag: 0, type: function Total() {}, return: null } };
+  `);
+  assert.deepEqual(Object.keys(button.isolated).filter((key) => key.startsWith('__react')), []);
+  const { heard, detail } = askName(tab, button);
+  assert.equal(heard, true, 'no answer before dispatchEvent returned');
+  assert.deepEqual(plain(detail), { name: 'Total', renamed: false });
+  assert.notEqual(Object.getPrototypeOf(detail), tab.realm('Object.prototype'), 'the page world\'s own object crossed');
+  // Nothing posted, and nothing for a node with no component but a null.
+  assert.deepEqual(tab.posted, []);
+  const plainNode = askName(tab, tab.node());
+  assert.equal(plainNode.heard, true);
+  assert.equal(plainNode.detail, null);
+  assert.deepEqual(tab.errors, []);
+});
+
+test('bridge: a name asked from inside an open shadow root is the node\'s own, read off the path, and only a composed question gets out', () => {
+  const tab = world();
+  tab.collector();
+  const host = tab.node();
+  const inner = tab.node({ host: host.record });
+  tab.page.inner = inner.main;
+  tab.page.host = host.main;
+  tab.realm(`
+    inner.__reactFiber$k = { tag: 5, type: 'button', return: { tag: 0, type: function SaveButton() {}, return: null } };
+    host.__reactFiber$k = { tag: 5, type: 'x-card', return: { tag: 0, type: function Card() {}, return: null } };
+  `);
+  assert.deepEqual(plain(askName(tab, inner).detail), { name: 'SaveButton', renamed: false });
+  assert.equal(askName(tab, inner, { composed: false }).heard, false, 'heard from inside the root without composed');
+  // A page that replaced the path and the target later is not read through.
+  tab.realm(`
+    Event.prototype.composedPath = function () { return [host]; };
+    Object.defineProperty(Event.prototype, 'target', { configurable: true, get() { return host; } });
+  `);
+  assert.deepEqual(plain(askName(tab, inner).detail), { name: 'SaveButton', renamed: false });
+});
+
+test('bridge: page code that runs while a name is read sees the name request, never the log channel, and gets no log', async () => {
+  const tab = world();
+  tab.bridge();
+  tab.collector();
+  const button = tab.node();
+  tab.page.button = button.main;
+  tab.realm(`
+    window.seen = [];
+    window.guessed = 0;
+    const Total = function Total() {};
+    // A getter of the page's on what the collector reads for the name.
+    Object.defineProperty(Total, 'displayName', {
+      get() {
+        seen.push(window.event && window.event.type);
+        return undefined;
+      },
+    });
+    button.__reactFiber$k = { tag: 5, type: 'button', return: { tag: 0, type: Total, return: null } };
+    console.error('order 4412 failed for bob@example.com');
+  `);
+  assert.deepEqual(plain(askName(tab, button).detail), { name: 'Total', renamed: false });
+  const { collected } = await tab.ask('cdr:get-context');
+  assert.deepEqual(collected.console.map((entry) => entry.text), ['order 4412 failed for bob@example.com']);
+  const seen = plain(tab.page.seen);
+  assert.ok(seen.length > 0, 'the getter never ran');
+  assert.deepEqual([...new Set(seen)], ['__cdr_name']);
+  // A channel the page makes up is not one the collector listens on.
+  tab.realm(`
+    const guess = '__cdr_' + '0123456789abcdef'.repeat(2);
+    window.addEventListener(guess + ':reply', () => { guessed += 1; });
+    window.dispatchEvent(new CustomEvent(guess, { detail: 'snapshot' }));
+  `);
+  assert.equal(tab.page.guessed, 0);
+  assert.deepEqual(tab.posted, []);
 });

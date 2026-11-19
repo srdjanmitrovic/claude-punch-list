@@ -444,6 +444,44 @@ export const EXTRA = {
     return report;
   },
 
+  // A Svelte 5 development build: the element's own line and column in the
+  // file that writes it, the files it sits in, and the props Svelte 5.58 and
+  // later let be read. No handlers, which are read for React and Vue 3 only.
+  svelte: () => {
+    const report = sampleReport('bug');
+    const { element } = report.items[0];
+    element.component = {
+      framework: 'svelte',
+      version: '5',
+      build: 'development',
+      names: ['CouponField', 'CheckoutForm', '+page'],
+      source: 'src/lib/CouponField.svelte:14:5',
+      props: ['value="SUMMER25"', 'disabled=false'],
+      hops: 0,
+    };
+    element.handlers = null;
+    return report;
+  },
+
+  // An Angular development build, read through its own window.ng: the file
+  // and line of the component's class, its inputs as props, and an element
+  // two up from the one Angular rendered (content a directive wrote itself).
+  angular: () => {
+    const report = sampleReport('bug');
+    const { element } = report.items[0];
+    element.component = {
+      framework: 'angular',
+      version: '22.3.0',
+      build: 'development',
+      names: ['CouponFieldComponent', 'CheckoutComponent', 'AppComponent'],
+      source: 'src/app/coupon-field/coupon-field.component.ts:12',
+      props: ['code="SUMMER25"', 'disabled=false'],
+      hops: 2,
+    };
+    element.handlers = null;
+    return report;
+  },
+
   // Secrets in every place a url prints: the page, a request, a logged
   // message, a failed resource, and credentials in an address on a second
   // origin. Each keeps its shape and loses only the value.

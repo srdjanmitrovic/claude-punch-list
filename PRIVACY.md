@@ -45,15 +45,34 @@ you are picking an element or have just picked one: it reads, keeps and sends no
 wherever the collector is set to run, in pages loaded since the extension was installed or
 enabled.
 
+While you are picking an element, the extension also reads, in the page, the name of the React,
+Vue or Svelte component behind the highlighted element, and shows it beside the highlight. It does
+so each time the highlight moves to another element, by the pointer, Tab or the arrow keys, keeps
+nothing of it and sends nothing. The name goes into an item only if you pick that element, as
+part of what Element takes, below. On an Angular page it shows no name while you hover, since
+Angular can only be asked by calling its own functions, which the extension does for a pick alone.
+
 **When you capture something** with Region, Element, Screen or Page, the extension takes:
 
 * a screenshot of the visible part of the tab, cropped to what you framed, or with Page, of the
   whole page, scrolled through and put together;
 * the page's address and title, and the size of the window;
 * with Element, the element you clicked: a selector that finds it again, its markup and
-  attributes, some of its computed styles, its visible text, and, on a React or Vue page, the
-  name of the component that rendered it, that component's props, and the names and first
-  statements of the event handlers bound to it.
+  attributes, some of its computed styles, its visible text, and, on a React, Vue, Svelte or
+  Angular page, the name of the component that rendered it and of those around it, the file it is
+  defined or written in where the page's development build records one, and that component's
+  props (on Svelte, from Svelte 5.58; on Angular, its inputs), and, on a React or Vue 3 page, the
+  names and first statements of the event handlers bound to it. These are read from what the framework itself keeps
+  in the page. On an Angular page that means calling, at the pick only, the functions Angular's
+  development build publishes for its own DevTools (`window.ng`). Those functions cache what they
+  find (`__ngContext__`) on the elements and the component instances they are asked about, and
+  the extension puts that cache back as it found it before it answers, with one rare exception:
+  on the host of a component whose elements an overlay or a portal moved elsewhere in the page, a
+  cache made before the pick with nothing filled in yet (by Angular DevTools, for instance) is
+  given back as the plain number Angular put there at render, which Angular reads the same way
+  (see the [architecture notes](docs/ARCHITECTURE.md)). Reading a prop can run the component's own
+  code, as reading it in the page's own scripts would, for instance a Svelte prop computed from the
+  parent's state or an Angular signal input.
 
 **When you use Page**, the extension scrolls the page you are on from the top down, one screen at
 a time, and hides what is fixed to the window between screenshots, then puts both back as they
@@ -74,9 +93,11 @@ Values that look secret are replaced with `<redacted>` where they are read, befo
 stored: props, markup and logged objects whose names look like a password, token, key, session or
 card number, the values of password and hidden fields, any prop that holds what a password, one
 time code or card field on the page holds or is shaped like such a secret in a component that
-renders one, and the matching parts of every address the prompt prints. That screening goes mostly
-by name, so it is not a guarantee. The README's privacy section lists what it covers and what it
-does not, among them free text, the page title and the screenshot itself.
+renders one, and the matching parts of every address the prompt prints. For Svelte, Vue 2 and
+Angular, "renders one" means a field under the component's element in the page, so a field such a
+component shows elsewhere, in an overlay or a portal, does not count as its own. That screening
+goes mostly by name, so it is not a guarantee. The README's privacy section lists what it covers
+and what it does not, among them free text, the page title and the screenshot itself.
 
 ## Where it is kept, and for how long
 

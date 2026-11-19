@@ -33,10 +33,12 @@ sidepanel/panel.js ......... orchestrates everything. Captures the tab, crops
         ^                             and posts the counts on a port to the panel.
         | channel events              |
         | (the log, the counts)       | window.postMessage (inspect, from the picker)
+        |                             | an event on the node (the name, while hovering)
         v                             v
        content/collector-main.js .... MAIN world, always on. Wraps console,
                                       fetch and XHR from document_start, and
-                                      reads React and Vue internals on request.
+                                      reads React, Vue, Svelte and Angular
+                                      internals on request.
 ```
 
 ## Three decisions worth understanding
@@ -106,10 +108,14 @@ and push the live bridge's channel out, which leaves the page's log unread and t
 the reload advice. And when the extension starts on a tab that was already open (see
 [A tab that was open before](#a-tab-that-was-open-before)), the bridge has to announce its
 channel where a page listener can hear it, and a script listening then can read every snapshot
-over it and answer in the collector's place. None of this lets it put anything into a prompt that
-it could not put there by logging made up lines, which any page can do, and what it can read is
-the page's own console and network activity, which it could record anyway by wrapping the same
-functions.
+over it and answer in the collector's place. It can send `__cdr_name` on a node of its own and
+learn from the reply that the extension is there, hear the picker's `__cdr_name` while Element is
+armed and learn which element is highlighted (the arrow keys' included), and answer it before the
+collector does or keep the answer back (see [The name while hovering](#the-name-while-hovering)),
+which changes the name on the tag and nothing else. None of this lets it put anything into a
+prompt that it could not put there by logging made up lines, which any page can do, and what it
+can read is the page's own console and network activity, which it could record anyway by
+wrapping the same functions.
 
 While the side panel is open and shown on a tab, it also holds a port to that tab's bridge,
 `cdr:counts`, opened with `chrome.tabs.connect` to the top frame once a read has found the
@@ -160,9 +166,10 @@ again when it is shown.
 
 The picker still asks what rendered a node over `window.postMessage`, and that answer is about
 the node alone. The same boundary is why the element picker cannot read a React fiber itself.
-React hangs the fiber off the DOM node as a `__reactFiber$<random>` property and Vue hangs
-`__vueParentComponent`, and those properties live on each world's own wrapper of the node, so
-an isolated world script sees a node with none of them. The DOM itself **is** shared, which is
+React hangs the fiber off the DOM node as a `__reactFiber$<random>` property, Vue 3 hangs
+`__vnode` and `__vueParentComponent`, Vue 2 `__vue__` and Svelte `__svelte_meta`, and those
+properties live on each world's own wrapper of the node, so an isolated world script sees a node
+with none of them. The same goes for the `window.ng` Angular publishes. The DOM itself **is** shared, which is
 what the handoff uses: the picker sets a random `data-cdr-pick` attribute on the clicked
 element, asks for it by that value, and the main world finds the node with `querySelector`, and
 inside open shadow roots when that finds nothing (`findMarked`, which walks at most 20 000
@@ -191,6 +198,80 @@ event dispatch reads them back from there, and Vue keeps the same names on `__vn
 Neither is the fiber, so the two lookups climb independently and their hop counts can differ.
 That is why the prompt never presents them as one number.
 
+The component comes from `componentOf`, which asks one reader per framework in turn: React, Vue
+3, Vue 2, Svelte, then Angular. Each answers null for a node it does not know, and each reads only
+what the framework itself keeps in the page, with no code of the extension's left behind.
+
+* **Vue 2** puts `__vue__`, the instance, on the element each component's render made its root,
+  in a production build too. An element inside the root carries nothing, so `vue2Summary` climbs
+  to the nearest root, passes through any component that renders another as its own root (both
+  share the element, and the outer one holds it) to the innermost, and walks that instance's
+  render tree, at most `SUBTREE_LIMIT` vnodes and never into a child component, for the vnode of
+  the element nearest the picked one. That vnode's `context` is the instance whose template made
+  it, which is how slot content is credited to the template that wrote it, as Vue 3's
+  `__vnode.ctx` is. A walk that stops short of the picked element names the root's component with
+  no steps counted, rather than an element two up that is no answer. A development build is told
+  from a production one by `_renderProxy`, a `Proxy` in the first and the instance itself in the
+  second, and only the first is claimed.
+* **Svelte**'s development build puts `__svelte_meta` on each element it creates from a template:
+  where the element is written (`loc`, from Svelte 3), the blocks and components it was rendered
+  inside (`parent`, from 5.36), and the context of the component that rendered it (`component`,
+  with its props as `s` and its function, from 5.58). Svelte 5 also defines `__svelte_meta` as
+  null on `Element.prototype`, so only a meta the element holds itself counts. The component is
+  named after its file, as the compiler names it, and printed as where the element is written
+  (`Element written at`); Svelte 3 and 4 count lines from 0, so the reader adds one to theirs.
+  Props are read only when the context's function was compiled from the element's own file (its
+  `Symbol('filename')`, found by description, since the symbol is not exported), because a
+  snippet's element is written in one file and rendered with another component's context.
+* **Angular** keeps nothing on an element that says which component rendered it, so
+  `angularSummary` calls the functions a development build publishes for Angular DevTools on
+  `window.ng` (`getOwningComponent`, `getHostElement`, `getDirectiveMetadata`, `isSignal`). It is
+  the one reader that runs the page's code, every call goes through `ask()` in a try, and only an
+  object answer is kept. `getOwningComponent` and `getHostElement` go through Angular's
+  `getLContext`, which caches what it finds in `__ngContext__`, a property of Angular's own that it
+  reads back in either form: an LContext on each element asked about that Angular rendered, and on
+  each component instance asked about and its host element, or the LContext the host already holds
+  with its component filled in. A component instance, its host and the root elements of each
+  template hold their view's number there from render, and an LContext refers back to the instance
+  and the host, so the page's own code that serialises an instance (`JSON.stringify(this)`) would
+  meet a cycle after a pick that it did not meet before. (Asked about a directive, `getLContext`
+  would write on every directive of its element too, but the reader asks only about elements and
+  about the components `getOwningComponent` answers.) So the reader puts all of it back. Before
+  each call it notes the own `__ngContext__` of what the call can change (`noteContext`): each
+  element it climbs through, and each instance before `getHostElement`. A host is known only from
+  `getHostElement`'s answer, by which time the call has changed it, so the reader notes ahead the
+  elements where the hosts usually are (`noteAbove`): before the first `getHostElement`, the
+  elements above the one the climb stopped at, and after each `getHostElement`, the elements above
+  the host it answered, before anything asks about them. Each step goes past a shadow root to its
+  host (`parentOrHost`, through the native `parentNode` and `ShadowRoot.prototype.host` getters),
+  so the host of a component whose template `ViewEncapsulation.ShadowDom` puts in a shadow root is
+  among them. That leaves a host above none of those: the host of a component whose elements an
+  overlay or a portal moved away from it. `noteHost` works out what such a host held from what
+  `getLContext` does: the number its instance held, when the instance and the host now share an
+  LContext with nothing but its component filled in, and otherwise what it holds now. In
+  `finally`, `putBack` defines each member that is not as it was back as it was, and deletes one
+  that was absent, through `Object.defineProperty`, `Object.getOwnPropertyDescriptor` and
+  `Reflect.deleteProperty` taken as the file loads, each step in its own try, and writes nothing
+  that is as it was. So a number stays that number, an absent one stays absent, an LContext
+  Angular DevTools made first stays the same object with its component as it was, and an accessor
+  the page put there is neither run nor replaced. Three things are not put back. What Angular's own
+  write hands to such an accessor's setter stays with the page's code. A member the page's own code
+  made unwritable while a call ran (an object it froze, or a proxy that refuses the write) stays as
+  the call left it. And on a host that only a call's answer names, an LContext made before the pick
+  with nothing filled in (by `getOwningComponent`, `getContext` or `getInjector` asked about that
+  host, for instance) cannot be told from one the call made, and is given its number back. Angular
+  reads either form the same way. The name and the file and line come from the `debugInfo` the
+  compiler gives a component's definition from Angular 17.1, read only when `ɵcmp` is a value of
+  the class's own; a component compiled in the browser has a getter there that compiles it, which
+  is not called, so it is named by its class with no file. The version is the root host's
+  `ng-version`, and the props are the inputs `getDirectiveMetadata` lists, a signal input called
+  for its value and one that throws (a required input not yet set) left out. An input has two
+  names, the one a template binds and its class property, and is filed under the first unless only
+  the second looks secret (`@Input('value') password`), so that the name rule withholds it.
+
+A production build of Svelte or Angular leaves nothing to read, and no reader guesses: the item
+has no component, as on a page with no framework.
+
 Whether a handler's body is worth printing is decided by the text itself rather than by the build
 label. The test is whether the author's own names survived: an identifier of four characters or
 more, outside a string, that is not one a minifier keeps, and not read after a dot unless what it
@@ -206,7 +287,13 @@ has a minified body behind a real name.
 Props are printed unless they could carry a secret (`summariseProps`). A prop whose own name is a
 secret name is withheld. When a component is inspected, the collector also reads the live values of
 the page's secret controls (`reactGuard`, `vueGuard`): the controls the component renders, up to
-3,000 nodes, and the document's own (`documentValues`). Those are elements of type password,
+3,000 nodes, and the document's own (`documentValues`). Svelte, Vue 2 and Angular keep no tree of
+what a component rendered that this file reads, so for them `domGuard` takes the elements under the
+component's element in the page instead, through the native `getElementsByTagName` and no further
+than 3,000: Vue 2's `$el`, Angular's host, or, for Svelte, whose component has no element of its
+own, the first ancestor it did not render, counting under it only what the component or one inside
+it rendered (by the meta's context chain) and what has no meta, as `{@html}` writes. A field such a
+component renders outside that element, in an overlay or a portal, is not counted as its own. Those are elements of type password,
 elements whose autocomplete says `current-password`, `new-password`, `one-time-code`, `cc-number`
 or `cc-csc`, and form controls whose name or id is a secret name such as `csrf_token`. In the
 document it reads at most 32 of each kind, judging the names of the first 256 inputs, text areas
@@ -291,6 +378,45 @@ selector costs an element of the light DOM. So 300 roots of 1,000 elements each 
 512 roots of 2,000 elements each 58.9 ms, where 0.6.0 took 0.1 and 0.2 ms. A budget of elements
 shared by the roots would cap that, but one root of 10,000 elements or more, such as a data grid,
 would then hide a password field in every root after it.
+
+#### The name while hovering
+
+While Element is armed, the tag over the highlight names the component as well, and that question
+takes another road than a pick's, because it is asked as often as once a frame for as long as the
+pointer moves. It writes nothing into the page and posts nothing. The picker sends a `__cdr_name`
+event on the highlighted node itself (on the outermost closed host through `reachOf`, as at a
+pick), composed, so that it gets out of an open shadow root, and not bubbling. The collector hears
+it in a capture listener on the window and answers with `__cdr_name:reply` on the window:
+`{ name, renamed }`, or `null` when no component is found. Dispatch is synchronous and crosses the
+two worlds, so the reply is in before the picker's `dispatchEvent` returns, in the frame the box
+is drawn in, and its detail reaches the picker as a copy its world makes as it reads it. The
+collector reads the node off `composedPath()[0]`, through the native it took at `document_start`,
+because the target a listener on the window sees is the shadow host. The picker asks once for
+each element an arm highlights (a `WeakMap`), asks before it draws, so page code that runs during
+the answer cannot leave the box and the tag on different elements, and stops asking for the rest
+of the arm when no reply comes at all (a tab with no collector, or a collector of 0.6.1 or earlier
+left from before an update).
+
+The name comes from `componentOf(node, true)`, the brief path, whose contract is stated on the
+function and in CONTRIBUTING.md: the walk a pick makes for the names, and nothing after it. No
+props, so none of the guard's look through the document and its shadow roots for secret fields,
+and no owner or call site. Svelte's brief path is the climb to the nearest meta and its file's
+name. Vue 2's keeps the render tree walk, bounded at `SUBTREE_LIMIT` vnodes, since without it the
+name would be the root's and not the one the pick reports, and skips the build, the file, the
+version and the props. Angular's reader is not asked at all: it can learn nothing without calling
+`window.ng`, once for each element climbed, so `componentOf` answers null for it and the tag on an
+Angular page gives the element alone. A pick's round trip, guard included, took 1.24 ms at 20 000 elements
+and 8.5 ms at 100 000 (Chrome 157), and a name about 4 microseconds, at 20 000 elements or
+100 000. The two can disagree in one case: the hover reaches a node in an open shadow root
+wherever it is, while a pick looks for its marked node there with `findMarked`, which gives up
+after 20 000 elements, so on a very large page the tag can name a component the pick then does
+not report.
+
+The type is public, not one of the bridge's random channels, on purpose. Page code can run while
+the name is read (a getter on a fiber's type, or on `Element.prototype.parentElement`), and while
+it runs `window.event` is the request. On a channel it would hand the page the channel's name,
+and with it the log. What crosses on `__cdr_name` is the name of one of the page's own
+components, and a request sent from inside an answer gets none.
 
 #### A tab that was open before
 
@@ -547,7 +673,7 @@ the main world answers exactly one action per request.
 
 | Action | From | Purpose |
 | :--- | :--- | :--- |
-| `inspect` | picker | Return the React or Vue component behind a marked node, and the handlers bound to it |
+| `inspect` | picker | Return the React, Vue, Svelte or Angular component behind a marked node, and the handlers bound to it |
 
 `snapshot` and `clear` go over the bridge's channel instead. Over `window.postMessage` they
 answer `null`, like any action this build does not recognise (the picker's `ping` among them,
@@ -558,6 +684,17 @@ and a script that answered every unknown action with the snapshot would hand the
 buffer to present as a component. The bridge, when it falls back to an old collector, and the
 picker keep their ids apart by type, numbers from the bridge and strings from the picker, so
 each ignores the other's replies on a window they both listen to.
+
+While Element is armed the picker asks one thing more, with a pair of DOM events rather than
+messages (see [The name while hovering](#the-name-while-hovering)):
+
+| Event | Sent on | Purpose |
+| :--- | :--- | :--- |
+| `__cdr_name` | the highlighted node, by the picker, composed and not bubbling | Asks for the name of the component behind the node. No detail |
+| `__cdr_name:reply` | the window, by the collector, before the request's dispatch returns | `{ name, renamed }`: the nearest component's name, and `renamed: true` when a bundler made it up, or `null` when there is none. The picker takes the first reply, cuts the name to 60 characters and writes it as text |
+
+Both are public by design. A page can send, answer or stop them (see the end of
+`collector-main.js`), and what it changes is the name on the tag, which reaches no prompt.
 
 A few things about the first table are load bearing.
 
@@ -1793,7 +1930,9 @@ reproduce:
   there is no isolated world here: the bridge, the overlay, the picker and the page shot share
   globals and prototypes with the page and with the collector. A picker that read a React fiber off
   a node by itself would work on the stage and find nothing in Chrome. There is no `chrome.dom`
-  either, so the page shot walks open shadow roots only.
+  either, so the page shot walks open shadow roots only. The name the picker asks for while
+  hovering crosses no world here either: its reply's detail is the collector's own object, not
+  the copy Chrome makes, so a reply that would not survive that copy still shows there.
 * **Messages.** A broadcast from the page reaches the panel synchronously, inside the call that
   sent it, and the panel receives the very object that was sent. Chrome serialises every message
   and delivers it in a later task, so a value that does not survive serialisation, or code that

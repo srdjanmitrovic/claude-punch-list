@@ -28,8 +28,10 @@
       see the SAVING state and the slow download banner.
 
       ?demo=demo-react.html loads a different page in the tab frame, from the
-      short list in DEMOS below. The React and Vue fixtures are there for the
-      component lookup, which the plain demo page cannot exercise. Only a bare
+      short list in DEMOS below. The React, Vue and Vue 2 fixtures are there
+      for the component lookup, which the plain demo page cannot exercise. There
+      is none for Svelte or Angular, whose development builds come only out of
+      their compilers, and there is no build step here. Only a bare
       filename from that list is accepted: the stage injects the extension's
       real content scripts into whatever the frame holds, and a stage that
       accepted any url would hand that code, and same origin reach into the
@@ -161,7 +163,7 @@
 
         // Everything ?demo= is allowed to name, resolved against this
         // directory. The first entry is the default.
-        const DEMOS = ['demo-page.html', 'demo-react.html', 'demo-vue.html'];
+        const DEMOS = ['demo-page.html', 'demo-react.html', 'demo-vue.html', 'demo-vue2.html'];
 
         function demoWindow() {
           return demo.contentWindow;

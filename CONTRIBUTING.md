@@ -35,11 +35,16 @@ Clicking **Apply** on that page fires a failing request, a console warning, and 
 `TypeError`. That gives the collector real data to pick up, so you can verify a change end to
 end rather than against an empty buffer.
 
-Two more fixtures sit beside it. `tools/demo-react.html` and `tools/demo-vue.html` render a
-small component tree so the element picker's component lookup has something to read; the stage
-loads either with `?demo=demo-react.html` or `?demo=demo-vue.html`. Both pull their framework
-from a CDN, which is fine for a fixture and would not be fine in the extension. Nothing under
-`tools/` is packaged.
+Three more fixtures sit beside it. `tools/demo-react.html`, `tools/demo-vue.html` and
+`tools/demo-vue2.html` render a small component tree so the element picker's component lookup
+has something to read; the stage loads each with `?demo=` and its file name. The Vue 2 one has the
+three cases its reader must get right: a component that renders another as its root, slot
+content, and what `v-html` writes. All three pull their framework from a CDN, which is fine for a
+fixture and would not be fine in the extension. Nothing under `tools/` is packaged. There is no
+Svelte or Angular fixture: their development builds come only out of their compilers, and a page
+here cannot have a build step. Check a change to those readers in a project of your own
+(`npx sv create`, `ng new`) in Chrome, beside the tests in `test/collector.test.mjs`, whose shapes
+name the versions they were taken from.
 
 For work on the panel itself there is a faster loop. With the same server running, open
 `http://localhost:8000/tools/panel-stage.html`. That is the panel as an ordinary web page
@@ -70,15 +75,21 @@ still supported. They live in `test/`:
   run `UPDATE_GOLDEN=1 npm test` and commit the regenerated files with the change, so the diff
   shows exactly what Claude Code will now read.
 * `test/collector.test.mjs` runs `content/collector-main.js` in a fresh `node:vm` realm and holds
-  every wrapper to the rules below.
+  every wrapper to the rules below, and the name it answers while Element hovers to the brief
+  contract below: what it reads and what it leaves alone, a bounded walk, nothing thrown into the
+  page, and the same name a pick reports.
 * `test/bridge.test.mjs` runs `content/collector-bridge.js` and `content/collector-main.js`
-  together in one `node:vm` realm: the handshake over the bridge's channel whichever half starts
-  first, what the bridge does with an answer that is not the collector's, the fallback to
-  `window.postMessage` for a collector of 0.5.0 still running in a tab, the page facts it hands
-  the panel, and the counts it posts on the panel's `cdr:counts` port: as they change, at most
-  four times a second, again at every read, and nothing while no port is open, with the ports it
-  closes when it stops watching, also against a page that floods the change event or answers in
-  the collector's place.
+  together, each in a `node:vm` realm of its own over shared events and nodes (`makeWorlds` in
+  `test/support/worker-realm.mjs`), as two worlds of one page: the handshake over the bridge's
+  channel whichever half starts first, what the bridge does with an answer that is not the
+  collector's, the fallback to `window.postMessage` for a collector of 0.5.0 still running in a
+  tab, the page facts it hands the panel, and the counts it posts on the panel's `cdr:counts`
+  port: as they change, at most four times a second, again at every read, and nothing while no
+  port is open, with the ports it closes when it stops watching, also against a page that floods
+  the change event or answers in the collector's place. It also asks a component's name from the extension's world as the picker
+  does while it hovers, on a node each world wraps on its own: answered before `dispatchEvent`
+  returns, read off the page's wrapper, copied as it crosses, and never with the log's channel
+  on `window.event`.
 * `test/picker.test.mjs` runs the picker's masking block, lifted out of `content/picker.js`
   between its `MASKING BEGIN` and `MASKING END` markers, against markup a picked form produces.
 * `test/picker-events.test.mjs` runs `content/picker.js` in a `node:vm` realm against a model of
@@ -88,9 +99,10 @@ still supported. They live in `test/`:
   get pointer events and no mouse events, `:hover` moves at a frame, and everything outside an
   open modal dialog is inert. A closed shadow root hides what is inside it from the page but not
   from `chrome.dom`. Window listeners run in the order they were added. A press or key grants
-  transient activation that `showPicker()` spends. A popover's `toggle` goes no further than its
-  own tree, and a frame's discrete transition of `pointer-events` holds its old value for half
-  its time. A test that needs the press gate runs `content/press-gate.js` in the realm first.
+  transient activation that `showPicker()` spends. An event sent on an element reaches the
+  window's capture listeners at once, and gets out of a shadow root only when it is composed. A
+  popover's `toggle` goes no further than its own tree, and a frame's discrete transition of
+  `pointer-events` holds its old value for half its time. A test that needs the press gate runs `content/press-gate.js` in the realm first.
   When the picker comes to rely on another browser behaviour, check it in Chrome first, then add
   it to the model with a note of where it was seen.
 * `test/capture.test.mjs` runs `content/overlay.js`, `content/stop.js` and a second injection of
@@ -228,10 +240,49 @@ reading a single file, and breaking them tends to fail silently rather than loud
   `isSecretName` written without any method the page can replace, so a change to the rules of
   `isSecretName` must be made there too; `test/collector.test.mjs` fails until the two agree. The
   README's privacy section lists what is screened and what is not, and should change with them.
-* The picker reads a React fiber or a Vue instance by asking `content/collector-main.js`, because
-  those live on the node as properties only the page's own JavaScript world can see. The node
-  crosses the boundary as a temporary `data-cdr-pick` attribute, since the DOM is shared and the
-  property is not. Both sides remove that attribute, including on the timeout path.
+* The picker reads a React fiber, a Vue instance or a Svelte meta, and Angular's `window.ng`, by
+  asking `content/collector-main.js`, because those live on the node or the window as properties
+  only the page's own JavaScript world can see. At a pick the
+  node crosses the boundary as a temporary `data-cdr-pick` attribute, since the DOM is shared and
+  the property is not. Both sides remove that attribute, including on the timeout path. Hovering
+  writes nothing: the picker sends `__cdr_name` on the node itself, and the collector answers on
+  the window before `dispatchEvent` returns (see
+  [The name while hovering](docs/ARCHITECTURE.md#the-name-while-hovering)). Keep that listener on
+  its public type. On the bridge's channel, page code that runs during the answer would read the
+  channel's name off `window.event`.
+* Every framework reader goes behind `componentOf(node, brief)` in `content/collector-main.js`,
+  the one place both a pick and the hover ask, in the order the readers are tried. With `brief`
+  set it is answering the hover, as often as once a frame, and a reader must then keep to this
+  contract:
+  * it reads names only (`framework`, `names`, and `renamed` where it applies), so no props and
+    no guard;
+  * it does no work across the whole document: no `querySelectorAll` or `getElementsByTagName`
+    of it, and no walk of its shadow roots;
+  * it calls no function of the page's or of its framework's (a read can still run a getter the
+    page planted, as at a pick);
+  * it looks at a fixed number of nodes, however large the page is: `CLIMB_LIMIT` elements up
+    from the node, `CLIMB_LIMIT` steps up the framework's own tree, and at most `SUBTREE_LIMIT`
+    nodes of a walk down the component's own render tree (as Vue 2's reader walks its vnodes to
+    learn which component wrote an element);
+  * its `names[0]` and `renamed` are the ones it gives without `brief`, so the tag shows the name
+    the item's Component line starts with.
+
+  A reader that cannot keep to it answers `null` when `brief` is set, and is then simply not asked
+  while hovering, as Angular's is, since it learns everything by calling `window.ng`.
+  `test/collector.test.mjs` holds React, Vue 3, Vue 2 and Svelte to it, and Angular to not being
+  asked, and a new reader needs the same tests: that its brief path reads no prop, nothing of the
+  document and calls nothing, that its `names[0]` is the pick's, and that the nodes it looks at
+  stay within those bounds, where a walk down the render tree is counted against `SUBTREE_LIMIT`.
+* A pick leaves the page's objects as it found them, Angular's included, but for the one case
+  `noteHost` cannot tell apart (see the Angular passage of docs/ARCHITECTURE.md). Angular's
+  `getLContext`, behind `window.ng.getOwningComponent` and `getHostElement`, caches an LContext in
+  `__ngContext__` on what it is asked about, so `angularSummary` notes each object a call can
+  change before that call (`noteContext`, with `noteAbove` for the elements above the climb and
+  above each host `getHostElement` answers, or `noteHost` for a host only the call's answer
+  names) and puts every one back in `finally` (`putBack`). Another `window.ng` call needs the
+  same, and a test in `test/collector.test.mjs`, on the fixture's `angularApp`, which writes
+  `__ngContext__` as Angular 22.3.0 does, that every object the call changed is as it was after
+  the pick.
 * Content script broadcasts reach every open side panel, not just the one in the same window.
   Filter on `sender.tab.id`.
 * A content script runs in a page that may be hostile. The worker acts on the messages only the
@@ -371,7 +422,7 @@ test of the tool, and the output is exactly the context a maintainer wants.
 ## Scope
 
 Some things are intentionally out of scope for now: any server component, and telemetry of any
-kind. Nothing in this extension should ever make a
-network request. The React and Vue fixtures under `tools/` load a framework from a CDN, which is
-the one exception and only because they are test pages that never ship. If you have an idea that
+kind. Nothing in this extension should ever make a network request. The React, Vue and Vue 2
+fixtures under `tools/` load a framework from a CDN, which is the one exception and only because
+they are test pages that never ship. If you have an idea that
 needs one, open an issue first so we can talk about it before you spend time on it.

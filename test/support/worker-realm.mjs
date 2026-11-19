@@ -97,9 +97,17 @@ export function makeClock() {
  * one, and a second injection beside it adds nothing, as in Chrome; deleting
  * the id is the extension being reloaded under it.
  *
+ * An event can also be sent on a node both worlds share (node()), as the
+ * picker asks the component's name while it hovers: the window's capture
+ * listeners of both worlds hear it at once, and its bubbling ones only if it
+ * bubbles. Each world's event has that world's own wrapper of the node first
+ * in its composedPath() and, as its target, that wrapper or, for a node in a
+ * shadow root, its host's, and window.event is set as for one on the window.
+ *
  * `clock` (makeClock) runs both worlds' timers, for a test that times what
  * the bridge does; without one they are node's. `dispatched` lists the type
- * of every event dispatched on the window, in order, whichever world sent it.
+ * of every event dispatched on the window or a node, in order, whichever
+ * world sent it.
  */
 export function makeWorlds({
   url = 'https://example.test/',
@@ -157,6 +165,7 @@ export function makeWorlds({
           trusted: false, // only an event fire() sends, as the browser's own
           stopped: false,
           dispatching: false,
+          on: null, // the node it is sent on, if not the window
           wrappers: new Map(),
         };
         state.wrappers.set(name, this);
@@ -173,6 +182,24 @@ export function makeWorlds({
       }
       get isTrusted() {
         return stateOf(this).trusted;
+      }
+      // For one sent on a node (see node()): the node as this world wraps
+      // it, or the host of the shadow root it is in, as retargeting gives it
+      // to a listener on the window. For one sent on the window, the window.
+      get target() {
+        const state = stateOf(this);
+        if (!state.on) return worlds[name].self;
+        return (state.on.host || state.on).wrappers[name];
+      }
+      // The node first, then its host if it has one, then the window, while
+      // the event is being dispatched; empty after, as in Chrome.
+      composedPath() {
+        const state = stateOf(this);
+        if (!state.dispatching) return [];
+        const path = [];
+        for (let at = state.on; at; at = at.host) path.push(at.wrappers[name]);
+        path.push(worlds[name].self);
+        return path;
       }
       preventDefault() {
         const state = stateOf(this);
@@ -199,6 +226,45 @@ export function makeWorlds({
     return { Event, CustomEvent };
   }
 
+  /**
+   * An event sent on the window (`on` null) or on a node of node(). Sent on
+   * a node, it meets the window's capture listeners on its way down and its
+   * bubbling ones only if it bubbles, and one in a shadow root that is not
+   * composed stays there and meets none.
+   */
+  function dispatch(event, on) {
+    const state = STATE.get(event);
+    if (!state) throw new TypeError("Failed to execute 'dispatchEvent': parameter 1 is not of type 'Event'.");
+    if (state.dispatching) throw new Error('InvalidStateError: the event is already being dispatched.');
+    dispatched.push(state.type);
+    if (on && on.host && !state.composed) return !state.defaultPrevented;
+    state.on = on;
+    state.dispatching = true;
+    state.stopped = false;
+    const all = [...listFor(state.type)];
+    const bubbling = !on || state.bubbles ? all.filter((one) => !one.capture) : [];
+    try {
+      for (const entry of [...all.filter((one) => one.capture), ...bubbling]) {
+        if (state.stopped) break;
+        if (!listFor(state.type).includes(entry)) continue;
+        const target = worlds[entry.world].window;
+        const seen = wrap(state, entry.world);
+        const previous = target.event;
+        target.event = seen;
+        try {
+          entry.fn.call(worlds[entry.world].self, seen);
+        } catch (error) {
+          errors.push(error);
+        } finally {
+          target.event = previous;
+        }
+      }
+    } finally {
+      state.dispatching = false;
+    }
+    return !state.defaultPrevented;
+  }
+
   function eventsFor(name, win) {
     const capturing = (options) => options === true || Boolean(options && typeof options === 'object' && options.capture);
     return {
@@ -215,33 +281,7 @@ export function makeWorlds({
         if (at !== -1) list.splice(at, 1);
       },
       dispatchEvent(event) {
-        const state = STATE.get(event);
-        if (!state) throw new TypeError("Failed to execute 'dispatchEvent': parameter 1 is not of type 'Event'.");
-        if (state.dispatching) throw new Error('InvalidStateError: the event is already being dispatched.');
-        dispatched.push(state.type);
-        state.dispatching = true;
-        state.stopped = false;
-        const all = [...listFor(state.type)];
-        try {
-          for (const entry of [...all.filter((one) => one.capture), ...all.filter((one) => !one.capture)]) {
-            if (state.stopped) break;
-            if (!listFor(state.type).includes(entry)) continue;
-            const target = worlds[entry.world].window;
-            const seen = wrap(state, entry.world);
-            const previous = target.event;
-            target.event = seen;
-            try {
-              entry.fn.call(worlds[entry.world].self, seen);
-            } catch (error) {
-              errors.push(error);
-            } finally {
-              target.event = previous;
-            }
-          }
-        } finally {
-          state.dispatching = false;
-        }
-        return !state.defaultPrevented;
+        return dispatch(event, null);
       },
       postMessage(data) {
         posted.push(JSON.parse(JSON.stringify(data)));
@@ -362,6 +402,23 @@ export function makeWorlds({
         for (const fn of onDisconnect) fn(port);
       };
       return panel;
+    },
+    /**
+     * A node of the document, which both worlds share as they share the
+     * window's events, each through a wrapper of its own, made in its realm:
+     * an expando one world sets on its wrapper (React's __reactFiber$) is not
+     * on the other's. With `host` (another node's record) it is in that
+     * node's open shadow root. dispatchEvent on either wrapper sends the
+     * event on it (see dispatch()). Returns { main, isolated, record }.
+     */
+    node({ host = null } = {}) {
+      const record = { host, wrappers: {} };
+      for (const name of ['main', 'isolated']) {
+        const wrapper = vm.runInContext('({ parentElement: null })', worlds[name].realm);
+        wrapper.dispatchEvent = (event) => dispatch(event, record);
+        record.wrappers[name] = wrapper;
+      }
+      return { main: record.wrappers.main, isolated: record.wrappers.isolated, record };
     },
     /** Run code in a world: 'main' (the page's, and the collector's) or 'isolated'. */
     run(name, code, filename) {
