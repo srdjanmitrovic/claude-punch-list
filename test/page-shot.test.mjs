@@ -307,6 +307,82 @@ test('a document the page locked, with nothing else to scroll, is left as it is,
   assert.equal('locked' in begun, false);
 });
 
+// Locomotive Scroll 4 in smooth mode (a view 1024 px wide or more) locks the
+// root with overflow hidden and moves its container up with a transform as
+// the wheel turns: in Chrome for Testing 156 Page said an open dialog had
+// locked the page, where none was open. Told apart from a lock a dialog,
+// a cookie wall or a menu holds only where nothing of those is there.
+const LOCO = { id: 'container', rect: { x: 0, y: 0, width: 1000, height: 3600 }, transform: 'matrix(1, 0, 0, 1, 0, -384)' };
+
+test('a locked page that a script of its own has moved is told apart from one a dialog holds, and left as it is', async () => {
+  const scripted = async (elements, name, options = {}) => {
+    const page = started({ height: 3600, overflow: 'hidden', bodyOverflow: 'hidden', elements, ...options });
+    const begun = await page.call('begin');
+    assert.equal(begun.locked, true, `${name}: ${JSON.stringify(begun)}`);
+    assert.equal(begun.screens, 1, name);
+    await step(page, 0);
+    await page.call('end');
+    assert.deepEqual(page.scrolls, [], `${name}: it was scrolled`);
+    for (const element of [page.root, ...elements.map((spec) => page.el(spec.id))]) {
+      assert.equal(element.writes, 0, `${name}: ${element.id || element.localName} was changed`);
+    }
+    return begun.scripted ?? false;
+  };
+  assert.equal(await scripted([LOCO], 'moved up'), true);
+  assert.equal(
+    await scripted([{ ...LOCO, transform: 'matrix3d(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, -384, 0, 1)' }], 'matrix3d'),
+    true
+  );
+  const cover = { id: 'cover', position: 'fixed', rect: { x: 0, y: 0, width: 1000, height: 800 } };
+  assert.equal(
+    await scripted(
+      [
+        LOCO,
+        { ...BAR, id: 'cookies' },
+        { ...cover, style: { visibility: 'hidden' } },
+        { ...cover, id: 'transition', style: { opacity: '0' } },
+      ],
+      'a bar, a hidden cover, a transparent one'
+    ),
+    true,
+    'a bar fixed to the bottom, or a cover that cannot be seen, holds nothing'
+  );
+  // What holds a page still is there, so the notice names both causes.
+  for (const [name, more] of [
+    ['a backdrop', [cover]],
+    ['a modal dialog', [{ id: 'dialog', tag: 'dialog', position: 'fixed', modal: true, rect: { x: 300, y: 200, width: 400, height: 300 } }]],
+    ['aria-modal', [{ id: 'sheet', attributes: { 'aria-modal': 'true' }, rect: { x: 300, y: 200, width: 400, height: 300 } }]],
+  ]) {
+    assert.equal(await scripted([LOCO, ...more], name), false, name);
+  }
+  // And what does not look like a page moved up by its own scrolling.
+  for (const [name, change] of [
+    ['at the top, not moved yet', { transform: 'matrix(1, 0, 0, 1, 0, 0)' }],
+    ['moved sideways, as a menu pushes the page', { transform: 'matrix(1, 0, 0, 1, 300, 0)' }],
+    ['pushed sideways once scrolled', { transform: 'matrix(1, 0, 0, 1, 300, -384)' }],
+    ['scaled', { transform: 'matrix(0.9, 0, 0, 0.9, 0, -384)' }],
+    ['no transform', { transform: 'none' }],
+    ['no taller than the view', { rect: { x: 0, y: 0, width: 1000, height: 800 } }],
+    ['fixed to the window, a column too narrow to hold the page', { position: 'fixed', rect: { x: 0, y: 0, width: 200, height: 3600 } }],
+  ]) {
+    assert.equal(await scripted([{ ...LOCO, ...change }], name), false, name);
+  }
+  // An aria-modal element that is not shown holds nothing.
+  const closed = { id: 'closed', attributes: { 'aria-modal': 'true' }, rect: { x: 0, y: 0, width: 0, height: 0 } };
+  assert.equal(await scripted([LOCO, closed], 'a closed sheet'), true);
+  // The page scrolls for the user: no lock, so nothing to tell apart.
+  const page = started({ height: 3600, elements: [LOCO] });
+  const begun = await page.call('begin');
+  assert.equal('locked' in begun || 'scripted' in begun, false);
+});
+
+test('begin says the device pixel ratio, for the panel to count the screens a run at the cap takes', async () => {
+  for (const ratio of [1, 2, 1.25]) {
+    const page = started({ ratio });
+    assert.equal((await page.call('begin')).ratio, ratio);
+  }
+});
+
 test('a top fixed element shows on the first screen only, a bottom one on the last only, and a tall sidebar always', async () => {
   const page = started({ height: 2000, elements: [HEADER, BAR, SIDEBAR] });
   const shown = () => ['header', 'bar', 'sidebar'].filter((id) => !inline(page.el(id)).opacity);
@@ -533,6 +609,23 @@ test('step reports where it was before it scrolled, the viewport, and the page h
 // ------------------------------------------ the panel and the page together --
 
 const QUOTA = 'This request exceeds the MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND quota.';
+const LOCKED =
+  'The page has locked its scrolling, as an open dialog or menu does, or as a page that scrolls itself with a script does, so this is the visible screen.';
+
+/** Each count the Page button shows while a run goes on, in order, each once. */
+function countsShown(panel) {
+  const node = panel.element('mode-page-count');
+  const seen = [];
+  let value = node.textContent;
+  Object.defineProperty(node, 'textContent', {
+    get: () => value,
+    set: (text) => {
+      value = text;
+      if (text && seen.at(-1) !== text) seen.push(text);
+    },
+  });
+  return seen;
+}
 
 test('Page scrolls the page through, files one stitched PNG, and puts the page back', async () => {
   const { panel, page, calls, downloads } = await together({ page: { height: 2000, elements: [HEADER, BAR] } });
@@ -1016,6 +1109,53 @@ test('a page longer than the cap stops at 10 000 device pixels, at full resoluti
   assert.deepEqual({ ...report.items[0].stitched }, { screens: 7, cssWidth: 1280, cssHeight: 5000, cut: true });
 });
 
+// In Chrome for Testing 156 a 30,000 px page read 0/34 until the first
+// screenshot, though the cap let six be taken at 2x (begin's count knew
+// nothing of the cap), and 6/7 after the last one (a screen was added for a
+// next one the cap would not take). The same 6/7 showed on Wikipedia, MDN
+// and GitHub.
+test('the count says the screens a run cut at the cap takes, before the first screenshot and after the last', async () => {
+  for (const [ratio, screens] of [
+    [2, 7], // 5000 CSS pixels at 2x: seven screens of 720, a pixel short each
+    [1, 14], // 10,000 at 1x
+  ]) {
+    const { panel, calls } = await together({ page: { height: 30000, ratio } });
+    if (ratio === 2) panel.imageSizes.set('data:image/png;base64,AAAA', { width: 2560, height: 1440 });
+    const seen = countsShown(panel);
+    panel.click('mode-page');
+    await panel.clock.advance(20000);
+    assert.equal(calls.filter((call) => call === 'step').length, screens, `${ratio}x`);
+    assert.deepEqual(
+      seen,
+      ['0/1', ...Array.from({ length: screens + 1 }, (_, taken) => `${taken}/${screens}`)],
+      `${ratio}x`
+    );
+    assert.equal(filed(panel).item.stitched.screens, screens);
+  }
+});
+
+test('the count ends on the screens taken when the page ends, or stops scrolling, before its estimate', async () => {
+  // A page that reaches its end: the estimate was right all along. At 2159
+  // the third screen ends a pixel short of it, which the page counts as its
+  // end, so the estimate does too.
+  for (const height of [2158, 2159]) {
+    const plain = await together({ page: { height } });
+    const seen = countsShown(plain.panel);
+    plain.panel.click('mode-page');
+    await plain.panel.clock.advance(10000);
+    assert.deepEqual(seen, ['0/1', '0/3', '1/3', '2/3', '3/3'], `${height}`);
+  }
+
+  // One that will not scroll past 1000: at 0, 719, 1000 and 1000 again.
+  const stuck = await together({ page: { height: 2000 } });
+  const scroll = stuck.page.scroll;
+  stuck.page.scroll = (target, options) => scroll(target, { ...options, top: Math.min(options.top, 1000) });
+  const counts = countsShown(stuck.panel);
+  stuck.panel.click('mode-page');
+  await stuck.panel.clock.advance(10000);
+  assert.equal(counts.at(-1), '4/4', counts.join(' '));
+});
+
 // A page that says it goes on but will not scroll there (a scroll handler
 // that pulls it back, a height it reports and cannot reach). Without the
 // stop it would be stepped in place up to 100 times, about 52 s.
@@ -1057,12 +1197,34 @@ test('a page that locked its scrolling is filed as the screen in view, unscrolle
     saved.canvas.context.calls.filter((call) => call.op === 'drawImage').map((call) => call.args.slice(1)),
     [[0, 0, 1280, 720, 0, 0, 1280, 720]]
   );
-  assert.equal(
-    panel.banner(),
-    'The page has locked its scrolling, as an open dialog or menu does, so this is the visible screen.'
-  );
+  assert.equal(panel.banner(), LOCKED);
   assert.deepEqual(page.scrolls, []);
   assert.equal(page.root.scrollTop, 1200);
+});
+
+// The notice names both causes unless the page looks moved by its own script,
+// and then says that, not that a dialog is open.
+test('a page that scrolls itself with a script is filed as the screen in view, and says that instead', async () => {
+  const { panel, page, calls } = await together({
+    page: { height: 3600, overflow: 'hidden', bodyOverflow: 'hidden', elements: [{ ...LOCO, rect: { ...LOCO.rect, width: 1280 } }] },
+  });
+  panel.click('mode-page');
+  await panel.clock.advance(5000);
+  assert.deepEqual(calls, ['inject', 'begin', 'step', 'end']);
+  assert.deepEqual({ ...filed(panel).item.stitched }, { screens: 1, cssWidth: 1280, cssHeight: 720 });
+  assert.equal(
+    panel.banner(),
+    'The page moves its content with a script instead of scrolling, which a whole page capture cannot follow, so this is the visible screen.'
+  );
+  assert.deepEqual(page.scrolls, []);
+
+  // At its top the script has not moved it yet: the notice names both.
+  const top = await together({
+    page: { height: 3600, overflow: 'hidden', elements: [{ ...LOCO, transform: 'matrix(1, 0, 0, 1, 0, 0)' }] },
+  });
+  top.panel.click('mode-page');
+  await top.panel.clock.advance(5000);
+  assert.equal(top.panel.banner(), LOCKED);
 });
 
 // A page that changes height under the capture can leave a seam that does not

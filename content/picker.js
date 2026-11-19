@@ -1429,8 +1429,12 @@
             border-radius: 2px;
             transition: all 60ms ease-out;
           }
+          /* Above the hint: on a narrow page the hint wraps, and an element
+             near the top has its tag, the component's name with it, drawn
+             in the same place. */
           .tag {
             position: fixed;
+            z-index: 1;
             font: 600 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
             color: #fff;
             background: #d6157f;
@@ -1451,16 +1455,25 @@
           .what { flex: 0 100000 auto; min-width: 4ch; overflow: hidden; text-overflow: ellipsis; }
           .who { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; font-weight: 500; }
           .who:empty { display: none; }
+          /* Centred in the width of the view less a margin, rather than
+             hung from its middle, which gave it half the view to wrap in:
+             on a page the side panel squeezed to 375 px it took four lines.
+             So it stays inside the view, wraps no more than it must, and is
+             never cut short. One line is the same pill as ever (28 px tall,
+             rounded by half that); more lines are a rounded box. */
           .hint {
             position: fixed;
-            left: 50%;
             top: 20px;
-            transform: translateX(-50%);
-            font: 500 12px/1 ui-sans-serif, system-ui, -apple-system, sans-serif;
+            left: 12px;
+            right: 12px;
+            width: fit-content;
+            margin: 0 auto;
+            text-align: center;
+            font: 500 12px/16px ui-sans-serif, system-ui, -apple-system, sans-serif;
             color: #f5f5f4;
             background: rgba(20, 22, 28, 0.92);
-            padding: 8px 14px;
-            border-radius: 999px;
+            padding: 6px 14px;
+            border-radius: 14px;
             pointer-events: none;
             box-shadow: 0 4px 16px rgba(0,0,0,0.35);
           }

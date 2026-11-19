@@ -1968,6 +1968,54 @@ test('picker events: a page ::backdrop rule cannot dim the page under the host',
   assert.match(html, /:host::backdrop\s*\{\s*display:\s*none\s*!important;?\s*\}/);
 });
 
+// On a page the side panel squeezed to 375 px or less, and at 125% zoom, the
+// hint, hung from the middle of the view, had half of it to wrap in and took
+// four lines at the top, painted over the tag of an element up there, and
+// the component's name with it: it comes after the tag in the root, at the
+// same level (Chrome for Testing 156).
+test('picker events: the tag paints above the hint, and the hint wraps in the width of the view, cut short nowhere', async () => {
+  const realm = makeRealm();
+  realm.arm();
+  await realm.frame();
+  const { html } = realm.host().attached;
+  /** The declarations of the rule for `.name`, as { property: value }. */
+  const rule = (name) => {
+    const match = new RegExp(`\\n\\s*\\.${name} \\{([^}]*)\\}`).exec(html);
+    assert.ok(match, `the root has no .${name} rule`);
+    return Object.fromEntries(
+      match[1]
+        .split(';')
+        .map((declaration) => declaration.trim())
+        .filter(Boolean)
+        .map((declaration) => {
+          const colon = declaration.indexOf(':');
+          return [declaration.slice(0, colon).trim(), declaration.slice(colon + 1).trim()];
+        })
+    );
+  };
+  const tag = rule('tag');
+  const hint = rule('hint');
+  // Two fixed boxes in one stacking context paint by z-index, then in tree order.
+  assert.deepEqual([tag.position, hint.position], ['fixed', 'fixed']);
+  const order = [...html.matchAll(/<div class="([^"]+)"/g)].map((match) => match[1]);
+  const level = (declarations) => Number.parseInt(declarations['z-index'] ?? '0', 10) || 0;
+  assert.ok(
+    level(tag) > level(hint) || (level(tag) === level(hint) && order.indexOf('tag') > order.indexOf('hint')),
+    'the hint paints over the tag'
+  );
+  // Its room to wrap in is the view less a margin each side, centred, not
+  // the half of the view to the right of its middle.
+  assert.equal(hint.transform, undefined);
+  assert.match(hint.left, /^\d+px$/);
+  assert.equal(hint.right, hint.left);
+  assert.ok(Number.parseInt(hint.left, 10) <= 16, hint.left);
+  assert.deepEqual([hint.width, hint.margin], ['fit-content', '0 auto']);
+  // And nothing of it is cut off.
+  for (const property of ['overflow', 'text-overflow', 'white-space', 'height', 'max-height', 'max-width', '-webkit-line-clamp']) {
+    assert.equal(hint[property], undefined, `.hint sets ${property}`);
+  }
+});
+
 test('picker events: a second finger neither picks nor ends the first finger\'s press', async () => {
   const realm = makeRealm();
   realm.add('div', { id: 'target' }, [100, 100, 200, 100]);

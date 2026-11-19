@@ -118,8 +118,9 @@ still supported. They live in `test/`:
 * `test/page-shot.test.mjs` runs `content/page-shot.js` in a `node:vm` realm against a model of a
   host page (`test/support/page-realm.mjs`): inline styles with their priorities, computed
   positions, boxes that move as the page scrolls, inner scrollers, open and closed shadow roots,
-  images that load when the test says so, and scroll snapping and smooth scrolling as Chrome was
-  seen to handle them, each noted at the top of that file. It holds the script to putting the page
+  images that load when the test says so, computed transforms and modal dialogs, and scroll
+  snapping, smooth scrolling and a page that scrolls itself as Chrome was seen to handle them,
+  each noted at the top of that file. It holds the script to putting the page
   back on every path, and then runs it with the real panel on one clock: the pacing, the lease
   against the quota retries, Stop, Esc and every other way a run ends, and the image the panel
   puts together.

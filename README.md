@@ -119,10 +119,10 @@ extension take screenshots (two a second). While it runs, the button reads Stop 
 the screens taken, the other capture buttons and **Mark up** wait, and the line at the top of the
 panel says what is going on. The screenshots are then put together into one PNG, named like the others
 with `_page`, and the item reads PAGE. In the frame it shows at the frame's width and scrolls;
-<kbd>Tab</kbd> reaches it, and the arrow keys scroll it too. An element fixed to the top of the
-window, such as a header, shows once at the top, and one fixed to the bottom, such as a cookie
-bar, once at the bottom, as does one inside a component's or a chat widget's shadow root, open or
-closed. A sticky element shows once, in its own place. A fixed element nearly as
+<kbd>Tab</kbd> reaches it, and the arrow keys scroll it too, even with Region or Element armed. An
+element fixed to the top of the window, such as a header, shows once at the top, and one fixed to
+the bottom, such as a cookie bar, once at the bottom, as does one inside a component's or a chat
+widget's shadow root, open or closed. A sticky element shows once, in its own place. A fixed element nearly as
 tall as the window, such as a sidebar, is left as it is and repeats down the page, so it reads as
 one column. A page that scrolls inside one area rather than as a whole (an app with a scrolling
 pane under a fixed header) has that area followed, and what is beside it comes from the first
@@ -135,7 +135,13 @@ reads CUT SHORT and says how much of the page it shows; for what is further down
 use Screen or Region. A page that stops scrolling before its end is cut where it stopped, and says
 that instead. A page that does not scroll is filed as one screen, and says so. So is a page that
 has locked its scrolling, as an open dialog or menu does: it is not scrolled at all, and the item
-is the screen as you see it. A seam can
+is the screen as you see it. A page that scrolls itself with a script, moving its content rather
+than letting the browser scroll it, locks its scrolling the same way and cannot be scrolled
+through either, so it too is one screen. Locomotive Scroll does this in its smooth mode, on a view
+at least 1,024 pixels wide. Where the page has been moved that way and nothing such as a dialog's
+backdrop is over it, the item says the page moves its content with a script; otherwise it names
+both causes. Lenis, and Locomotive on a narrower view, let the browser scroll, and are captured
+whole. A seam can
 be off where the page moved between two screenshots (an animation, a carousel, content that loaded
 late, a header that a script fixes once the page is scrolled), and the item says so when the page
 changed height while it was taken. A video shows a
@@ -187,12 +193,15 @@ holds the screenshot without marks, in memory. It holds those of its 10 newest c
 100 MB at most. Any other item, one restored when the panel opened, one captured in another
 window, or an older one, shows Mark up dimmed, and pressing it says why. To mark such an item up,
 capture it again. A whole page is never held for marking up: at its tallest, on a Retina display,
-it decodes to about 100 MB, and the markup's canvas would need as much again in the side panel. Its Mark up is
+it decodes to about 100 MB, and the markup's canvas would need as much again, on top of what
+putting the page together already takes (about 150 MB more in the side panel's process and 260 MB
+more in Chrome's GPU process at the peak, below). Its Mark up is
 dimmed too, and to point at part of it, capture that part with Region and mark that up.
 
 **From the keyboard.** While Region or Element is armed, the arrow keys and <kbd>Enter</kbd>
 work on the page, and pressed in the panel they go on to the page too, so there is no need to
-click the page after clicking a mode button. In a text field they stay with the field, and
+click the page after clicking a mode button. In a text field they stay with the field, on the
+frame of a whole page they scroll the frame, and
 <kbd>Enter</kbd> goes on only from the lit mode button or with nothing focused, so on any other
 button it still presses that button. On a row of the sheet, <kbd>Alt</kbd> with the up or down
 arrow moves that row instead (see section 2). While you mark up a capture they stay in the panel,
@@ -246,7 +255,10 @@ frame. The name is read in the page once for each element the highlight goes to,
 Tab or the arrow keys, with nothing written into the page and nothing posted to it, and it is kept
 nowhere. On a page with no component, on a site you keep the collector off, and in a tab left open
 across an update or reload of the extension (whose old collector may not know the question) until
-you reload the tab, the tag gives the element and its size alone. So does it on an Angular page:
+you reload the tab, the tag gives the element and its size alone. So does it on a production build
+of Vue 3 or Svelte, which keep nothing on an element that says which component rendered it (Vue 3
+does only when built with its production devtools flag, `__VUE_PROD_DEVTOOLS__`), so there is no
+name to show; a Vue 2 production build still has one. And so does it on an Angular page:
 Angular can be asked which component rendered an element only by calling its own functions, which
 the extension does once for a pick and not for every element the pointer crosses.
 
@@ -606,7 +618,10 @@ a cycle afterwards, so the extension puts that cache back before it answers, as 
 all but one rare case that the [architecture notes](docs/ARCHITECTURE.md) describe.
 
 A production build of Svelte or Angular records none of this, so there the element section has no
-Component line, only the markup, the search targets and the selector. Vue 2 keeps its instances on
+Component line, only the markup, the search targets and the selector. Nor does a production build
+of Vue 3: it sets neither `__vueParentComponent` nor `__vnode` on its elements (unless it was built
+with `__VUE_PROD_DEVTOOLS__`), so there is no Component line and, since the handlers are read from
+`__vnode` too, no Handlers line either. Vue 2 keeps its instances on
 the page in production too, so a Vue 2 production build is read as a development one is, without
 the file, which vue-loader records only in development, and without saying which build it is. The
 handlers bound to an element are read on React and Vue 3 pages only, so on Svelte, Vue 2 and
@@ -1173,8 +1188,12 @@ cost of Claude reading it smaller, since it scales any image down to 2,576 pixel
 edge; lower it for text Claude can still read. Two other limits sit beside it and may stop a run
 first: `PAGE_MAX_AREA`, 2^26 pixels in all (about 26,000 rows at 2,560 wide), which keeps the
 canvas well inside what Chrome can encode, and `PAGE_MAX_SCREENS`, 100 screenshots. Taller
-images also take more of the side panel's memory while they are put together (four bytes a
-pixel), and longer to take, at half a second a screen.
+images also take more memory while they are put together, and longer to take, at half a second a
+screen. At the current cap on a 2x display (a page 2,028 by 10,000 pixels), putting one together
+took about 150 MB more in the side panel's process and about 260 MB more in Chrome's GPU process
+at the peak, as measured in Chrome for Testing 156. Afterwards the two stayed about 145 MB and
+120 MB above where they were while the screenshots were taken, and a second and third run did not
+add to that.
 
 **How much history the collector keeps.** `LIMIT` in
 [`content/collector-main.js`](content/collector-main.js), currently the newest 30 entries of

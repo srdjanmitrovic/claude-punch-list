@@ -2297,6 +2297,44 @@ test('page: the frame scrolls a page item, as a Tab stop with a label, and no ot
   assert.equal(wrapper.getAttribute('aria-label'), null);
 });
 
+// In Chrome for Testing 156, with Region armed, the arrow keys on the focused
+// frame of a page item went on to the page, and the frame did not scroll:
+// only text fields were kept from forwardsKey.
+test('page: with a mode armed, the arrow keys scroll the focused frame of a page item, and go to the page from elsewhere', async () => {
+  const { panel } = await panelAndPage({ page: { height: 2000 } });
+  panel.click('mode-page');
+  await panel.clock.advance(8000);
+  const handed = [];
+  panel.chrome.scripting.executeScript = async ({ target, args }) => {
+    handed.push([target.tabId, ...args]);
+    return [{ result: true }];
+  };
+  const realm = realmOf(panel);
+  const frame = panel.element('preview-scroll');
+  panel.click('mode-region');
+  await panel.flush();
+  await panel.flush();
+  assert.equal(realm.armedHere(), true);
+  assert.equal(frame.getAttribute('tabindex'), '0');
+  realm.document.activeElement = frame;
+  for (const key of ['ArrowDown', 'ArrowUp', 'ArrowLeft', 'ArrowRight', 'Enter']) {
+    assert.equal(press(panel, key), false, `${key} on the frame went to the page`);
+  }
+  realm.document.activeElement = null;
+  assert.equal(press(panel, 'ArrowDown'), true, 'from nowhere in particular the arrows go on to the page');
+  await panel.flush();
+  assert.deepEqual(handed, [[TAB, 'region', 'ArrowDown', false, false]]);
+
+  // Showing another item, the frame is no Tab stop, and holds no key back.
+  await captureRegion(panel);
+  panel.click('mode-region');
+  await panel.flush();
+  await panel.flush();
+  assert.equal(frame.getAttribute('tabindex'), null);
+  realm.document.activeElement = frame;
+  assert.equal(press(panel, 'ArrowDown'), true);
+});
+
 test('page: Page is off on a page the panel may not capture', async () => {
   const panel = await started({
     worker: (message) =>

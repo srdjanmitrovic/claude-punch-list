@@ -21,7 +21,12 @@
  *   property removed leaves an empty style attribute behind;
  * * TreeWalker does not enter shadow roots; shadowRoot is null for a closed
  *   one, which only chrome.dom.openOrClosedShadowRoot hands an extension;
- * * a background tab runs no animation frames.
+ * * a background tab runs no animation frames;
+ * * Locomotive Scroll 4 in smooth mode locks the root and the body (overflow
+ *   hidden) and moves its container, taller than the view, with an inline
+ *   matrix3d() transform, which getComputedStyle gives in its 2D form:
+ *   matrix(1, 0, 0, 1, 0, 0) at load, matrix(1, 0, 0, 1, 0, -192) once the
+ *   wheel has moved it 192 px (Chrome for Testing 156).
  *
  * The clock is the panel realm's makeClock, so a test can run the panel and
  * the page on one timeline (panelAndPage does).
@@ -95,7 +100,13 @@ class PageElement {
       overflowY: spec.overflowY || 'visible',
       backgroundColor: spec.background || 'rgba(0, 0, 0, 0)',
       scrollSnapType: spec.snap ? 'y mandatory' : 'none',
+      // As getComputedStyle serialises it: 'none', or matrix() or matrix3d().
+      transform: spec.transform || 'none',
     };
+    // Attributes other than style, which the model keeps apart.
+    this.attributes = { ...spec.attributes };
+    // A <dialog> opened with showModal(), which :modal matches.
+    this.modal = Boolean(spec.modal);
     // The border box, in the coordinates of whatever it is laid out in: the
     // view for a fixed element, otherwise the content of its scroller (the
     // document or an inner element), unscrolled.
@@ -135,7 +146,12 @@ class PageElement {
   }
   getAttribute(name) {
     if (name === 'style') return this.hasStyle ? this.style.cssText : null;
-    return null;
+    return Object.hasOwn(this.attributes, name) ? String(this.attributes[name]) : null;
+  }
+  /** Only :modal, the one selector page-shot.js asks an element about. */
+  matches(selector) {
+    if (selector !== ':modal') throw new Error(`the model knows no selector ${selector}`);
+    return this.modal;
   }
   removeAttribute(name) {
     if (name !== 'style') return;
@@ -199,6 +215,7 @@ class PageElement {
  * @param {boolean} [options.smooth] html { scroll-behavior: smooth }.
  * @param {number[]} [options.snap] a mandatory snapping root's snap points.
  * @param {number} [options.scale] visualViewport.scale: pinch zoom when not 1.
+ * @param {number} [options.ratio] devicePixelRatio.
  * @param {boolean} [options.dom] whether chrome.dom.openOrClosedShadowRoot exists.
  * @param {string} [options.overflow] the root's overflow-y.
  * @param {string} [options.bodyOverflow] the body's overflow-y.
@@ -213,6 +230,7 @@ export function makePage({
   smooth = false,
   snap = null,
   scale = 1,
+  ratio = 1,
   dom = true,
   overflow = 'visible',
   bodyOverflow = 'visible',
@@ -246,6 +264,7 @@ export function makePage({
       overflowY: inline('overflow-y') || sheet.overflowY,
       backgroundColor: inline('background-color') || sheet.backgroundColor,
       scrollSnapType: inline('scroll-snap-type') || sheet.scrollSnapType,
+      transform: sheet.transform,
       visibility: inline('visibility') || 'visible',
       opacity: inline('opacity') || '1',
     };
@@ -270,7 +289,10 @@ export function makePage({
   };
   page.scrolls = [];
 
-  /** Add an element: { id, tag, in, shadowIn, position, rect, overflowY, scroll, style, shadow, ... }. */
+  /**
+   * Add an element: { id, tag, in, shadowIn, position, rect, overflowY,
+   * scroll, style, shadow, transform, attributes, modal, ... }.
+   */
   page.add = (spec) => {
     const element = new PageElement(page, spec);
     const parent = spec.shadowIn ? byId.get(spec.shadowIn)._shadow : spec.in ? byId.get(spec.in) : body;
@@ -314,6 +336,7 @@ export function makePage({
     innerHeight: viewport.height,
     NodeFilter: { SHOW_ELEMENT: 1 },
     visualViewport: { scale },
+    devicePixelRatio: ratio,
     setTimeout: clock.setTimeout,
     clearTimeout: clock.clearTimeout,
     getComputedStyle: (element) => page.computed(element),

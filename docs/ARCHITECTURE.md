@@ -654,7 +654,7 @@ function and serialised arguments, and Chrome hands back what the function retur
 
 | Call | Answer |
 | :--- | :--- |
-| `begin()` | `{ ok: true, scroller: 'document' \| 'inner', locked?, rect, client, viewport, scrollHeight, screens, background }`, `locked: true` only for a document the page has locked, which the run leaves as it is; or `{ ok: false, reason: 'zoom' \| 'error' }` with nothing on the page changed |
+| `begin()` | `{ ok: true, scroller: 'document' \| 'inner', locked?, scripted?, rect, client, viewport, ratio, scrollHeight, screens, background }`, `locked: true` only for a document the page has locked, which the run leaves as it is, `scripted: true` with it when the page looks moved by a script of its own rather than held by a dialog, and `ratio` the page's `devicePixelRatio`; or `{ ok: false, reason: 'zoom' \| 'error' }` with nothing on the page changed |
 | `step(index)` | `{ active: true, top, scrollHeight, atEnd, viewport, before }`, where `top` is where the page actually is and `before` where it was when the step began; or `{ active: false, stopped }`, `stopped` being `'user'`, `'pagehide'`, `'lease'`, `'error'` or `'ended'` |
 | `end()` | `{ restored: true }` when a run was still going; otherwise `{ restored: false, stopped }`, `stopped` being why the page ended it by itself (`'user'`, `'pagehide'`, `'lease'` or `'error'`) or null |
 
@@ -1050,7 +1050,12 @@ the next one, checks that the tab in view is still the one it is scrolling, and 
 retry for another window's panel capturing at the same moment. The run ends at the end of the
 page, when the frames reach `PAGE_MAX_HEIGHT` device pixels (10,000) or `PAGE_MAX_AREA` pixels in
 all (2^26), after `PAGE_MAX_SCREENS`, or when the page does not scroll any further, which the item
-says rather than that the page was too long. `end()` is called in a `finally`, whatever happened,
+says rather than that the page was too long. The Page button counts the screens taken out of an
+estimate (`pageScreens`), which counts as the loop stops: from `begin()` on it is held to the cap,
+worked out with the device pixel ratio `begin()` reports until the first screenshot gives the real
+scale, and once no further screenshot will be taken it is the number taken. (In Chrome for Testing
+156 a 30,000 pixel page read 0/34 for a run of six screens at 2x, and 6/7 after the last.) `end()`
+is called in a `finally`, whatever happened,
 and what it answers is read: no step follows the last screenshot to say the page ended the run by
 itself before it was taken (the user scrolled just as the page reached its end), and by then the
 page is back where it was, which that screenshot would show at the bottom of the image, so such a
@@ -1097,7 +1102,20 @@ page has locked (`overflow-y` `hidden` or `clip` on the root, or on the body whi
 it is `hidden`, so a run would go through every screen under the lock, loading and logging what the
 user never reached, and with `clip` it would not move at all. Where nothing else qualifies, the run
 is still: it neither scrolls nor touches a style, is the one screen in view as the user sees it,
-and the item says the page locked its scrolling. Otherwise `begin()` records where the page was
+and the item says the page locked its scrolling. A page that scrolls itself locks it too:
+Locomotive Scroll 4 in its smooth mode sets `overflow: hidden` on the root and the body and moves
+a container taller than the view with a transform as the wheel turns, and in Chrome for Testing
+156 the item said an open dialog had locked the page where none was open. So the notice names both
+causes, and only where the page looks moved by its own script (`scrolledByScript`) does `begin()`
+say `scripted` and the item say that instead. That takes one more walk, for a locked page only,
+and two things: an element that is not fixed, taller than the view, and moved only up by its
+computed transform (`matrix(1, 0, 0, 1, 0, y)` with `y` below zero, or the same `matrix3d`), and
+nothing that holds a page still, which is a modal `dialog`, an element marked `aria-modal` that is
+shown, or an element fixed to the window covering half the view or more (a backdrop, a cookie
+wall, a menu's sheet) unless it is `visibility: hidden` or at opacity 0, as a page transition
+layer waiting over the view often is. A page pushed sideways by an open menu, a page at the top of such a script
+(not moved yet), and one with a dialog open over it all get the notice that names both. Otherwise
+`begin()` records where the page was
 scrolled, turns scroll snapping off on the scroller (mandatory snapping moved a programmatic scroll
 from 600 to 409 in Chrome), and scrolls to the top with `behavior: 'instant'`, because a page's
 `scroll-behavior: smooth` makes a plain `scrollTo` an animation that has not moved yet when the
@@ -1171,14 +1189,25 @@ record the scroll depth, and whatever of that fails lands in the log, sorted to 
 PRIVACY.md says so. The collector, in the main world, is not touched.
 
 **Memory.** At the cap on a 2x display a run holds about seven screenshots as PNG `Blob`s, a few MB
-each, and while they are put together a canvas of up to about 100 MB and one decoded screenshot.
-For that reason a page item is never held for marking up (`markupBlocked` says why), which would
-need the decoded page and the markup's canvas as well.
+each, and while they are put together a canvas of up to about 100 MB of pixels and one decoded
+screenshot. What Chrome spends on that is more than the pixels, and most of it is outside the
+panel's JavaScript heap, which stayed under 3 MB throughout. Measured in Chrome for Testing 156,
+headed on a real 2x display, three runs at the cap (a 30,000 pixel page, filed as 2,028 by 10,000
+pixels): while the screenshots were put together, the extension's renderer process went about
+146 MB and the GPU process about 263 MB above where they were while the screenshots were taken.
+After a run the renderer stayed about 145 MB and the GPU process about 120 MB above that, and
+neither grew on the second or third run, so nothing of a run accumulates, though Chrome does not
+hand that memory back at once. For that reason a page item is never held for marking up
+(`markupBlocked` says why), which would need the decoded page and the markup's canvas as well.
 
 **Not handled.** Only vertical scrolling is captured. An inner scroller under a quarter of the view,
 such as a dialog's body, is not chosen; Region or Element covers it better. A modal that leaves the
 page scrollable has its backdrop repeat on every screen (one that locks the page makes the run
-still). A video or an animation differs from screen to screen, and a page
+still). A page that scrolls itself by moving its content, as Locomotive Scroll 4 does in its
+smooth mode on a view 1,024 pixels wide or more, gives one screen, since it locks the document and
+the capture cannot follow its script; Lenis, which lets the browser scroll, and Locomotive on a
+narrower view, where it does too, were captured whole in Chrome for Testing 156. A video or an
+animation differs from screen to screen, and a page
 that moves between a screenshot and the next step leaves a seam. So does a header a script takes
 out of the flow once the page is scrolled, which moves everything below it up inside the step: in
 Chrome for Testing 156 a 56 px nav cut 56 px out of the page at the first seam, and scroll anchoring
@@ -1620,7 +1649,9 @@ item can be marked up is decided in one place, `markupBlocked`, which returns th
 or null. An item that cannot still shows the button, dimmed with `aria-disabled` rather than
 disabled, so that a press can say why: it came from storage, from another window, or was let go
 to keep within the bound. A whole page is never held at all (`holdFull` skips mode `page`), since
-at the cap it decodes to about 100 MB and the canvas needs as much again; its reason says to
+at the cap it decodes to about 100 MB and the canvas needs as much again, on top of what putting it
+together takes in the renderer and the GPU process (see
+[Whole page capture](#whole-page-capture), Memory); its reason says to
 capture the part with Region. Mark up also waits while a copy or a capture runs, while the item's
 previous marked copy is being saved, and while its own capture is being decoded.
 

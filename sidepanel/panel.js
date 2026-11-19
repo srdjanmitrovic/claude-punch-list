@@ -2519,7 +2519,14 @@ const PAGE_TOO_LARGE = 'The whole page was too large to put together, so nothing
 const PAGE_GREW =
   'The page changed height or moved while it was captured, so a seam in this screenshot may not line up.';
 const PAGE_ONE_SCREEN = 'Nothing on this page scrolls, so this is the visible screen.';
-const PAGE_LOCKED = 'The page has locked its scrolling, as an open dialog or menu does, so this is the visible screen.';
+// A locked document is not scrolled at all (content/page-shot.js begin).
+// What locked it is told apart only where the page looks moved by a script
+// of its own; otherwise the notice names both causes, so it is true of
+// either.
+const PAGE_LOCKED =
+  'The page has locked its scrolling, as an open dialog or menu does, or as a page that scrolls itself with a script does, so this is the visible screen.';
+const PAGE_SCRIPTED =
+  'The page moves its content with a script instead of scrolling, which a whole page capture cannot follow, so this is the visible screen.';
 const PAGE_INNER =
   'The page scrolls inside one area, so only that area is shown in full, and what is beside it is from the first screen.';
 const PAGE_CANCELLED = 'Page capture cancelled. Nothing was filed.';
@@ -2736,6 +2743,28 @@ function pagePlan({ scroller, rect, client, frames, frame, base, scrollHeight, m
   };
 }
 
+/**
+ * How far down the page a whole page capture reaches, in CSS pixels, for an
+ * image `width` device pixels wide at `base` of them to a CSS pixel:
+ * PAGE_MAX_HEIGHT rows, and never more than PAGE_MAX_AREA pixels in all.
+ */
+function pageReach(width, base) {
+  return Math.min(PAGE_MAX_HEIGHT, Math.floor(PAGE_MAX_AREA / Math.max(1, width))) / base;
+}
+
+/**
+ * How many screens a run takes down a scroller `height` CSS pixels tall,
+ * showing `rect` of the view, when it may reach `reach`: one, then a step (a
+ * CSS pixel short of a screen, content/page-shot.js) for each further screen.
+ * It counts as the loop in scrollAndShoot stops: once the page says it is at
+ * its end, which it does within a pixel of it, or once a screen reaches as
+ * far as `reach`.
+ */
+function pageScreens(rect, height, reach) {
+  const span = Math.min(height - 1, reach - rect.y) - rect.height;
+  return Math.min(PAGE_MAX_SCREENS, 1 + Math.ceil(Math.max(0, span) / Math.max(1, rect.height - 1)));
+}
+
 /** The size of a screenshot, decoded once and let go. */
 async function bitmapSize(blob) {
   const bitmap = await createImageBitmap(blob);
@@ -2796,7 +2825,14 @@ async function scrollAndShoot(shot) {
     // A stop from here on is said below, once the page has had its end().
     if (!shot.cancelled) begun = await untilStopped(shot, callPage(tabId, 'begin'));
     if (!shot.cancelled && !begun?.ok) throw new Error(begun?.reason === 'zoom' ? PAGE_ZOOMED : PAGE_REFUSED);
-    shot.expected = begun?.screens || 1;
+    // The count's first estimate, held to the cap at the device pixel ratio
+    // the page reports, as the first screenshot then confirms. Without it a
+    // page far longer than the cap read 0/34 for a run of six screens.
+    if (begun?.ok) {
+      const ratio = Number(begun.ratio) > 0 ? Number(begun.ratio) : 1;
+      const reach = pageReach(Math.round(begun.client.width * ratio), ratio);
+      shot.expected = Math.min(begun.screens || 1, pageScreens(begun.rect, begun.scrollHeight, reach));
+    }
     renderPageButton();
     let gate = null;
     for (let index = 0; index < PAGE_MAX_SCREENS && !shot.cancelled; index += 1) {
@@ -2847,27 +2883,29 @@ async function scrollAndShoot(shot) {
           stopPageShot('resized');
           break;
         }
-        const width = Math.min(size.width, Math.round(begun.client.width * base));
-        limit = Math.min(PAGE_MAX_HEIGHT, Math.floor(PAGE_MAX_AREA / Math.max(1, width))) / base;
+        limit = pageReach(Math.min(size.width, Math.round(begun.client.width * base)), base);
       }
       frames.push({ blob, top: reply.top, takenAt });
       last = reply;
       shot.screens = frames.length;
-      // The count's estimate, which grows with the page: a screen, then a
-      // step (a CSS pixel short of one) for each further screen it reaches.
-      const span = Math.min(reply.scrollHeight, limit - begun.rect.y) - begun.rect.height;
-      shot.expected = Math.max(
-        frames.length + (reply.atEnd ? 0 : 1),
-        1 + Math.ceil(Math.max(0, span) / Math.max(1, begun.rect.height - 1))
-      );
-      renderPageButton();
-      if (reply.atEnd) break;
       // A page that would not scroll further, though it says there is more.
-      if (frames.length > 1 && reply.top <= frames[frames.length - 2].top) {
-        stuck = true;
-        break;
-      }
-      if (begun.rect.y + reply.top + begun.rect.height >= limit) break;
+      stuck = !reply.atEnd && frames.length > 1 && reply.top <= frames[frames.length - 2].top;
+      // Whether another screenshot follows: not at the end of the page, not
+      // where it stopped scrolling, not once the frames reach the cap, and
+      // not after PAGE_MAX_SCREENS.
+      const more =
+        !reply.atEnd &&
+        !stuck &&
+        begun.rect.y + reply.top + begun.rect.height < limit &&
+        frames.length < PAGE_MAX_SCREENS;
+      // The count's estimate, which grows with the page, and is the screens
+      // taken once no more will be: the last screenshot of a run cut at the
+      // cap read 6/7.
+      shot.expected = more
+        ? Math.max(frames.length + 1, pageScreens(begun.rect, reply.scrollHeight, limit))
+        : frames.length;
+      renderPageButton();
+      if (!more) break;
     }
   } finally {
     // The page is put back whatever happened: the end, a stop, a screenshot
@@ -2996,7 +3034,7 @@ async function capturePage() {
     }
     const { begun, frames } = taken;
     const notices = [...taken.notices];
-    if (begun.locked) notices.push(PAGE_LOCKED);
+    if (begun.locked) notices.push(begun.scripted ? PAGE_SCRIPTED : PAGE_LOCKED);
     else if (frames.length === 1 && !plan.cut) notices.push(PAGE_ONE_SCREEN);
     if (begun.scroller === 'inner') notices.push(PAGE_INNER);
     if (plan.cut) notices.push(pageCutNotice(plan.cssHeight, taken.stuck));
@@ -5793,12 +5831,14 @@ const PAGE_KEYS = ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Enter'];
  * panel. Clicking Region or Element leaves the keyboard here, and the page
  * hears no key until it is clicked, which for Element is the pick itself. So
  * the arrows and Enter go on to the page while a mode is armed: not from a
- * text field, where they move the caret, and Enter only from the lit mode
- * button or from nowhere in particular, so that Enter on another button still
- * presses it. Alt with the up or down arrow on a row of the sheet never gets
- * here: it moves the row (see the keydown listener). Nor does any key while
- * a markup is open: the arrows and Enter draw on its canvas (markKey), and
- * anywhere else in the panel they are the panel's.
+ * text field, where they move the caret, nor from the frame while it shows a
+ * whole page (a Tab stop then, see renderFrame), where the arrows scroll it,
+ * and Enter only from the lit mode button or from nowhere in particular, so
+ * that Enter on another button still presses it. Alt with the up or down
+ * arrow on a row of the sheet never gets here: it moves the row (see the
+ * keydown listener). Nor does any key while a markup is open: the arrows and
+ * Enter draw on its canvas (markKey), and anywhere else in the panel they
+ * are the panel's.
  */
 function forwardsKey(event) {
   if (!PAGE_KEYS.includes(event.key) || event.isComposing) return false;
@@ -5807,6 +5847,7 @@ function forwardsKey(event) {
   if (!armedHere()) return false;
   const focused = document.activeElement;
   if (focused && (focused.tagName === 'TEXTAREA' || focused.tagName === 'INPUT')) return false;
+  if (focused === el.previewScroll && el.previewScroll.getAttribute('tabindex') !== null) return false;
   if (event.key !== 'Enter') return true;
   const lit = state.armedMode === 'element' ? el.modeElement : el.modeRegion;
   return !focused || focused === document.body || focused === lit;

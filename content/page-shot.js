@@ -46,6 +46,10 @@
     // A fixed element at least this share of the scroller's height is a
     // sidebar or a backdrop, left alone so that it repeats down the page.
     const TALL = 0.9;
+    // A fixed element covering at least this share of the view holds a
+    // locked page as a dialog's backdrop, a cookie wall or a menu's sheet
+    // does (see scrolledByScript).
+    const COVERING = 0.5;
     const INPUT = ['wheel', 'touchstart', 'keydown', 'pointerdown'];
     const INSETS = ['top', 'right', 'bottom', 'left'];
     // The built in elements attachShadow accepts, as the DOM standard lists
@@ -247,6 +251,70 @@
         distance = reach;
       });
       return best;
+    }
+
+    /**
+     * Whether a computed transform only moves the element up: a translation
+     * with no horizontal part, no scale and no turn, and a vertical part
+     * below zero. matrix(a, b, c, d, x, y), or matrix3d with the same six
+     * at 0, 1, 4, 5, 12 and 13.
+     */
+    function liftedOnly(transform) {
+      const match = /^matrix(3d)?\(([^)]*)\)$/.exec(transform || '');
+      if (!match) return false;
+      const m = match[2].split(',').map(Number);
+      const [a, b, c, d, x, y] = match[1] ? [m[0], m[1], m[4], m[5], m[12], m[13]] : m;
+      return a === 1 && b === 0 && c === 0 && d === 1 && x === 0 && y < 0;
+    }
+
+    /**
+     * Whether a document the page has locked looks moved by a script of its
+     * own rather than held still by a dialog. Locomotive Scroll's smooth mode
+     * (in version 4, on a view 1024 px wide or more) locks the root with
+     * overflow hidden and, as the user turns the wheel, moves a container
+     * taller than the view up with a transform. So that is what is looked
+     * for: an element taller than the view, not fixed, moved only up by its
+     * transform. And it is said only when nothing that holds a page still
+     * is there: no modal dialog, nothing marked aria-modal that is shown,
+     * and no element fixed to the window covering COVERING of the view or
+     * more that can be seen. A page at the top of such a script has not
+     * been moved yet, and is left to the notice that names both causes.
+     * One walk, and only for a locked page;
+     * whatever goes wrong in it makes it false, never a refused run.
+     */
+    function scrolledByScript() {
+      try {
+        const covering = COVERING * innerWidth * innerHeight;
+        let moved = false;
+        let held = false;
+        walk((element) => {
+          if (held) return;
+          if (element.getAttribute('aria-modal') === 'true' && shownArea(element.getBoundingClientRect()) > 0) {
+            held = true;
+            return;
+          }
+          const style = getComputedStyle(element);
+          if (style.position === 'fixed') {
+            // A modal <dialog> is fixed by the browser's own sheet, and its
+            // ::backdrop is no element a walk meets.
+            if (element.localName === 'dialog' && element.matches(':modal')) held = true;
+            // One nobody can see holds nothing: smooth scrolling sites often
+            // keep a page transition layer over the whole view at opacity 0.
+            else if (
+              style.visibility !== 'hidden' &&
+              style.opacity !== '0' &&
+              shownArea(element.getBoundingClientRect()) >= covering
+            ) {
+              held = true;
+            }
+            return;
+          }
+          if (!moved && liftedOnly(style.transform) && element.getBoundingClientRect().height > innerHeight) moved = true;
+        });
+        return moved && !held;
+      } catch {
+        return false;
+      }
     }
 
     /** The part of the view the scroller shows, without its borders and scrollbars. */
@@ -478,11 +546,17 @@
      * reloaded) is put back first.
      *
      * A document the page has locked (overflow hidden or clip, as an open
-     * dialog, a cookie wall or a menu sets) is one the user cannot scroll,
-     * though a script still can. With nothing else to scroll, the run is
-     * still: it neither scrolls nor settles, and is the one screen in view,
-     * as the user sees it. `locked` tells the panel why, when the document
-     * would have scrolled.
+     * dialog, a cookie wall or a menu sets, and as a page that scrolls
+     * itself with a script does) is one the user cannot scroll, though a
+     * script still can. With nothing else to scroll, the run is still: it
+     * neither scrolls nor settles, and is the one screen in view, as the
+     * user sees it. `locked` tells the panel why, when the document would
+     * have scrolled, and `scripted` when the page looks moved by a script
+     * of its own rather than held by a dialog (scrolledByScript).
+     *
+     * `ratio` is the page's device pixel ratio, for the panel to hold its
+     * first count of the screens to the cap, which is in device pixels,
+     * before a screenshot has shown it the real one.
      */
     function begin() {
       try {
@@ -517,13 +591,16 @@
           scrollTo(0);
         }
         const height = currentHeight();
+        const locked = still && root.scrollHeight - root.clientHeight > 1;
         return {
           ok: true,
           scroller: scroller ? 'inner' : 'document',
-          ...(still && root.scrollHeight - root.clientHeight > 1 ? { locked: true } : {}),
+          ...(locked ? { locked: true } : {}),
+          ...(locked && scrolledByScript() ? { scripted: true } : {}),
           rect: run.rect,
           client: { width: root.clientWidth, height: root.clientHeight },
           viewport: { width: innerWidth, height: innerHeight },
+          ratio: window.devicePixelRatio || 1,
           scrollHeight: height,
           screens: height <= run.rect.height ? 1 : 1 + Math.ceil((height - run.rect.height) / stride()),
           background: background(),
