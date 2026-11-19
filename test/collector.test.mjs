@@ -5341,6 +5341,14 @@ test('collector: a Svelte pick calls no accessor planted on what it reads', () =
 // The compiler gives a component's definition (ɵcmp, a value of the class's
 // own) a debugInfo in a development build (compiler-cli
 // extractClassDebugInfo, with lineNumber counted from 1).
+//
+// getOwningComponent and getHostElement answer through getLContext, and
+// write what it writes. At render (attachPatchData) each component instance,
+// its host and the root elements of each template hold their view's number
+// in __ngContext__, and other elements hold nothing. getLContext asked about
+// an element caches a new LContext on it; asked about a component instance,
+// on the instance and its host, or it reuses the LContext the host holds and
+// fills in its component, caching it on the instance only then.
 
 /** A signal as Angular makes one: a function to call for the value, or one that throws while a required input is unset. */
 function signalOf(value, { unset = false } = {}) {
@@ -5353,14 +5361,28 @@ function signalOf(value, { unset = false } = {}) {
 }
 
 /**
- * <app-root ng-version="22.3.0"> > <app-checkout> > <app-coupon-field> >
- * <div class="coupon"> > (<input>, <p> > <em>), where the <p> is a library's
- * own markup that Angular did not render, with each component of its own
- * class. calls counts every call of a window.ng function.
+ * <app-root ng-version="22.3.0"> > <main> > <div class="layout"> >
+ * <app-checkout> > <section> > <app-coupon-field> > <div class="coupon"> >
+ * (<input>, <p> > <em>), where the <p> is a library's own markup that
+ * Angular did not render, with each component of its own class. With `moved`, the coupon's <div> sits in an overlay of its own
+ * instead, outside the app, as a CDK overlay or a portal moves an element,
+ * so that its component's host is not above it. With `shadow`, it is the
+ * top element of an open shadow root of its host, as
+ * ViewEncapsulation.ShadowDom puts a template, so that a climb by
+ * parentElement stops below the host; the realm needs SHADOW_NATIVES.
+ *
+ * calls counts every call of a window.ng function, written lists each
+ * object a call wrote __ngContext__ on, filled each LContext a call found
+ * already made and filled in the component of, and `inside` is set while a
+ * call runs. lContext(target) is getLContext, as a test asks it to stand for
+ * what Angular DevTools asked before the pick.
  */
-function angularApp(page, { coupon = {}, info = true, publish = true } = {}) {
+function angularApp(page, { coupon = {}, info = true, publish = true, moved = false, shadow = false } = {}) {
   const { Element } = page.page;
   const calls = [];
+  const written = [];
+  const filled = [];
+  const state = { inside: false };
   const component = (name, inputs, fields, debug) => {
     const Type = { [name]: class {} }[name];
     if (debug) Type.ɵcmp = { debugInfo: { className: name, ...debug } };
@@ -5376,43 +5398,151 @@ function angularApp(page, { coupon = {}, info = true, publish = true } = {}) {
     info && { filePath: 'src/app/coupon-field/coupon-field.component.ts', lineNumber: 12 }
   );
   const root = new Element('app-root', { 'ng-version': '22.3.0' });
-  const checkoutHost = root.append(new Element('app-checkout', {}));
-  const couponHost = checkoutHost.append(new Element('app-coupon-field', {}));
-  const box = couponHost.append(new Element('div', { class: 'coupon' }));
+  // Each host sits some elements below the one above it, as in an app:
+  // <main> is the root's template's top element and the <div> inside it a
+  // plain one, and <section> the checkout's template's top element.
+  const main = root.append(new Element('main', {}));
+  const layout = main.append(new Element('div', { class: 'layout' }));
+  const checkoutHost = layout.append(new Element('app-checkout', {}));
+  const section = checkoutHost.append(new Element('section', {}));
+  const couponHost = section.append(new Element('app-coupon-field', {}));
+  const overlay = moved ? new Element('div', { class: 'cdk-overlay-container' }) : null;
+  const box = shadow
+    ? new Element('div', { class: 'coupon' })
+    : (overlay ?? couponHost).append(new Element('div', { class: 'coupon' }));
+  if (shadow) couponHost.shadow = new page.page.ShadowRoot(couponHost, [box]);
   const input = box.append(new page.page.HTMLInputElement('input', coupon.type ? { type: coupon.type } : {}));
   const note = box.append(new Element('p', {}));
   const emphasis = note.append(new Element('em', {}));
-  const owners = new Map([
-    [checkoutHost, app],
-    [couponHost, checkout],
-    [box, couponField],
-    [input, couponField],
-  ]);
+
+  // Each view by its number: the elements it holds, in order, and the
+  // component whose template it is (none for the root view).
+  class View {
+    constructor(id, nodes, context) {
+      Object.assign(this, { id, nodes, context });
+    }
+  }
+  const views = new Map(
+    [
+      new View(0, [root], null),
+      new View(1, [main, layout, checkoutHost], app),
+      new View(2, [section, couponHost], checkout),
+      new View(3, [box, input], couponField),
+    ].map((view) => [view.id, view])
+  );
   const hosts = new Map([
     [app, root],
     [checkout, checkoutHost],
     [couponField, couponHost],
   ]);
+  // What render leaves: each instance and its host the number of the view
+  // the host is in, and each template's top element its view's.
+  root.__ngContext__ = app.__ngContext__ = 0;
+  checkoutHost.__ngContext__ = checkout.__ngContext__ = main.__ngContext__ = 1;
+  couponHost.__ngContext__ = couponField.__ngContext__ = section.__ngContext__ = 2;
+  box.__ngContext__ = 3;
+  // Angular climbs by parentNode: the parents as built, whatever a test
+  // makes of parentElement later.
+  const parents = new Map(
+    [main, layout, checkoutHost, section, couponHost, box, input, note, emphasis].map((element) => [element, element.parentElement])
+  );
+
+  class LContext {
+    constructor(lViewId, nodeIndex, native) {
+      Object.assign(this, { lViewId, nodeIndex, native, component: undefined, directives: undefined, localRefs: undefined });
+    }
+  }
+  // attachPatchData and readPatchedData: a plain write and a plain read.
+  const write = (target, value) => {
+    target.__ngContext__ = value;
+    written.push(target);
+  };
+  const read = (target) => {
+    const data = target.__ngContext__;
+    return typeof data === 'number' ? (views.get(data) ?? null) : data || null;
+  };
+  // Angular tells a component instance by its class's ɵcmp, which is a
+  // getter where a component is compiled just in time; this tells it by its
+  // host, so that no test's getter runs on that account.
+  function getLContext(target) {
+    let found = read(target);
+    if (found instanceof View) {
+      const component = hosts.has(target) ? target : undefined;
+      const native = component ? hosts.get(target) : target;
+      const index = found.nodes.indexOf(native);
+      if (index === -1) {
+        if (component) throw new Error('The provided component was not found in the application');
+        return null;
+      }
+      const existing = read(native);
+      const context = existing && !(existing instanceof View) ? existing : new LContext(found.id, index, native);
+      if (component && context.component === undefined) {
+        if (context === existing) filled.push(context);
+        context.component = component;
+        write(component, context);
+      }
+      write(native, context);
+      found = context;
+    } else if (!found) {
+      for (let parent = parents.get(target); parent; parent = parents.get(parent)) {
+        const above = read(parent);
+        if (!above) continue;
+        const view = above instanceof View ? above : views.get(above.lViewId);
+        if (!view) return null;
+        const index = view.nodes.indexOf(target);
+        if (index >= 0) {
+          found = new LContext(view.id, index, target);
+          write(target, found);
+          break;
+        }
+      }
+    }
+    return found || null;
+  }
+  const call = (name, body) => (arg) => {
+    calls.push(name);
+    state.inside = true;
+    try {
+      return body(arg);
+    } finally {
+      state.inside = false;
+    }
+  };
   const ng = {
-    getOwningComponent(element) {
-      calls.push('getOwningComponent');
-      return owners.get(element) ?? null;
-    },
-    getHostElement(instance) {
-      calls.push('getHostElement');
-      return hosts.get(instance) ?? null;
-    },
-    getDirectiveMetadata(instance) {
-      calls.push('getDirectiveMetadata');
-      return { inputs: instance.constructor.inputsMeta, outputs: {} };
-    },
-    isSignal(value) {
-      calls.push('isSignal');
-      return typeof value === 'function' && value.isSignal === true;
-    },
+    // The component whose view holds the element, or null in the root view.
+    getOwningComponent: call('getOwningComponent', (element) => {
+      const context = getLContext(element);
+      const view = context ? views.get(context.lViewId) : null;
+      return view ? view.context : null;
+    }),
+    // Throws, as Angular does, for an instance it finds no view for.
+    getHostElement: call('getHostElement', (instance) => getLContext(instance).native),
+    getDirectiveMetadata: call('getDirectiveMetadata', (instance) => ({ inputs: instance.constructor.inputsMeta, outputs: {} })),
+    isSignal: call('isSignal', (value) => typeof value === 'function' && value.isSignal === true),
   };
   if (publish) page.page.ng = ng;
-  return { ng, calls, root, checkoutHost, couponHost, box, input, note, emphasis, couponField };
+  return {
+    ng,
+    calls,
+    written,
+    filled,
+    state,
+    lContext: getLContext,
+    root,
+    main,
+    layout,
+    checkoutHost,
+    section,
+    couponHost,
+    overlay,
+    box,
+    input,
+    note,
+    emphasis,
+    app,
+    checkout,
+    couponField,
+  };
 }
 
 test('collector: an Angular element names the component whose template holds it, the file and line of its class, the components above, and the version', () => {
@@ -5578,6 +5708,542 @@ test("collector: Angular is never asked while hovering, and a page another frame
   const { component } = page.request('inspect', { marker: 'pick1' });
   assert.deepEqual([component.framework, component.names[0]], ['react', 'CouponField']);
   assert.deepEqual([angular.calls, touched], [[], []], 'window.ng was asked on a React page');
+});
+
+// What an Angular pick changes in the page, and puts back.
+
+/** The fixture's elements and component instances, by name. */
+function angularObjects(angular) {
+  const { root, main, layout, checkoutHost, section, couponHost, box, input, note, emphasis, app, checkout, couponField } = angular;
+  return { root, main, layout, checkoutHost, section, couponHost, box, input, note, emphasis, app, checkout, couponField };
+}
+
+/** Each object's own __ngContext__, as its descriptor, by name. */
+function ngContexts(objects) {
+  return Object.fromEntries(
+    Object.entries(objects).map(([name, object]) => [name, Object.getOwnPropertyDescriptor(object, '__ngContext__')])
+  );
+}
+
+/** The names of the objects a list holds, each once, sorted. */
+function namesIn(objects, list) {
+  const names = new Map(Object.entries(objects).map(([name, object]) => [object, name]));
+  return [...new Set(list.map((object) => names.get(object) ?? 'another'))].sort();
+}
+
+test('collector: an Angular pick puts back the __ngContext__ of every object its calls changed, so the page can still serialise its components', () => {
+  const page = arm({ dom: true });
+  const angular = angularApp(page);
+  const objects = angularObjects(angular);
+  const before = ngContexts(objects);
+  // As render leaves them: a number on each instance, its host and each
+  // template's top element, and nothing on the rest.
+  assert.deepEqual(Object.fromEntries(Object.entries(before).map(([name, member]) => [name, member?.value])), {
+    root: 0,
+    main: 1,
+    layout: undefined,
+    checkoutHost: 1,
+    section: 2,
+    couponHost: 2,
+    box: 3,
+    input: undefined,
+    note: undefined,
+    emphasis: undefined,
+    app: 0,
+    checkout: 1,
+    couponField: 2,
+  });
+
+  const picks = [
+    // Asked about itself, then each instance up the chain and its host.
+    ['input', ['app', 'checkout', 'checkoutHost', 'couponField', 'couponHost', 'input', 'root']],
+    // A host, asked about as an element first.
+    ['couponHost', ['app', 'checkout', 'checkoutHost', 'couponHost', 'root']],
+    // A climb from markup Angular did not render to the template's root.
+    ['emphasis', ['app', 'box', 'checkout', 'checkoutHost', 'couponField', 'couponHost', 'root']],
+  ];
+  for (const [picked, changed] of picks) {
+    angular.written.length = 0;
+    page.page.document.querySelector = () => objects[picked];
+    const { component } = page.request('inspect', { marker: 'pick1' });
+    assert.equal(component.framework, 'angular', picked);
+    // The calls did write each of these while the pick ran...
+    assert.deepEqual(namesIn(objects, angular.written), changed, picked);
+    // ...and every one is as it was: a number the same number, and one that
+    // was absent absent again.
+    assert.deepEqual(ngContexts(objects), before, picked);
+    for (const instance of [angular.app, angular.checkout, angular.couponField]) {
+      assert.doesNotThrow(() => JSON.stringify(instance), `${picked}: ${instance.constructor.name}`);
+    }
+  }
+
+  // The printout is the one a pick gave before anything was put back, and
+  // the same at every pick.
+  page.page.document.querySelector = () => angular.input;
+  const expected = {
+    framework: 'angular',
+    build: 'development',
+    names: ['CouponFieldComponent', 'CheckoutComponent', 'AppComponent'],
+    hops: 0,
+    source: 'src/app/coupon-field/coupon-field.component.ts:12',
+    version: '22.3.0',
+    props: ['code="SUMMER25"', 'disabled=false', 'apiToken=<redacted>'],
+  };
+  assert.deepEqual(page.request('inspect', { marker: 'pick1' }).component, expected);
+  assert.deepEqual(page.request('inspect', { marker: 'pick1' }).component, expected);
+});
+
+test('collector: an LContext cached before an Angular pick, by Angular DevTools say, stays the same object, its component as it was', () => {
+  const page = arm({ dom: true });
+  const angular = angularApp(page);
+  const { checkoutHost, couponHost, input, checkout, couponField } = angular;
+  // DevTools asked about the coupon's host as an element, which caches an
+  // LContext with no component on it, and about the checkout component,
+  // which caches one with its component on it and on its host.
+  const hostContext = angular.lContext(couponHost);
+  const checkoutContext = angular.lContext(checkout);
+  assert.deepEqual([hostContext.component, checkoutContext.component, checkoutHost.__ngContext__ === checkoutContext], [undefined, checkout, true]);
+  angular.filled.length = 0;
+  angular.written.length = 0;
+
+  page.page.document.querySelector = () => input;
+  assert.equal(page.request('inspect', { marker: 'pick1' }).component.names[0], 'CouponFieldComponent');
+  // The pick found the host's LContext, filled in its component and cached
+  // it on the instance...
+  assert.deepEqual([angular.filled.length, angular.filled[0] === hostContext], [1, true]);
+  assert.ok(angular.written.includes(couponField));
+  // ...and both are as they were, as is what the checkout's was.
+  assert.equal(couponHost.__ngContext__, hostContext);
+  assert.deepEqual(Object.getOwnPropertyDescriptor(hostContext, 'component'), {
+    value: undefined,
+    writable: true,
+    enumerable: true,
+    configurable: true,
+  });
+  assert.equal(couponField.__ngContext__, 2);
+  assert.deepEqual(
+    [checkout.__ngContext__ === checkoutContext, checkoutHost.__ngContext__ === checkoutContext, checkoutContext.component === checkout],
+    [true, true, true]
+  );
+});
+
+test('collector: an Angular pick puts back the host of a component whose elements an overlay moved elsewhere, which no climb from them reaches', () => {
+  const page = arm({ dom: true });
+  const angular = angularApp(page, { moved: true });
+  const { couponHost, input, couponField } = angular;
+  page.page.document.querySelector = () => input;
+  const { component } = page.request('inspect', { marker: 'pick1' });
+  assert.deepEqual([component.names, component.hops], [['CouponFieldComponent', 'CheckoutComponent', 'AppComponent'], 0]);
+  // getHostElement changed the host before it named it, and the number it
+  // held is the one its instance held.
+  assert.ok(angular.written.includes(couponHost));
+  assert.deepEqual(Object.getOwnPropertyDescriptor(couponHost, '__ngContext__'), {
+    value: 2,
+    writable: true,
+    enumerable: true,
+    configurable: true,
+  });
+  assert.deepEqual([couponField.__ngContext__, Object.hasOwn(input, '__ngContext__')], [2, false]);
+
+  // An LContext a caller cached on the host first, which the pick's call
+  // reused, is told from one the call made by what else is filled in, and
+  // stays, with its component as it was: filled in by getComponent, so the
+  // call left the instance alone, or with its directives filled in by
+  // getDirectives, or its local refs by a DebugElement's references (null
+  // for a node with no local names, as getLocalRefs stores it), so the call
+  // filled in its component.
+  const fills = {
+    'its component': (context, app) => {
+      context.component = app.couponField;
+    },
+    'its directives': (context) => {
+      context.directives = [];
+    },
+    'its local refs': (context) => {
+      context.localRefs = null;
+    },
+  };
+  for (const [label, fill] of Object.entries(fills)) {
+    const again = arm({ dom: true });
+    const app = angularApp(again, { moved: true });
+    const context = app.lContext(app.couponHost);
+    fill(context, app);
+    const was = context.component;
+    app.written.length = 0;
+    again.page.document.querySelector = () => app.input;
+    assert.equal(again.request('inspect', { marker: 'pick1' }).component.names[0], 'CouponFieldComponent', label);
+    assert.ok(app.written.includes(app.couponHost), label);
+    assert.deepEqual(
+      [app.couponHost.__ngContext__ === context, context.component === was, app.couponField.__ngContext__],
+      [true, true, 2],
+      label
+    );
+  }
+
+  // One with nothing filled in cannot be told from one the call made, and
+  // the host is given back the number instead.
+  const last = arm({ dom: true });
+  const lone = angularApp(last, { moved: true });
+  lone.lContext(lone.couponHost);
+  last.page.document.querySelector = () => lone.input;
+  last.request('inspect', { marker: 'pick1' });
+  assert.deepEqual([lone.couponHost.__ngContext__, lone.couponField.__ngContext__], [2, 2]);
+});
+
+test('collector: an Angular pick notes the elements above a host only a call named before any call asks about them, so an LContext cached there first stays', () => {
+  const page = arm({ dom: true });
+  const angular = angularApp(page, { moved: true });
+  const { root, checkoutHost, couponHost, input, app, checkout, couponField } = angular;
+  // DevTools asked about the checkout's host and the root as elements, which
+  // caches an LContext with nothing filled in on each. Both are above the
+  // coupon's host, which the first getHostElement names, and above nothing
+  // the pick climbed through, each with elements in between that are no
+  // host, so a sweep that stops short of either leaves it to noteHost.
+  const checkoutContext = angular.lContext(checkoutHost);
+  const rootContext = angular.lContext(root);
+  const objects = angularObjects(angular);
+  const before = ngContexts(objects);
+  angular.filled.length = 0;
+
+  page.page.document.querySelector = () => input;
+  const { component } = page.request('inspect', { marker: 'pick1' });
+  assert.deepEqual([component.names, component.hops], [['CouponFieldComponent', 'CheckoutComponent', 'AppComponent'], 0]);
+  // The calls filled in both LContexts and cached them on the instances...
+  assert.deepEqual(
+    [angular.filled.length, angular.filled.includes(checkoutContext), angular.filled.includes(rootContext)],
+    [2, true, true]
+  );
+  // ...and every object is as it was: both hosts hold the same LContext,
+  // with nothing filled in, rather than the number noteHost would give back,
+  // and the coupon's host, which held a number, holds it again.
+  assert.deepEqual(ngContexts(objects), before);
+  assert.deepEqual(
+    [checkoutHost.__ngContext__ === checkoutContext, root.__ngContext__ === rootContext, couponHost.__ngContext__],
+    [true, true, 2]
+  );
+  assert.deepEqual([checkoutContext.component, rootContext.component], [undefined, undefined]);
+  assert.deepEqual([app.__ngContext__, checkout.__ngContext__, couponField.__ngContext__], [0, 1, 2]);
+});
+
+// Node.prototype.parentNode and ShadowRoot.prototype.host, getters as Chrome
+// has them, which the collector takes at its start. An element's parent node
+// is its parent element, or the shadow root it is a top element of, and host
+// throws for anything but a shadow root, as the native does.
+const SHADOW_NATIVES = `
+  globalThis.Node = class Node {};
+  Object.defineProperty(Node.prototype, 'parentNode', {
+    configurable: true,
+    get() { return this.parentElement ?? this.root ?? null; },
+  });
+  globalThis.ShadowRoot = class ShadowRoot extends DocumentFragment {
+    constructor(host, children) {
+      super(children);
+      this.attachedTo = host;
+      for (const child of children) child.root = this;
+    }
+  };
+  Object.defineProperty(ShadowRoot.prototype, 'host', {
+    configurable: true,
+    get() {
+      if (!(this instanceof ShadowRoot)) throw new TypeError('Illegal invocation');
+      return this.attachedTo;
+    },
+  });
+`;
+
+test('collector: an Angular pick notes the host of a component whose template is in a shadow root, and every host above it, before any call asks about them', () => {
+  const page = arm({ dom: true, before: SHADOW_NATIVES });
+  const angular = angularApp(page, { shadow: true });
+  const { checkoutHost, couponHost, box, input, app, checkout, couponField } = angular;
+  // DevTools asked about both hosts as elements, which caches an LContext
+  // with nothing filled in on each: on a host only a call's answer named,
+  // the one case noteHost cannot tell from a call's own.
+  const couponContext = angular.lContext(couponHost);
+  const checkoutContext = angular.lContext(checkoutHost);
+  const objects = angularObjects(angular);
+  const before = ngContexts(objects);
+  // The page's own parentNode and host on the way up, which the climb must
+  // not run: it steps through the natives.
+  let outside = 0;
+  for (const holder of [box, couponHost.shadowRoot]) {
+    for (const key of ['parentNode', 'host']) {
+      Object.defineProperty(holder, key, {
+        configurable: true,
+        get() {
+          outside += 1;
+          return null;
+        },
+      });
+    }
+  }
+
+  // The input, whose climb stops at once, below the root's top element, and
+  // the <em>, whose climb stops at that top element itself.
+  for (const [picked, hops] of [
+    [input, 0],
+    [angular.emphasis, 2],
+  ]) {
+    const label = picked.tag;
+    angular.filled.length = 0;
+    page.page.document.querySelector = () => picked;
+    const { component } = page.request('inspect', { marker: 'pick1' });
+    assert.deepEqual([component.names, component.hops], [['CouponFieldComponent', 'CheckoutComponent', 'AppComponent'], hops], label);
+    // The calls filled in both LContexts and cached them on the instances...
+    assert.deepEqual(
+      [angular.filled.length, angular.filled.includes(couponContext), angular.filled.includes(checkoutContext)],
+      [2, true, true],
+      label
+    );
+    // ...and every object is as it was, both hosts holding the same
+    // LContext, with nothing filled in, rather than the number noteHost
+    // would give back.
+    assert.deepEqual(ngContexts(objects), before, label);
+    assert.deepEqual(
+      [couponHost.__ngContext__ === couponContext, checkoutHost.__ngContext__ === checkoutContext],
+      [true, true],
+      label
+    );
+    assert.deepEqual([couponContext.component, checkoutContext.component], [undefined, undefined], label);
+    assert.deepEqual([app.__ngContext__, checkout.__ngContext__, couponField.__ngContext__], [0, 1, 2], label);
+    for (const instance of [app, checkout, couponField]) {
+      assert.doesNotThrow(() => JSON.stringify(instance), `${label}: ${instance.constructor.name}`);
+    }
+  }
+  assert.equal(outside, 0, 'a parentNode or host of the page was run');
+});
+
+test('collector: an Angular pick neither runs nor replaces an accessor the page put on __ngContext__', () => {
+  const page = arm({ dom: true });
+  const angular = angularApp(page);
+  const { input, couponField, state } = angular;
+  // Each counts the reads and writes that come from anywhere but Angular's
+  // own calls, which read and write __ngContext__ plainly.
+  let outside = 0;
+  const accessor = (initial) => {
+    let kept = initial;
+    return {
+      configurable: true,
+      enumerable: false,
+      get() {
+        if (!state.inside) outside += 1;
+        return kept;
+      },
+      set(value) {
+        if (!state.inside) outside += 1;
+        kept = value;
+      },
+    };
+  };
+  const onInstance = accessor(2);
+  const onInput = accessor(undefined);
+  Object.defineProperty(couponField, '__ngContext__', onInstance);
+  Object.defineProperty(input, '__ngContext__', onInput);
+  // A call that replaces the one on the element with a value of its own.
+  const owning = angular.ng.getOwningComponent;
+  angular.ng.getOwningComponent = (element) => {
+    const answer = owning(element);
+    if (element === input) {
+      Object.defineProperty(input, '__ngContext__', { value: 'replaced', writable: true, enumerable: true, configurable: true });
+    }
+    return answer;
+  };
+
+  page.page.document.querySelector = () => input;
+  assert.equal(page.request('inspect', { marker: 'pick1' }).component.names[0], 'CouponFieldComponent');
+  assert.equal(outside, 0, 'the collector ran an accessor of the page');
+  // The instance's is still the page's, and the element's is the page's again.
+  const instanceMember = Object.getOwnPropertyDescriptor(couponField, '__ngContext__');
+  const inputMember = Object.getOwnPropertyDescriptor(input, '__ngContext__');
+  assert.deepEqual(
+    [instanceMember.get === onInstance.get, instanceMember.set === onInstance.set, inputMember.get === onInput.get, inputMember.set === onInput.set],
+    [true, true, true, true]
+  );
+  assert.deepEqual([inputMember.enumerable, inputMember.configurable], [false, true]);
+  // What Angular's own write handed the instance's setter is kept by the
+  // page's code, where nothing is put back without running it.
+  state.inside = true;
+  assert.equal(couponField.__ngContext__.component, couponField);
+  state.inside = false;
+});
+
+test('collector: an Angular pick whose window.ng throws partway still puts back everything its calls changed', () => {
+  const page = arm({ dom: true });
+  const angular = angularApp(page);
+  const objects = angularObjects(angular);
+  const before = ngContexts(objects);
+  // Each throws once getLContext has written: getOwningComponent asked about
+  // the input, getHostElement asked about the checkout component (on it and
+  // its host), and getDirectiveMetadata, the last call, every time.
+  const { getOwningComponent, getHostElement } = angular.ng;
+  angular.ng.getOwningComponent = (element) => {
+    const answer = getOwningComponent(element);
+    if (element === angular.input) throw new Error('the page refuses');
+    return answer;
+  };
+  angular.ng.getHostElement = (instance) => {
+    const host = getHostElement(instance);
+    if (instance === angular.checkout) throw new Error('the page refuses');
+    return host;
+  };
+  angular.ng.getDirectiveMetadata = () => {
+    throw new Error('the page refuses');
+  };
+  page.page.document.querySelector = () => angular.input;
+  const { component } = page.request('inspect', { marker: 'pick1' });
+  // One up to the template's root, and no further than the throw.
+  assert.deepEqual([component.names, component.hops, component.props], [['CouponFieldComponent', 'CheckoutComponent'], 1, undefined]);
+  assert.deepEqual(namesIn(objects, angular.written), ['box', 'checkout', 'checkoutHost', 'couponField', 'couponHost', 'input']);
+  assert.deepEqual(ngContexts(objects), before);
+
+  // A throw out of the reader itself, here from a Map.prototype.get the page
+  // replaced before the collector started (as a late start finds it), at the
+  // second component of the chain: the pick has no answer, and what the
+  // calls before it changed is put back all the same.
+  const late = arm({
+    dom: true,
+    before: `
+      const get = Map.prototype.get;
+      Map.prototype.get = function (key) {
+        if (key !== null && typeof key === 'object' && Object.hasOwn(key, 'explodes')) throw new Error('the page broke Map');
+        return get.call(this, key);
+      };
+    `,
+  });
+  const broken = angularApp(late);
+  const brokenObjects = angularObjects(broken);
+  const was = ngContexts(brokenObjects);
+  broken.checkout.explodes = true;
+  late.page.document.querySelector = () => broken.input;
+  assert.equal(late.request('inspect', { marker: 'pick1' }), null);
+  assert.deepEqual(namesIn(brokenObjects, broken.written), ['couponField', 'couponHost', 'input']);
+  assert.deepEqual(ngContexts(brokenObjects), was);
+});
+
+test('collector: an Angular pick whose getHostElement answers something that is no element still names what it reached, and puts back what the calls changed', () => {
+  // Chrome's parentElement getter, which the collector takes at its start,
+  // throws for anything but a node. These elements keep their parent as a
+  // value of their own.
+  const page = arm({
+    dom: true,
+    before: `
+      globalThis.Node = class Node {};
+      Object.defineProperty(Node.prototype, 'parentElement', {
+        configurable: true,
+        get() {
+          if (this === null || typeof this !== 'object' || !('tag' in this)) throw new TypeError('Illegal invocation');
+          return Object.getOwnPropertyDescriptor(this, 'parentElement')?.value ?? null;
+        },
+      });
+    `,
+  });
+  const angular = angularApp(page);
+  const objects = angularObjects(angular);
+  const before = ngContexts(objects);
+  // A wrapper of the page's, which lets Angular answer for the checkout
+  // component and then answers an object of its own.
+  const { getHostElement } = angular.ng;
+  angular.ng.getHostElement = (instance) => {
+    const host = getHostElement(instance);
+    return instance === angular.checkout ? { wraps: host } : host;
+  };
+  page.page.document.querySelector = () => angular.input;
+  const { component } = page.request('inspect', { marker: 'pick1' });
+  // That object has no owner, so the names stop at the checkout.
+  assert.deepEqual([component.names, component.hops], [['CouponFieldComponent', 'CheckoutComponent'], 0]);
+  assert.deepEqual(namesIn(objects, angular.written), ['checkout', 'checkoutHost', 'couponField', 'couponHost', 'input']);
+  assert.deepEqual(ngContexts(objects), before);
+});
+
+test('collector: an Angular pick puts back what it changed though the page put get and value on Object.prototype', () => {
+  const page = arm({ dom: true });
+  const angular = angularApp(page);
+  const objects = angularObjects(angular);
+  // An accessor of the page's on the input, which the first call replaces.
+  const accessor = { configurable: true, enumerable: false, get: () => undefined, set: () => {} };
+  Object.defineProperty(angular.input, '__ngContext__', accessor);
+  const before = ngContexts(objects);
+  // Planted by the first call, once window.ng has been read: node's vm
+  // aborts when its global is asked for a descriptor with these in place.
+  // A descriptor that inherits either has both a value and a getter.
+  const objectProto = page.realm('Object.prototype');
+  const owning = angular.ng.getOwningComponent;
+  angular.ng.getOwningComponent = (element) => {
+    const answer = owning(element);
+    if (element === angular.input) {
+      Object.defineProperty(angular.input, '__ngContext__', { value: 'replaced', writable: true, enumerable: true, configurable: true });
+      Object.defineProperty(objectProto, 'value', { configurable: true, writable: true, value: 'page' });
+      Object.defineProperty(objectProto, 'get', { configurable: true, writable: true, value: () => 'page' });
+    }
+    return answer;
+  };
+  page.page.document.querySelector = () => angular.input;
+  try {
+    assert.equal(page.request('inspect', { marker: 'pick1' }).component.names[0], 'CouponFieldComponent');
+    assert.equal(objectProto.get(), 'page');
+  } finally {
+    delete objectProto.value;
+    delete objectProto.get;
+  }
+  assert.deepEqual(ngContexts(objects), before);
+});
+
+test('collector: an Angular pick writes back only what its calls changed, through the natives taken at the start, and a member that refuses leaves the rest put back', () => {
+  // The page's defineProperty and deleteProperty as the collector found
+  // them, counting its writes of __ngContext__ and of an LContext's component.
+  const page = arm({
+    dom: true,
+    before: `
+      globalThis.writes = [];
+      const define = Object.defineProperty;
+      Object.defineProperty = function (holder, key, descriptor) {
+        if (key === '__ngContext__' || key === 'component') writes.push(holder);
+        return define(holder, key, descriptor);
+      };
+      const remove = Reflect.deleteProperty;
+      Reflect.deleteProperty = function (holder, key) {
+        if (key === '__ngContext__' || key === 'component') writes.push(holder);
+        return remove(holder, key);
+      };
+    `,
+  });
+  const angular = angularApp(page);
+  const objects = angularObjects(angular);
+  const before = ngContexts(objects);
+  // Replaced since by the page, as a page can at any time.
+  page.realm(`
+    Object.defineProperty = Reflect.deleteProperty = Object.getOwnPropertyDescriptor = () => {
+      throw new Error('the page replaced it');
+    };
+  `);
+  page.page.document.querySelector = () => angular.input;
+  assert.equal(page.request('inspect', { marker: 'pick1' }).component.names.length, 3);
+  assert.deepEqual(ngContexts(objects), before);
+  // Not the template's root, which no call changed, nor anything else.
+  assert.deepEqual(namesIn(objects, page.realm('writes')), ['app', 'checkout', 'checkoutHost', 'couponField', 'couponHost', 'input', 'root']);
+  assert.equal(page.realm('writes').length, 7);
+
+  // The root component frozen by a call (the last), with its LContext on:
+  // it cannot be put back, and stays so, and nothing else does.
+  const again = arm({ dom: true });
+  const frozen = angularApp(again);
+  const all = angularObjects(frozen);
+  const was = ngContexts(all);
+  const { getDirectiveMetadata } = frozen.ng;
+  frozen.ng.getDirectiveMetadata = (instance) => {
+    Object.freeze(frozen.app);
+    return getDirectiveMetadata(instance);
+  };
+  again.page.document.querySelector = () => frozen.input;
+  let component;
+  assert.doesNotThrow(() => {
+    component = again.request('inspect', { marker: 'pick1' }).component;
+  });
+  assert.deepEqual([component.names[0], component.props.length], ['CouponFieldComponent', 3]);
+  assert.equal(frozen.app.__ngContext__.component, frozen.app);
+  const now = ngContexts(all);
+  delete now.app;
+  delete was.app;
+  assert.deepEqual(now, was);
 });
 
 // ------------------------------------------------------------------ Vue 2 --

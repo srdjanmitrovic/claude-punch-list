@@ -495,6 +495,10 @@ Props of `CouponFieldComponent`: code="SUMMER25", disabled=false
 Its props are the component's inputs, under the names a template binds them by (or under the
 class property's name, when only that one looks secret), and a signal input is read for its value. The file and line are the ones the Angular compiler records for the
 class from Angular 17.1 on; a component compiled in the browser has none, and the line is left out.
+The `window.ng` functions cache what they find on the elements and components they are asked
+about (`__ngContext__`), which could make the page's own `JSON.stringify` of a component fail on
+a cycle afterwards, so the extension puts that cache back before it answers, as it found it in
+all but one rare case that the [architecture notes](docs/ARCHITECTURE.md) describe.
 
 A production build of Svelte or Angular records none of this, so there the element section has no
 Component line, only the markup, the search targets and the selector. Vue 2 keeps its instances on

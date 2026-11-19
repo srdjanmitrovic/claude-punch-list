@@ -225,19 +225,45 @@ what the framework itself keeps in the page, with no code of the extension's lef
   the one reader that runs the page's code, every call goes through `ask()` in a try, and only an
   object answer is kept. `getOwningComponent` and `getHostElement` go through Angular's
   `getLContext`, which caches what it finds in `__ngContext__`, a property of Angular's own that it
-  reads back in either form: on each element asked about that Angular rendered, and on each
-  component instance asked about and its host element. Angular DevTools leaves the same. A
-  component instance has held its view's number there since it was made, and after a pick holds an
-  object that refers back to the instance and to its host, so the page's own code that serialises
-  the instance (`JSON.stringify(this)`) meets a cycle it did not meet before. The name and the file
-  and line come from the `debugInfo` the compiler gives a component's definition from Angular 17.1,
-  read only when `ɵcmp` is a value of the class's own; a component compiled in the browser has a
-  getter there that compiles it, which is not called, so it is named by its class with no file.
-  The version is the root host's `ng-version`, and the props are the inputs `getDirectiveMetadata`
-  lists, a signal input called for its value and one that throws (a required input not yet set)
-  left out. An input has two names, the one a template binds and its class property, and is filed
-  under the first unless only the second looks secret (`@Input('value') password`), so that the
-  name rule withholds it.
+  reads back in either form: an LContext on each element asked about that Angular rendered, and on
+  each component instance asked about and its host element, or the LContext the host already holds
+  with its component filled in. A component instance, its host and the root elements of each
+  template hold their view's number there from render, and an LContext refers back to the instance
+  and the host, so the page's own code that serialises an instance (`JSON.stringify(this)`) would
+  meet a cycle after a pick that it did not meet before. (Asked about a directive, `getLContext`
+  would write on every directive of its element too, but the reader asks only about elements and
+  about the components `getOwningComponent` answers.) So the reader puts all of it back. Before
+  each call it notes the own `__ngContext__` of what the call can change (`noteContext`): each
+  element it climbs through, and each instance before `getHostElement`. A host is known only from
+  `getHostElement`'s answer, by which time the call has changed it, so the reader notes ahead the
+  elements where the hosts usually are (`noteAbove`): before the first `getHostElement`, the
+  elements above the one the climb stopped at, and after each `getHostElement`, the elements above
+  the host it answered, before anything asks about them. Each step goes past a shadow root to its
+  host (`parentOrHost`, through the native `parentNode` and `ShadowRoot.prototype.host` getters),
+  so the host of a component whose template `ViewEncapsulation.ShadowDom` puts in a shadow root is
+  among them. That leaves a host above none of those: the host of a component whose elements an
+  overlay or a portal moved away from it. `noteHost` works out what such a host held from what
+  `getLContext` does: the number its instance held, when the instance and the host now share an
+  LContext with nothing but its component filled in, and otherwise what it holds now. In
+  `finally`, `putBack` defines each member that is not as it was back as it was, and deletes one
+  that was absent, through `Object.defineProperty`, `Object.getOwnPropertyDescriptor` and
+  `Reflect.deleteProperty` taken as the file loads, each step in its own try, and writes nothing
+  that is as it was. So a number stays that number, an absent one stays absent, an LContext
+  Angular DevTools made first stays the same object with its component as it was, and an accessor
+  the page put there is neither run nor replaced. Three things are not put back. What Angular's own
+  write hands to such an accessor's setter stays with the page's code. A member the page's own code
+  made unwritable while a call ran (an object it froze, or a proxy that refuses the write) stays as
+  the call left it. And on a host that only a call's answer names, an LContext made before the pick
+  with nothing filled in (by `getOwningComponent`, `getContext` or `getInjector` asked about that
+  host, for instance) cannot be told from one the call made, and is given its number back. Angular
+  reads either form the same way. The name and the file and line come from the `debugInfo` the
+  compiler gives a component's definition from Angular 17.1, read only when `ɵcmp` is a value of
+  the class's own; a component compiled in the browser has a getter there that compiles it, which
+  is not called, so it is named by its class with no file. The version is the root host's
+  `ng-version`, and the props are the inputs `getDirectiveMetadata` lists, a signal input called
+  for its value and one that throws (a required input not yet set) left out. An input has two
+  names, the one a template binds and its class property, and is filed under the first unless only
+  the second looks secret (`@Input('value') password`), so that the name rule withholds it.
 
 A production build of Svelte or Angular leaves nothing to read, and no reader guesses: the item
 has no component, as on a page with no framework.

@@ -60,11 +60,15 @@ Angular can only be asked by calling its own functions, which the extension does
   props (on Svelte, from Svelte 5.58; on Angular, its inputs), and, on a React or Vue 3 page, the
   names and first statements of the event handlers bound to it. These are read from what the framework itself keeps
   in the page. On an Angular page that means calling, at the pick only, the functions Angular's
-  development build publishes for its own DevTools (`window.ng`), which also leave Angular's own
-  cache (`__ngContext__`) on the elements and the component instances they were asked about, as
-  Angular DevTools does. Reading a prop can run the
-  component's own code, as reading it in the page's own scripts would, for instance a Svelte prop
-  computed from the parent's state or an Angular signal input.
+  development build publishes for its own DevTools (`window.ng`). Those functions cache what they
+  find (`__ngContext__`) on the elements and the component instances they are asked about, and
+  the extension puts that cache back as it found it before it answers, with one rare exception:
+  on the host of a component whose elements an overlay or a portal moved elsewhere in the page, a
+  cache made before the pick with nothing filled in yet (by Angular DevTools, for instance) is
+  given back as the plain number Angular put there at render, which Angular reads the same way
+  (see the [architecture notes](docs/ARCHITECTURE.md)). Reading a prop can run the component's own
+  code, as reading it in the page's own scripts would, for instance a Svelte prop computed from the
+  parent's state or an Angular signal input.
 
 **What you type**: the sentence you write for each item, and whether it is a bug or a
 suggestion.

@@ -244,6 +244,16 @@ reading a single file, and breaking them tends to fail silently rather than loud
   asked, and a new reader needs the same tests: that its brief path reads no prop, nothing of the
   document and calls nothing, that its `names[0]` is the pick's, and that the nodes it looks at
   stay within those bounds, where a walk down the render tree is counted against `SUBTREE_LIMIT`.
+* A pick leaves the page's objects as it found them, Angular's included, but for the one case
+  `noteHost` cannot tell apart (see the Angular passage of docs/ARCHITECTURE.md). Angular's
+  `getLContext`, behind `window.ng.getOwningComponent` and `getHostElement`, caches an LContext in
+  `__ngContext__` on what it is asked about, so `angularSummary` notes each object a call can
+  change before that call (`noteContext`, with `noteAbove` for the elements above the climb and
+  above each host `getHostElement` answers, or `noteHost` for a host only the call's answer
+  names) and puts every one back in `finally` (`putBack`). Another `window.ng` call needs the
+  same, and a test in `test/collector.test.mjs`, on the fixture's `angularApp`, which writes
+  `__ngContext__` as Angular 22.3.0 does, that every object the call changed is as it was after
+  the pick.
 * Content script broadcasts reach every open side panel, not just the one in the same window.
   Filter on `sender.tab.id`.
 * A content script runs in a page that may be hostile. The worker acts on the messages only the

@@ -2369,6 +2369,27 @@
   }
 
   /**
+   * An element's parent element, or, for the top element of a shadow root,
+   * that root's host, through the natives: the step up the Angular reader's
+   * notes take, so that the host of a component whose template
+   * ViewEncapsulation.ShadowDom puts in a shadow root, and every host above
+   * it, are noted before any call asks about them. Null at the document's
+   * top, for an element in no shadow root, and where this world has neither
+   * native.
+   */
+  function parentOrHost(element) {
+    const parent = parentOf(element);
+    if (parent || !nodeParentNode || !rootHost) return parent;
+    try {
+      // The host, or a TypeError for a parent node that is no shadow root
+      // (the document, a fragment) and for none at all.
+      return rootHost(nodeParentNode(element));
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * One prop value as a short display string.
    *
    * serialize() above is for console arguments and has a different job: it
@@ -2516,6 +2537,12 @@
   // parentElement a page defined on its own elements is not run by them.
   const NODE_PROTO = typeof Node === 'function' ? Node.prototype : null;
   const nodeParent = nativeGetter(NODE_PROTO, 'parentElement');
+  // The step past a shadow root that the Angular reader's notes take (see
+  // parentOrHost): a shadow root's top element has no parent element, but
+  // its parentNode is the root, and the root's host is the element the root
+  // is attached to, open or closed.
+  const nodeParentNode = nativeGetter(NODE_PROTO, 'parentNode');
+  const rootHost = nativeGetter(typeof ShadowRoot === 'function' ? ShadowRoot.prototype : null, 'host');
   const nodeListLength = typeof NodeList === 'function' ? nativeGetter(NodeList.prototype, 'length') : null;
   const collectionItem = typeof HTMLCollection === 'function' ? nativeMethod(HTMLCollection.prototype, 'item') : null;
   // Any element, a design system's own included, whose type or autocomplete
@@ -4635,17 +4662,26 @@
   // is asked at a pick only, never while hovering (see componentOf). Each
   // call goes through ask(), and only an object answer is kept.
   //
-  // getOwningComponent and getHostElement go through Angular's getLContext,
-  // which caches what it finds in __ngContext__, a property of Angular's own
-  // that it reads back in either form: on each element asked about that
-  // Angular rendered, and on each component instance asked about and its
-  // host element. A component instance has held its view's number there
-  // since it was made (as have the roots of each template and the hosts),
-  // and afterwards holds an object that refers back to the instance and to
-  // its host. So the page's own code that serialises an instance, with
-  // JSON.stringify say, meets a cycle after a pick it did not meet before.
-  // Angular DevTools leaves the same. A production build publishes no
-  // window.ng, and nothing is read.
+  // getOwningComponent and getHostElement go through Angular's getLContext
+  // (@angular/core 22.3.0), which caches what it finds in __ngContext__, a
+  // property of Angular's own that it reads back in either form. Asked about
+  // an element Angular rendered, it caches an LContext on that element.
+  // Asked about a component instance, it caches one on the instance and on
+  // its host element, or reuses the one the host holds, and then fills in
+  // its component and caches it on the instance only while it has none.
+  // (Asked about a directive, it would cache one on every directive of the
+  // element too, but this reader never asks about one: getOwningComponent
+  // answers a component.) A component instance, its host and the roots of
+  // each template hold their view's number there from render, and an
+  // LContext refers back to the instance and to the host, so the page's own
+  // code that serialises an instance, with JSON.stringify say, would meet a
+  // cycle after a pick that it did not meet before. So the reader notes each
+  // of these before the call that can change it, and puts every one back
+  // once its last call is done (see noteContext, noteAbove, noteHost and
+  // putBack): a number stays that number, one that was absent is deleted,
+  // and an LContext something else made first, Angular DevTools say, stays
+  // the same object, but for the one case noteHost cannot tell apart. A
+  // production build publishes no window.ng, and nothing is read.
 
   /** fn(arg), called as a member of ng, or null when it throws or answers anything but an object. */
   function ask(ng, fn, arg) {
@@ -4655,6 +4691,185 @@
       return answer !== null && typeof answer === 'object' ? answer : null;
     } catch {
       return null;
+    }
+  }
+
+  // What a pick puts back goes through natives taken as this file loads,
+  // before the page's own scripts run (ownDescriptor and defineOwn above,
+  // and this), so that a page that has replaced Object.defineProperty or
+  // Reflect.deleteProperty since is not run by it.
+  const deleteOwn = Reflect.deleteProperty;
+  const NG_CONTEXT = '__ngContext__';
+
+  /**
+   * holder's own member key as a descriptor with no prototype, so that
+   * defineOwn finds nothing of Object.prototype's in it, or null when holder
+   * has none. Its getter is not called. Throws as ownDescriptor does, for a
+   * proxy that refuses.
+   */
+  function ownCopy(holder, key) {
+    const found = ownDescriptor(holder, key);
+    if (found === undefined) return null;
+    return hasOwn(found, 'get')
+      ? { __proto__: null, get: found.get, set: found.set, enumerable: found.enumerable, configurable: found.configurable }
+      : {
+          __proto__: null,
+          value: found.value,
+          writable: found.writable,
+          enumerable: found.enumerable,
+          configurable: found.configurable,
+        };
+  }
+
+  /** Whether two members ownCopy answered are the same: the same value, or the same getter and setter, and the same flags. */
+  function sameMember(now, was) {
+    return (
+      now !== null &&
+      now.value === was.value &&
+      now.get === was.get &&
+      now.set === was.set &&
+      now.writable === was.writable &&
+      now.enumerable === was.enumerable &&
+      now.configurable === was.configurable
+    );
+  }
+
+  /**
+   * Notes holder's own member key as it is now, or as `was` says it was,
+   * the first time it is asked for, and answers the note. A later note of
+   * the same member keeps the first. A member that cannot be read (a proxy
+   * that refuses) is not noted, and so is not touched afterwards either.
+   * notes.list keeps the order, and notes.by each holder's notes by key.
+   */
+  function noteMember(notes, holder, key, was) {
+    if (holder === null || (typeof holder !== 'object' && typeof holder !== 'function')) return null;
+    let keys = mapGet(notes.by, holder);
+    if (keys && keys[key]) return keys[key];
+    let member = was;
+    if (member === undefined) {
+      try {
+        member = ownCopy(holder, key);
+      } catch {
+        return null;
+      }
+    }
+    if (!keys) {
+      keys = { __proto__: null };
+      mapSet(notes.by, holder, keys);
+    }
+    const note = { __proto__: null, holder, key, member };
+    keys[key] = note;
+    append(notes.list, note);
+    return note;
+  }
+
+  /**
+   * Notes holder's __ngContext__, before the call that could change it, and
+   * when it holds an LContext already, that LContext's component, the one
+   * member of it getLContext fills in.
+   */
+  function noteContext(notes, holder) {
+    const note = noteMember(notes, holder, NG_CONTEXT);
+    const context = note && note.member ? note.member.value : undefined;
+    if (context !== null && typeof context === 'object') noteMember(notes, context, 'component');
+  }
+
+  /**
+   * Notes the __ngContext__ of each element above element, at most limit of
+   * them, before any call asks about them: getHostElement changes a host
+   * before it answers it, and the hosts it answers are most often among
+   * them. Each step goes past a shadow root to its host (parentOrHost), where
+   * the host of a component whose template ViewEncapsulation.ShadowDom puts
+   * in one is. One noted already keeps its first note.
+   */
+  function noteAbove(notes, element, limit) {
+    try {
+      let above = parentOrHost(element);
+      for (let steps = 0; above && steps < limit; steps += 1) {
+        noteContext(notes, above);
+        above = parentOrHost(above);
+      }
+    } catch {
+      /* the rest are noted as they are answered (see noteHost) */
+    }
+  }
+
+  /**
+   * Notes the host element getHostElement answered for instance, which
+   * nothing names before the call, and which the call may have changed
+   * already. A host above the element the climb stopped at, or above a host
+   * answered before it, was noted before any call asked about it (see
+   * noteAbove and angularRead). This is for any other: the host of a
+   * component whose elements an overlay or a portal moved elsewhere in the
+   * page. The elements above it are noted straight after it, so the hosts
+   * after it in the chain are not among these. It goes by what getLContext
+   * does.
+   *
+   * When the instance held its view's number (noted just before the call)
+   * and now holds the same LContext as its host, the call cached it on the
+   * instance, which getLContext does only while that LContext's component
+   * is unset, so its component is noted as unset. If nothing else of it is
+   * filled in (its directives or local refs, which window.ng.getDirectives
+   * and a test's DebugElement fill in), the call made it, and the host held
+   * that same number before, as every host Angular renders holds the number
+   * its instance holds. One a caller had made for the host first, with
+   * nothing filled in either, cannot be told from it, and the host is given
+   * the number back too. Anything else the host holds is noted as it is.
+   */
+  function noteHost(notes, instance, host) {
+    if (host === null || typeof host !== 'object') return;
+    const keys = mapGet(notes.by, host);
+    if (keys && keys[NG_CONTEXT]) return;
+    const before = mapGet(notes.by, instance);
+    const held = before && before[NG_CONTEXT] ? before[NG_CONTEXT].member : null;
+    const id = held ? held.value : undefined;
+    let was;
+    try {
+      const now = ownCopy(host, NG_CONTEXT);
+      const context = now ? now.value : undefined;
+      if (typeof id === 'number' && context !== null && typeof context === 'object' && ownData(instance, NG_CONTEXT) === context) {
+        const filled = ownCopy(context, 'component');
+        if (filled !== null && hasOwn(filled, 'value')) {
+          noteMember(notes, context, 'component', {
+            __proto__: null,
+            value: undefined,
+            writable: filled.writable,
+            enumerable: filled.enumerable,
+            configurable: filled.configurable,
+          });
+        }
+        if (ownData(context, 'directives') === undefined && ownData(context, 'localRefs') === undefined) {
+          was = { __proto__: null, value: id, writable: now.writable, enumerable: now.enumerable, configurable: now.configurable };
+        }
+      }
+    } catch {
+      /* noted as it is */
+    }
+    noteMember(notes, host, NG_CONTEXT, was);
+  }
+
+  /**
+   * Puts every noted member back, the last noted first: one that is not as
+   * it was is defined as it was, and one that was absent is deleted. One
+   * that is as it was is not written at all, so a getter or setter of the
+   * page's on it is neither run nor replaced. Each step is on its own: one
+   * that throws (a frozen object, a proxy that refuses) leaves that member as
+   * it is, and the rest are still put back.
+   */
+  function putBack(notes) {
+    const list = notes.list;
+    for (let i = list.length - 1; i >= 0; i -= 1) {
+      const note = list[i];
+      try {
+        const now = ownCopy(note.holder, note.key);
+        if (note.member === null) {
+          if (now !== null) deleteOwn(note.holder, note.key);
+        } else if (!sameMember(now, note.member)) {
+          defineOwn(note.holder, note.key, note.member);
+        }
+      } catch {
+        /* left as it is */
+      }
     }
   }
 
@@ -4754,12 +4969,27 @@
    * template the element is written in (getOwningComponent, the rule Vue's
    * __vnode.ctx follows), the components whose templates hold its host and
    * theirs, the file and line of its class (debugInfo), the version, and its
-   * inputs. Never asked with `brief`.
+   * inputs. Every __ngContext__ its calls change is put back before it
+   * answers, however it ends, as it was but in one case: an LContext made
+   * before the pick with nothing filled in, on the host of a component whose
+   * elements an overlay moved away from it, which only the call's answer
+   * names and which is given back its view's number (see noteHost). Never
+   * asked with `brief`.
    */
   function angularSummary(node) {
     const ng = ownData(window, 'ng');
     const owning = ownData(ng, 'getOwningComponent');
     if (typeof owning !== 'function') return null;
+    const notes = { list: [], by: new NativeMap() };
+    try {
+      return angularRead(node, ng, owning, notes);
+    } finally {
+      putBack(notes);
+    }
+  }
+
+  /** What angularSummary answers, with each object a call can change noted in notes before that call. */
+  function angularRead(node, ng, owning, notes) {
     const hostOf = ownData(ng, 'getHostElement');
 
     // An element Angular did not render (what a directive or a library
@@ -4770,6 +5000,7 @@
     let instance = null;
     try {
       while (element && hops < CLIMB_LIMIT) {
+        noteContext(notes, element);
         instance = ask(ng, owning, element);
         if (instance) break;
         element = parentOf(element);
@@ -4780,13 +5011,27 @@
     }
     if (!instance) return null;
 
+    // The hosts the names are read through are most often the elements
+    // above that one. Nothing has asked about those yet (getOwningComponent
+    // changes the element it is asked about and no other), so they are
+    // noted now, as they were before the pick, and an LContext one of them
+    // holds is known to have been there before it.
+    noteAbove(notes, element, CLIMB_LIMIT - hops - 1);
+
     const names = [];
     let named = null; // the instance that gave names[0]
     let namedHost = null; // its host element
     let current = instance;
     for (let steps = 0; current && names.length < NAME_LIMIT && steps < CLIMB_LIMIT; steps += 1) {
       const name = angularName(current);
+      noteContext(notes, current);
       const host = ask(ng, hostOf, current);
+      // Noted before anything else is asked, getOwningComponent(host) below
+      // among them, and so are the elements above it: where an overlay
+      // moved the picked element, the hosts after this one are above it,
+      // and above none of the elements noted so far.
+      noteHost(notes, current, host);
+      if (host) noteAbove(notes, host, CLIMB_LIMIT);
       if (name) {
         if (!named) {
           named = current;
